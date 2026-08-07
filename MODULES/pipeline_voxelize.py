@@ -7,9 +7,15 @@ Lê os pares curados (binding_site.pdb + ligand.pdb) e gera:
   │  Tensor 4D: (X, Y, Z, C_site) onde C_site = 5 canais                   │
   │    Canal 0 — Densidade atômica (ocupância de vdW gaussiana)             │
   │    Canal 1 — Carga parcial (Gasteiger) interpolada na grade             │
-  │    Canal 2 — MEP (Potencial Eletrostático Molecular) — HF/STO-3G       │
-  │    Canal 3 — Densidade HOMO (orbital de fronteira — doador)             │
-  │    Canal 4 — Densidade LUMO (orbital de fronteira — aceptor)            │
+  │    Canal 2 — MEP (Potencial Eletrostático Molecular) — Coulomb          │
+  │    Canal 3 — Campo doador de elétrons (HOMO-like, semi-empírico)        │
+  │    Canal 4 — Campo aceptor de elétrons (LUMO-like, semi-empírico)       │
+  │                                                                           │
+  │  Os 5 canais são computados EXCLUSIVAMENTE a partir dos átomos do        │
+  │  próprio bolso de ligação (binding_site.pdb) — nunca do ligante. Isso    │
+  │  garante que o tensor do sítio seja idêntico em treino e em inferência   │
+  │  (pipeline_generate.py constrói o mesmo tensor sem precisar de nenhum    │
+  │  ligante de referência). Ver channel_site_donor_acceptor().              │
   └─────────────────────────────────────────────────────────────────────────┘
 
   ┌─ Ligante ───────────────────────────────────────────────────────────────┐
@@ -28,14 +34,37 @@ Lê os pares curados (binding_site.pdb + ligand.pdb) e gera:
 Requisitos:
     pip install numpy scipy biopython rdkit pyscf torch torch-geometric tqdm
 
-Notas sobre o cálculo quântico:
-    • Nível de teoria: RHF/STO-3G (rápido, adequado para gerar descritores
-      de densidade para ML; não é cálculo de alta precisão).
-    • Para ligantes com > MAX_QM_ATOMS átomos pesados, o QM é substituído
-      por aproximações semi-empíricas baseadas em cargas Gasteiger e
-      raio de van der Waals (muito mais rápido para datasets grandes).
-    • O MEP do SÍTIO é calculado como soma de potenciais de Coulomb das
-      cargas parciais Gasteiger dos resíduos (escala bem para proteínas).
+Notas sobre os canais 2-4 do sítio:
+    • Canal 2 (MEP) é a soma de potenciais de Coulomb das cargas parciais
+      dos átomos do sítio (escala bem para proteínas inteiras).
+    • Canais 3-4 (doador/aceptor, HOMO/LUMO-like) são calculados a partir
+      dos átomos do SÍTIO — nunca do ligante. Este é o substituto de uma
+      versão anterior que calculava HOMO/LUMO via QM (RHF/STO-3G) sobre o
+      LIGANTE co-cristalizado: isso vazava a "resposta" para dentro do
+      condicionamento do encoder durante o treino, já que na geração real
+      não existe ligante de referência e esses canais seriam sempre zero
+      (ver pipeline_generate.pdb_to_site_tensor). As funções antigas
+      (channel_homo_lumo_qm/_homo_lumo_approx) foram mantidas no código
+      mas não são mais usadas na construção do tensor.
+    • Como o sítio é protonado por resíduo (ver protonate_residue, pH
+      configurável), há três níveis de teoria disponíveis para os canais
+      3-4 (config["site_qm_method"]), do mais rigoroso ao mais rápido:
+        1. "rhf_sto3g_fragments" (padrão) — RHF/STO-3G real por RESÍDUO
+           (fragmentação tipo FMO, cada fragmento protonado e capado com H
+           nas bordas cortadas — sempre pequeno o bastante para caber sob
+           max_qm_atoms, ao contrário de tentar o sítio inteiro de uma vez,
+           que seria inviável). Densidade condensada por átomo via
+           população de Mulliken do HOMO/LUMO.
+        2. "gfn_xtb_full" — GFN-xTB (semi-empírico tight-binding, pacote
+           externo `xtb`) no sítio protonado INTEIRO, sem fragmentar —
+           usa os índices de Fukui condensados (f+/f-) como doador/aceptor.
+           Requer o binário `xtb` no PATH.
+        3. "heuristic" — aproximação por eletronegatividade de Pauling +
+           carga parcial (mais rápida, sem QM) — também o fallback
+           automático das duas anteriores quando o cálculo real falha.
+    • Para ligantes com > MAX_QM_ATOMS átomos pesados na etapa de QM do
+      ligante (hoje não usada no tensor, ver acima), o cálculo cairia
+      para a aproximação semi-empírica correspondente.
 
 Uso:
     python 04_voxelize.py                      # processa todos os pares
@@ -53,6 +82,8 @@ import logging
 import argparse
 import warnings
 import tempfile
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 import pandas as pd
@@ -134,6 +165,19 @@ def _xp():
     """Retorna cupy se disponível, senão numpy."""
     return cp if HAS_CUPY else np
 
+
+def _qm_to_numpy(arr):
+    """Converte para numpy resultados de QM que podem vir em cupy.
+
+    GPU4PySCF mantém mo_coeff/mo_occ em cupy.ndarray; PySCF/CPU já retorna
+    numpy. Como pyscf_mol.intor(...) (ex. matriz de overlap) é sempre CPU/
+    numpy, misturar os dois sem converter lança TypeError — usada em
+    _fragment_qm_weights antes de qualquer operação com arrays numpy.
+    """
+    if HAS_CUPY and cp is not None and isinstance(arr, cp.ndarray):
+        return cp.asnumpy(arr)
+    return np.asarray(arr)
+
 # ── GPU4PySCF: cálculos QM acelerados por CUDA ────────────────────────────────
 # Instalar: pip install gpu4pyscf-cuda12x
 # Documentação: https://github.com/pyscf/gpu4pyscf
@@ -198,12 +242,38 @@ VOXEL_CONFIG = {
     # Tamanho do lote de átomos para voxelização vetorizada (ajusta uso de memória)
     "vox_batch":       500 if HAS_CUPY else 100, 
 
-    # Limite de átomos pesados para cálculo QM completo (RHF/STO-3G)
-    # Acima disso usa aproximação semi-empírica (Gasteiger + densidade vdW)
+    # Limite de átomos pesados para cálculo QM completo (RHF/STO-3G).
+    # Usado tanto para o ligante (channel_homo_lumo_qm, hoje não conectado
+    # ao tensor — ver notas no topo do arquivo) quanto para CADA FRAGMENTO
+    # residual do sítio em site_qm_method="rhf_sto3g_fragments" (um resíduo
+    # protonado raramente passa de ~25 átomos, então o limite quase sempre
+    # é satisfeito — ao contrário de tentar o sítio inteiro de uma vez).
+    # Acima disso usa aproximação semi-empírica (eletronegatividade+carga).
     "max_qm_atoms": 60,
 
     # Base QM (STO-3G é a mais rápida; use 3-21G para mais precisão)
     "qm_basis": "sto-3g",
+
+    # ── Protonação do sítio (canais 3-4) ───────────────────────────────────
+    # pH usado para decidir o estado de protonação de resíduos ionizáveis
+    # (Asp/Glu/His/Cys/Tyr/Lys/Arg) via regra de limiar de Henderson-
+    # Hasselbalch sobre pKa de tabela — ver RESIDUE_PKA e protonate_residue.
+    "ph": 7.4,
+
+    # False = comportamento legado: sem protonação, sem H explícitos, carga
+    # aproximada por elemento (ver load_site_atoms). True = load_site_atoms_
+    # protonated, com H explícitos e cargas Gasteiger reais por resíduo.
+    "protonate_site": True,
+
+    # Método para os canais 3-4 (doador/aceptor de elétrons do sítio):
+    #   "rhf_sto3g_fragments" — QM real por resíduo (fragmentação FMO-like)
+    #   "gfn_xtb_full"        — GFN-xTB no sítio protonado inteiro (requer
+    #                           o binário `xtb` no PATH — não instalado por
+    #                           padrão, ver _xtb_whole_site_weights)
+    #   "heuristic"           — eletronegatividade de Pauling + carga (sem
+    #                           QM; também o fallback automático das outras
+    #                           duas quando o cálculo real falha)
+    "site_qm_method": "rhf_sto3g_fragments",
 
     # Número de canais do tensor do sítio
     "n_site_channels": 5,
@@ -238,6 +308,17 @@ VDW_RADII = {
     "CU": 1.40, "NI": 1.63, "CO": 1.70, "SE": 1.90,
 }
 VDW_DEFAULT = 1.70
+
+# Eletronegatividade de Pauling por elemento — usada para estimar caráter
+# doador/aceptor de elétrons (aproximação semi-empírica de HOMO/LUMO nos
+# canais 3-4 do tensor do sítio; ver channel_site_donor_acceptor).
+ELECTRONEGATIVITY = {
+    "C": 2.55, "N": 3.04, "O": 3.44, "S": 2.58, "P": 2.19,
+    "F": 3.98, "CL": 3.16, "BR": 2.96, "I": 2.66,
+    "FE": 1.83, "ZN": 1.65, "MG": 1.31, "SE": 2.55, "CA": 1.00,
+    "MN": 1.55, "CU": 1.90, "NI": 1.91, "CO": 1.88,
+}
+ELECTRONEGATIVITY_DEFAULT = 2.50
 
 # Features dos átomos no grafo (one-hot encoding)
 ATOM_TYPES   = ["C","N","O","S","P","F","CL","BR","I","FE","ZN","MG","OTHER"]
@@ -292,8 +373,17 @@ def _voxelize_atoms(
     sigma: float,
     grid_shape: tuple,
     batch: int = 500 if HAS_CUPY else 100,
+    compute_mep: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Calcula os canais 0, 1 e 2 de forma totalmente vetorizada.
+    """Calcula três campos gaussianos vetorizados a partir de pesos por átomo.
+
+    Genérico: não é específico dos canais 0-2 — qualquer par de pesos por
+    átomo (weights_density, weights_charge) pode ser passado para obter
+    dois campos gaussianos independentes (ex.: doador/aceptor de elétrons
+    em channel_site_donor_acceptor). O terceiro retorno (mep) é sempre a
+    soma de Coulomb `weights_charge / dist`; passe compute_mep=False para
+    pular esse termo quando ele não for usado (economiza uma sqrt+divisão
+    por átomo/voxel).
 
     Em vez de iterar átomo por átomo, monta uma matriz de distâncias
     (N_atoms, N_vox) de uma só vez usando broadcasting e opera sobre
@@ -341,9 +431,10 @@ def _voxelize_atoms(
         # Canal 1: carga interpolada
         charge  += xp.einsum('ij->j', wc_b[:, None] * gauss)
 
-        # Canal 2: MEP coulombiano  q / |r - r_i|
-        dist    = xp.sqrt(xp.clip(dist2, 0.01, None))
-        mep     += xp.einsum('ij->j', wc_b[:, None] / dist)
+        # Canal 2: MEP coulombiano  q / |r - r_i|  (pulado se compute_mep=False)
+        if compute_mep:
+            dist = xp.sqrt(xp.clip(dist2, 0.01, None))
+            mep += xp.einsum('ij->j', wc_b[:, None] / dist)
 
     # Volta para CPU numpy e reshape para (n,n,n)
     if HAS_CUPY and xp is cp:
@@ -404,6 +495,338 @@ def channel_mep_coulomb(
     return m
 
 
+def _electronegativity_donor_acceptor_weights(
+    elements: list[str],
+    charges: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Núcleo de channel_site_donor_acceptor: pesos doador/aceptor por átomo
+    a partir de eletronegatividade de Pauling + carga parcial — sem
+    espalhar na grade ainda. Extraído para reuso como fallback POR
+    FRAGMENTO em channel_site_orbital_field (quando o QM real falha só
+    para um resíduo, o resto do sítio não precisa cair nessa aproximação).
+
+      Doador (HOMO-like): átomos eletronegativamente pobres e/ou com carga
+        parcial negativa — regiões nucleofílicas, propensas a doar
+        densidade eletrônica.
+      Aceptor (LUMO-like): átomos eletronegativos e/ou com carga parcial
+        positiva — regiões eletrofílicas, propensas a aceitar densidade
+        eletrônica.
+    """
+    elec = np.array(
+        [ELECTRONEGATIVITY.get(e.upper(), ELECTRONEGATIVITY_DEFAULT)
+         for e in elements],
+        dtype=np.float32,
+    )
+    q = np.asarray(charges, dtype=np.float32)
+    donor_w    = np.clip((3.0 - elec) / 3.0 + np.clip(-q, 0.0, None), 0.0, None)
+    acceptor_w = np.clip((elec - 2.0) / 2.0 + np.clip(q, 0.0, None),  0.0, None)
+    return donor_w, acceptor_w
+
+
+def channel_site_donor_acceptor(
+    grid_flat: np.ndarray,
+    site_coords: np.ndarray,
+    site_elements: list[str],
+    site_charges: np.ndarray,
+    sigma: float,
+    grid_shape: tuple,
+    batch: int = 500 if HAS_CUPY else 100,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Canais 3-4 — Campo doador/aceptor de elétrons do SÍTIO (HOMO/LUMO-like),
+    nível "heuristic" (eletronegatividade + carga, sem QM — ver
+    _electronegativity_donor_acceptor_weights). Espalha os pesos na grade
+    com as mesmas gaussianas 3D dos canais 0-2 (reaproveita
+    _voxelize_atoms, inclusive aceleração CuPy).
+
+    Este é o nível mais rápido dos três disponíveis em
+    config["site_qm_method"] (ver channel_site_orbital_field para os
+    níveis "rhf_sto3g_fragments" e "gfn_xtb_full") — e também o fallback
+    automático dos outros dois quando o cálculo QM real falha ou está
+    indisponível.
+
+    Por que a partir do SÍTIO e não do ligante:
+      Esta é a substituição direta de uma versão anterior que calculava
+      HOMO/LUMO via QM (RHF/STO-3G) do ligante co-cristalizado. Aquilo
+      causava um vazamento de dados treino↔inferência: o encoder recebia
+      como entrada a densidade eletrônica da própria molécula que deveria
+      gerar, algo que não existe na geração real (não há ligante de
+      referência). Calculando o campo a partir dos átomos do próprio
+      sítio (sempre disponíveis, com ou sem ligante), o tensor fica
+      idêntico em treino e em inferência — sem vazamento — e ainda carrega
+      sinal quimicamente relevante: análogo aos mapas de complementaridade
+      doador/aceptor de métodos clássicos como GRID (Goodford, 1985) e a
+      featurizations voxelizadas de bolsos de ligação usadas em ML
+      estrutural (ex. Ragoza et al., 2017).
+    """
+    donor_w, acceptor_w = _electronegativity_donor_acceptor_weights(
+        site_elements, site_charges
+    )
+    donor, acceptor, _ = _voxelize_atoms(
+        grid_flat, site_coords, donor_w, acceptor_w, sigma, grid_shape,
+        batch=batch, compute_mep=False,
+    )
+    return donor, acceptor
+
+
+def _fragment_qm_weights(
+    mol: "Chem.Mol", config: dict,
+) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Roda RHF/STO-3G no fragmento residual protonado (ver
+    protonate_residue) e retorna pesos doador/aceptor CONDENSADOS por
+    átomo — população de Mulliken do HOMO/LUMO — na mesma escala usada
+    pela aproximação semi-empírica, prontos para serem espalhados na
+    grade pela mesma _voxelize_atoms.
+
+    Por que população condensada e não um cubo 3D real (como
+    channel_homo_lumo_qm fazia para o ligante): somar vários cubos
+    pequenos, um por resíduo, exigiria realinhar cada grade local na
+    grade global do sítio — complexidade e custo extras sem ganho real,
+    já que o que importa para o campo espalhado por gaussianas é o peso
+    por átomo, não a forma exata do orbital dentro do fragmento. A
+    população de Mulliken (c · S·c, com S = matriz de overlap AO) é o
+    jeito padrão de condensar um orbital molecular em contribuições
+    atômicas.
+
+    Retorna None se PySCF ausente, fragmento maior que
+    config["max_qm_atoms"], SCF sem orbital virtual, ou qualquer exceção
+    (não converge, geometria degenerada etc.) — o chamador cai para o
+    peso de eletronegatividade nesse fragmento específico.
+    """
+    if not HAS_PYSCF:
+        return None
+    n_heavy = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() > 1)
+    if n_heavy > config.get("max_qm_atoms", 60):
+        return None
+
+    try:
+        conf = mol.GetConformer()
+        atom_str = []
+        for atom in mol.GetAtoms():
+            xyz = conf.GetAtomPosition(atom.GetIdx())
+            atom_str.append(f"{atom.GetSymbol()} {xyz.x:.6f} {xyz.y:.6f} {xyz.z:.6f}")
+
+        charge      = Chem.GetFormalCharge(mol)
+        n_electrons = sum(a.GetAtomicNum() for a in mol.GetAtoms()) - charge
+        spin        = n_electrons % 2   # 0 = singleto, 1 = dubleto (radical)
+
+        pyscf_mol = gto.Mole()
+        pyscf_mol.atom    = "\n".join(atom_str)
+        pyscf_mol.basis   = config.get("qm_basis", "sto-3g")
+        pyscf_mol.charge  = charge
+        pyscf_mol.spin    = spin
+        pyscf_mol.verbose = 0
+        pyscf_mol.build()
+
+        if HAS_GPU4PYSCF:
+            mf = gpu_scf.RHF(pyscf_mol)
+        else:
+            mf = scf.RHF(pyscf_mol) if spin == 0 else scf.ROHF(pyscf_mol)
+        mf.kernel()
+
+        # GPU4PySCF mantém mo_coeff/mo_occ em cupy — converte para numpy
+        # antes de misturar com S (sempre CPU/numpy, via pyscf_mol.intor).
+        mo_occ    = _qm_to_numpy(mf.mo_occ)
+        mo_coeff  = _qm_to_numpy(mf.mo_coeff)
+        homo_i = int(np.where(mo_occ > 0)[0][-1])
+        lumo_i = homo_i + 1
+        if lumo_i >= mo_coeff.shape[1]:
+            return None   # sem orbital virtual (fragmento saturado, raro)
+
+        S = pyscf_mol.intor("int1e_ovlp")
+        ao_slices = pyscf_mol.aoslice_by_atom()
+        homo_c = mo_coeff[:, homo_i]
+        lumo_c = mo_coeff[:, lumo_i]
+        homo_pop_ao = homo_c * (S @ homo_c)   # população de Mulliken por AO
+        lumo_pop_ao = lumo_c * (S @ lumo_c)
+
+        n_atoms = mol.GetNumAtoms()
+        donor_w    = np.zeros(n_atoms, dtype=np.float32)   # HOMO ≈ doador
+        acceptor_w = np.zeros(n_atoms, dtype=np.float32)   # LUMO ≈ aceptor
+        for i, row in enumerate(ao_slices):
+            a0, a1 = int(row[2]), int(row[3])
+            donor_w[i]    = float(homo_pop_ao[a0:a1].sum())
+            acceptor_w[i] = float(lumo_pop_ao[a0:a1].sum())
+
+        # Mulliken pode dar população levemente negativa em bases polarizadas
+        # — não faz sentido como peso de intensidade gaussiana, clipa em 0.
+        return np.clip(donor_w, 0.0, None), np.clip(acceptor_w, 0.0, None)
+    except Exception as e:
+        log.debug(f"  QM fragmento falhou: {type(e).__name__}: {e}")
+        return None
+
+
+def _xtb_whole_site_weights(
+    site_coords: np.ndarray,
+    site_elements: list[str],
+    total_charge: int,
+    config: dict,
+) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Roda GFN-xTB (semi-empírico tight-binding) no sítio protonado
+    INTEIRO de uma só vez (não fragmenta por resíduo — xTB escala bem para
+    centenas de átomos) via o binário `xtb` (CLI, chamado por subprocess —
+    não é um pacote Python). Extrai os índices de Fukui condensados por
+    átomo (`--vfukui`):
+        f(-) → suscetibilidade a ataque ELETROFÍLICO → caráter DOADOR (HOMO-like)
+        f(+) → suscetibilidade a ataque NUCLEOFÍLICO → caráter ACEPTOR (LUMO-like)
+
+    Requer o binário `xtb` no PATH — não é instalado por padrão neste
+    projeto. Instale com `conda install -c conda-forge xtb` ou veja
+    https://github.com/grimme-lab/xtb. Retorna None (→ fallback heurístico)
+    se o binário não existir, o cálculo falhar ou não convergir.
+
+    ATENÇÃO — parsing não validado em produção: este código foi escrito
+    sem um binário `xtb` disponível no ambiente de desenvolvimento; o
+    formato de fukui.txt assumido aqui (colunas [idx, símbolo, f+, f-, f0])
+    é o documentado pelo projeto xtb mas pode variar entre versões. Rode
+    manualmente uma vez (`xtb site.xyz --gfn 2 --chrg 0 --vfukui`) e
+    confira fukui.txt antes de usar isso em lote.
+    """
+    xtb_bin = shutil.which("xtb")
+    if xtb_bin is None:
+        log.warning(
+            "  xtb não encontrado no PATH — instale com "
+            "'conda install -c conda-forge xtb' (ou compile de "
+            "https://github.com/grimme-lab/xtb). Usando aproximação semi-empírica."
+        )
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz_path = Path(tmpdir) / "site.xyz"
+            with open(xyz_path, "w") as f:
+                f.write(f"{len(site_elements)}\n")
+                f.write("sitio protonado (CODEEP)\n")
+                for elem, xyz in zip(site_elements, site_coords):
+                    f.write(f"{elem.capitalize():2s} {xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f}\n")
+
+            result = subprocess.run(
+                [xtb_bin, str(xyz_path), "--gfn", "2",
+                 "--chrg", str(int(total_charge)), "--vfukui"],
+                cwd=tmpdir, capture_output=True, text=True,
+                timeout=config.get("xtb_timeout_s", 600),
+            )
+            fukui_path = Path(tmpdir) / "fukui.txt"
+            if result.returncode != 0 or not fukui_path.exists():
+                log.debug(f"  xtb falhou (código {result.returncode}): "
+                          f"{result.stderr[-500:] if result.stderr else '(sem stderr)'}")
+                return None
+
+            return _parse_xtb_fukui(fukui_path, len(site_elements))
+    except Exception as e:
+        log.debug(f"  xtb: {type(e).__name__}: {e}")
+        return None
+
+
+def _parse_xtb_fukui(fukui_path: Path, n_atoms: int) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Lê fukui.txt gerado por `xtb --vfukui`.
+
+    Formato assumido (ver ressalva em _xtb_whole_site_weights):
+        #        f(+)     f(-)     f(0)
+        1O      0.1234   0.2345   0.1790
+        ...
+    f(+) → caráter aceptor (LUMO-like); f(-) → caráter doador (HOMO-like).
+    Ignora linhas que não comecem com um índice de átomo numérico.
+    """
+    try:
+        donor_w    = np.zeros(n_atoms, dtype=np.float32)
+        acceptor_w = np.zeros(n_atoms, dtype=np.float32)
+        idx = 0
+        with open(fukui_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                head = parts[0]
+                if not (head[0].isdigit() or (head[0] == "-" and head[1:2].isdigit())):
+                    continue
+                try:
+                    fplus, fminus = float(parts[-3]), float(parts[-2])
+                except (ValueError, IndexError):
+                    continue
+                if idx >= n_atoms:
+                    break
+                acceptor_w[idx] = max(0.0, fplus)
+                donor_w[idx]    = max(0.0, fminus)
+                idx += 1
+        if idx == 0:
+            return None
+        return donor_w, acceptor_w
+    except Exception:
+        return None
+
+
+def channel_site_orbital_field(
+    grid_flat: np.ndarray,
+    site_coords: np.ndarray,
+    site_elements: list[str],
+    site_charges: np.ndarray,
+    fragments: list,
+    sigma: float,
+    grid_shape: tuple,
+    config: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dispatcher dos canais 3-4 — escolhe o nível de teoria conforme
+    config["site_qm_method"]:
+        "rhf_sto3g_fragments" — QM real por resíduo (ver _fragment_qm_weights),
+            com fallback heurístico POR FRAGMENTO quando o QM falha só num
+            resíduo (o resto do sítio continua com o valor real).
+        "gfn_xtb_full" — GFN-xTB no sítio protonado inteiro (ver
+            _xtb_whole_site_weights), fallback heurístico para o sítio
+            inteiro se o binário `xtb` não estiver disponível.
+        "heuristic" (ou qualquer valor não reconhecido) — eletronegatividade
+            + carga (channel_site_donor_acceptor), sem QM.
+
+    Em todos os casos o resultado final é sempre um peso doador/aceptor
+    por átomo espalhado na grade pela mesma _voxelize_atoms — unifica os
+    três níveis de teoria no mesmo formato de saída.
+    """
+    method = config.get("site_qm_method", "rhf_sto3g_fragments")
+    batch  = config.get("vox_batch", 500 if HAS_CUPY else 100)
+
+    if method == "rhf_sto3g_fragments" and fragments and HAS_PYSCF:
+        n_atoms = len(site_elements)
+        donor_w    = np.zeros(n_atoms, dtype=np.float32)
+        acceptor_w = np.zeros(n_atoms, dtype=np.float32)
+        n_qm_ok = 0
+        for frag in fragments:
+            start, end, mol = frag["start"], frag["end"], frag["mol"]
+            result = _fragment_qm_weights(mol, config) if mol is not None else None
+            if result is not None:
+                donor_w[start:end], acceptor_w[start:end] = result
+                n_qm_ok += 1
+            else:
+                d, a = _electronegativity_donor_acceptor_weights(
+                    site_elements[start:end], site_charges[start:end]
+                )
+                donor_w[start:end], acceptor_w[start:end] = d, a
+        log.info(f"  QM fragmentado (RHF/STO-3G): {n_qm_ok}/{len(fragments)} "
+                 f"resíduos com orbital real, resto por aproximação")
+        donor, acceptor, _ = _voxelize_atoms(
+            grid_flat, site_coords, donor_w, acceptor_w, sigma, grid_shape,
+            batch=batch, compute_mep=False,
+        )
+        return donor, acceptor
+
+    if method == "gfn_xtb_full":
+        total_charge = int(round(sum(
+            Chem.GetFormalCharge(f["mol"]) for f in fragments if f["mol"] is not None
+        ))) if fragments else 0
+        result = _xtb_whole_site_weights(site_coords, site_elements, total_charge, config)
+        if result is not None:
+            donor_w, acceptor_w = result
+            donor, acceptor, _ = _voxelize_atoms(
+                grid_flat, site_coords, donor_w, acceptor_w, sigma, grid_shape,
+                batch=batch, compute_mep=False,
+            )
+            return donor, acceptor
+        # xtb indisponível/falhou — cai para a heurística abaixo
+
+    return channel_site_donor_acceptor(
+        grid_flat, site_coords, site_elements, site_charges, sigma, grid_shape,
+        batch=batch,
+    )
+
+
 def channel_homo_lumo_qm(
     grid_coords: np.ndarray,
     mol_rdkit,
@@ -411,7 +834,16 @@ def channel_homo_lumo_qm(
     voxel_size: float,
     config: dict,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Canais 3 e 4 — Densidade de probabilidade HOMO e LUMO via RHF/STO-3G.
+    """HOMO/LUMO do LIGANTE via RHF/STO-3G — NÃO usada na construção do
+    tensor do sítio (ver channel_site_donor_acceptor, que a substituiu para
+    eliminar o vazamento de dados treino↔inferência descrito lá).
+
+    Mantida no código porque o cálculo QM em si permanece válido e pode ser
+    reaproveitado no futuro como *alvo* de uma loss auxiliar do decoder
+    (prever a densidade eletrônica do ligante gerado, em vez de recebê-la
+    como entrada do encoder) — isso adicionaria sinal químico sem
+    reintroduzir o vazamento, mas exige uma mudança de arquitetura
+    (cabeça extra no GNNDecoder + termo na loss) que ainda não foi feita.
 
     Usa PySCF para calcular os coeficientes dos orbitais moleculares de
     fronteira e projetá-los na grade 3D.
@@ -463,16 +895,19 @@ def channel_homo_lumo_qm(
             mf = scf.RHF(pyscf_mol) if spin == 0 else scf.ROHF(pyscf_mol)
         mf.kernel()
 
-        mo_occ  = mf.mo_occ
+        # GPU4PySCF mantém mo_coeff/mo_occ em cupy — cubegen.orbital (CPU)
+        # exige numpy. Ver _qm_to_numpy.
+        mo_occ   = _qm_to_numpy(mf.mo_occ)
+        mo_coeff = _qm_to_numpy(mf.mo_coeff)
         homo_i  = int(np.where(mo_occ > 0)[0][-1])
         lumo_i  = homo_i + 1
 
         with tempfile.TemporaryDirectory() as tmpdir:
             fn_h = os.path.join(tmpdir, "homo.cube")
             fn_l = os.path.join(tmpdir, "lumo.cube")
-            cubegen.orbital(pyscf_mol, fn_h, mf.mo_coeff[:, homo_i],
+            cubegen.orbital(pyscf_mol, fn_h, mo_coeff[:, homo_i],
                             nx=n, ny=n, nz=n, resolution=voxel_size)
-            cubegen.orbital(pyscf_mol, fn_l, mf.mo_coeff[:, lumo_i],
+            cubegen.orbital(pyscf_mol, fn_l, mo_coeff[:, lumo_i],
                             nx=n, ny=n, nz=n, resolution=voxel_size)
             homo_grid = _read_cube_data(fn_h, n)
             lumo_grid = _read_cube_data(fn_l, n)
@@ -504,12 +939,9 @@ def _homo_lumo_approx(
     rdPartialCharges.ComputeGasteigerCharges(mol_rdkit)
     sigma = config["gaussian_sigma"] * 1.5  # gaussianas um pouco mais largas
 
-    # Eletronegatividade de Pauling por elemento
-    electroneg = {
-        "C": 2.55, "N": 3.04, "O": 3.44, "S": 2.58, "P": 2.19,
-        "F": 3.98, "CL": 3.16, "BR": 2.96, "I": 2.66,
-        "FE": 1.83, "ZN": 1.65, "MG": 1.31, "SE": 2.55,
-    }
+    # Eletronegatividade de Pauling por elemento (tabela compartilhada com
+    # channel_site_donor_acceptor, ver ELECTRONEGATIVITY no topo do módulo)
+    electroneg = ELECTRONEGATIVITY
 
     homo_grid = np.zeros((n, n, n), dtype=np.float32)
     lumo_grid = np.zeros((n, n, n), dtype=np.float32)
@@ -521,7 +953,7 @@ def _homo_lumo_approx(
         xyz   = conf.GetPositions()[atom.GetIdx()]
         q     = float(atom.GetDoubleProp("_GasteigerCharge")
                       if atom.HasProp("_GasteigerCharge") else 0.0)
-        en    = electroneg.get(sym, 2.50)
+        en    = electroneg.get(sym, ELECTRONEGATIVITY_DEFAULT)
 
         diff  = grid_coords - xyz
         dist2 = (diff**2).sum(axis=-1)
@@ -583,12 +1015,24 @@ def _read_cube_data(cube_path: str, n: int) -> np.ndarray:
 # BLOCO 3 — LEITURA DO SÍTIO (PDB → arrays)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_site_atoms(pdb_path: Path) -> tuple[np.ndarray, list[str], np.ndarray]:
-    """Lê o binding_site.pdb e retorna coords, elementos e cargas Gasteiger.
+# Cargas aproximadas por elemento (médias grosseiras em aminoácidos) — usada
+# como fallback quando a protonação por RDKit (protonate_residue) falha ou
+# está desativada (config["protonate_site"]=False). NÃO é Gasteiger real —
+# ver load_site_atoms_protonated para a carga real por átomo.
+_ELEM_CHARGE_APPROX = {
+    "C": -0.05, "N": -0.30, "O": -0.35, "S": -0.15,
+    "P": +0.40, "FE": +0.30, "ZN": +0.40, "MG": +0.50,
+}
 
-    As cargas do sítio são calculadas residuo a residuo via RDKit a partir
-    do SMILES de cada aminoácido padrão. Para resíduos não reconhecidos,
-    usa carga 0.
+
+def load_site_atoms(pdb_path: Path) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Lê o binding_site.pdb e retorna coords, elementos e cargas aproximadas
+    (tabela fixa por elemento, ver _ELEM_CHARGE_APPROX — NÃO é Gasteiger
+    real por resíduo). Sem hidrogênios, sem protonação.
+
+    Mantida por compatibilidade e como fallback rápido. Para o caminho
+    recomendado (protonação por pH + cargas Gasteiger reais), ver
+    load_site_atoms_protonated.
     """
     parser = PDBParser(QUIET=True)
     struct = parser.get_structure("site", str(pdb_path))
@@ -607,17 +1051,269 @@ def load_site_atoms(pdb_path: Path) -> tuple[np.ndarray, list[str], np.ndarray]:
                     elements.append(elem)
 
     coords_arr = np.array(coords, dtype=np.float32)
-
-    # Cargas Gasteiger aproximadas por elemento (proteínas)
-    # Valores médios de cargas Gasteiger em aminoácidos
-    elem_charge_approx = {
-        "C": -0.05, "N": -0.30, "O": -0.35, "S": -0.15,
-        "P": +0.40, "FE": +0.30, "ZN": +0.40, "MG": +0.50,
-    }
-    charges = np.array([elem_charge_approx.get(e, 0.0) for e in elements],
+    charges = np.array([_ELEM_CHARGE_APPROX.get(e, 0.0) for e in elements],
                        dtype=np.float32)
 
     return coords_arr, elements, charges
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 3B — PROTONAÇÃO DO SÍTIO (pH-dependente)
+# ══════════════════════════════════════════════════════════════════════════════
+# Módulo próprio do CODEEP, inspirado na etapa de preparo de proteína do
+# CODOC (adição de hidrogênios conforme pKa padrão + pH definido pelo
+# usuário), porém implementado aqui de forma independente e autocontida —
+# sem importar CODOC.
+#
+# Limitação assumida: pKa "de tabela" (sem correção por microambiente
+# estrutural, ao contrário de ferramentas como PROPKA). Aproximação de
+# primeira ordem, consistente com o nível de rigor do resto do módulo.
+#
+# A protonação é sempre RE-DERIVADA da regra de pH, ignorando H eventuais
+# já presentes no PDB de origem — garante que o tensor seja determinístico
+# e reprodutível (mesmo resultado com ou sem H experimentais na estrutura).
+
+STANDARD_AMINO_ACIDS = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+}
+
+# pKa padrão dos grupos ionizáveis em água a 25°C (Nelson & Cox, Lehninger
+# Principles of Biochemistry) — não considera microambiente/estrutura.
+RESIDUE_PKA = {
+    "ASP": 3.9, "GLU": 4.1, "CYS": 8.3, "TYR": 10.1,
+    "HIS": 6.0, "LYS": 10.5, "ARG": 12.5,
+}
+
+# Átomo ionizável de cada resíduo + nº de H no estado protonado/desprotonado.
+# "acidic": estado protonado (pH<pKa) é NEUTRO (default do RDKit, sem
+#   intervenção); estado desprotonado (pH>pKa) precisa de carga -1 explícita.
+# "basic": estado protonado (pH<pKa) precisa de carga +1 explícita; estado
+#   desprotonado (pH>pKa) é NEUTRO (default do RDKit, sem intervenção).
+# HIS é tratada à parte (3 estados: HID/HIE neutros + HIP +1).
+RESIDUE_IONIZABLE = {
+    "ASP": {"kind": "acidic", "atom": "OD2", "h_protonated": 1, "h_deprotonated": 0},
+    "GLU": {"kind": "acidic", "atom": "OE2", "h_protonated": 1, "h_deprotonated": 0},
+    "CYS": {"kind": "acidic", "atom": "SG",  "h_protonated": 1, "h_deprotonated": 0},
+    "TYR": {"kind": "acidic", "atom": "OH",  "h_protonated": 1, "h_deprotonated": 0},
+    "LYS": {"kind": "basic",  "atom": "NZ",  "h_protonated": 3, "h_deprotonated": 2},
+    "ARG": {"kind": "basic",  "atom": "NH2", "h_protonated": 2, "h_deprotonated": 1},
+}
+
+
+def determine_protonation(resname: str, ph: float) -> "dict | None":
+    """Decide o estado de protonação de um resíduo ionizável no pH dado
+    (regra de limiar de Henderson-Hasselbalch sobre o pKa de tabela:
+    protonado se pH < pKa).
+
+    Retorna None quando o resíduo não é ionizável OU quando o estado no pH
+    dado já é o default do RDKit (nenhuma intervenção de carga necessária —
+    ver comentário em RESIDUE_IONIZABLE). Retorna um dict
+    {"atom", "charge", "n_h"} quando é preciso sobrescrever a carga formal
+    do átomo ionizável antes de Chem.AddHs. HIS é tratada à parte
+    (_apply_his_protonation).
+    """
+    info = RESIDUE_IONIZABLE.get(resname.upper())
+    if info is None:
+        return None
+    pka = RESIDUE_PKA[resname.upper()]
+    protonated = ph < pka
+    default_is_protonated = (info["kind"] == "acidic")
+    if protonated == default_is_protonated:
+        return None
+    if info["kind"] == "acidic":   # aqui só chega o ramo desprotonado
+        charge = -1
+    else:                          # "basic" — aqui só chega o ramo protonado
+        charge = 1
+    n_h = info["h_protonated"] if protonated else info["h_deprotonated"]
+    return {"atom": info["atom"], "charge": charge, "n_h": n_h}
+
+
+def _apply_his_protonation(mol: "Chem.Mol", ph: float) -> None:
+    """HIS tem 3 estados usuais: HID/HIE (neutros, tautômeros ND1-H/NE2-H)
+    e HIP (+1, ambos protonados).
+
+    pH < pKa(HIS)≈6.0 → HIP (ND1 e NE2 protonados, carga total +1).
+    pH ≥ pKa(HIS)      → tautômero neutro; o default do RDKit ao adicionar H
+      num template sem H (sanitização + aromaticidade) já resolve para
+      NE2-H (HIE), o tautômero mais comum como default em campos de força
+      quando a estrutura não tem H experimentais para inferir o tautômero
+      real — não é preciso nenhuma intervenção nesse ramo.
+    """
+    if ph >= RESIDUE_PKA["HIS"]:
+        return
+    for atom in mol.GetAtoms():
+        info = atom.GetPDBResidueInfo()
+        name = info.GetName().strip() if info else ""
+        if name == "NE2":
+            atom.SetNumExplicitHs(1); atom.SetNoImplicit(True); atom.SetFormalCharge(1)
+        elif name == "ND1":
+            atom.SetNumExplicitHs(1); atom.SetNoImplicit(True); atom.SetFormalCharge(0)
+
+
+def _residue_pdb_block(residue) -> str:
+    """Serializa um resíduo Bio.PDB (sem H) em um bloco PDB mínimo, no
+    formato de colunas fixas esperado pelo RDKit (Chem.MolFromPDBBlock)."""
+    lines = []
+    i = 0
+    for atom in residue.get_atoms():
+        elem = (atom.element or atom.get_name()[0]).strip().upper()
+        if elem in ("H", "D", ""):
+            continue
+        i += 1
+        x, y, z = atom.get_coord()
+        name = atom.get_name()
+        name_field = f" {name:<3s}" if len(name) < 4 else name[:4]
+        lines.append(
+            f"ATOM  {i:5d} {name_field:<4s} {residue.get_resname():<3s} "
+            f"A{residue.id[1]:4d}    {x:8.3f}{y:8.3f}{z:8.3f}"
+            f"{1.0:6.2f}{0.0:6.2f}          {elem:>2s}"
+        )
+    lines.append("END")
+    return "\n".join(lines)
+
+
+def protonate_residue(residue, ph: float = 7.4) -> "Chem.Mol | None":
+    """Constrói um fragmento RDKit protonado (H explícitos com coordenadas
+    3D) a partir de um resíduo Bio.PDB isolado, no pH informado.
+
+    As ligações peptídicas cortadas nas bordas do fragmento (backbone N/C
+    do resíduo, que na cadeia real se ligam ao resíduo vizinho) ficam com
+    valência incompleta ao isolar o resíduo — o RDKit completa
+    automaticamente com H ao sanitizar/adicionar hidrogênios. Este é
+    exatamente o "capping" padrão de métodos QM fragmentados (FMO, Kitaura
+    et al. 1999): a ligação peptídica cortada vira -NH2/-CHO em vez de
+    -NH-C(=O)-. Aproximação aceitável para um descritor de ML — não para
+    energia de ligação de alta precisão (validado manualmente: ver
+    discussão no código-fonte/commit desta função).
+
+    Retorna None em qualquer falha — o chamador cai para a aproximação
+    semi-empírica (eletronegatividade) nesse resíduo.
+    """
+    resname = residue.get_resname().upper()
+    try:
+        pdb_block = _residue_pdb_block(residue)
+        mol = Chem.MolFromPDBBlock(pdb_block, removeHs=False, sanitize=False)
+        if mol is None or mol.GetNumAtoms() == 0:
+            return None
+
+        if resname == "HIS":
+            Chem.SanitizeMol(mol)
+            _apply_his_protonation(mol, ph)
+        else:
+            Chem.SanitizeMol(mol)
+            adj = determine_protonation(resname, ph)
+            if adj is not None:
+                for atom in mol.GetAtoms():
+                    info = atom.GetPDBResidueInfo()
+                    if info and info.GetName().strip() == adj["atom"]:
+                        atom.SetNumExplicitHs(adj["n_h"])
+                        atom.SetNoImplicit(True)
+                        atom.SetFormalCharge(adj["charge"])
+                        break
+
+        Chem.SanitizeMol(mol)
+        mol = Chem.AddHs(mol, addCoords=True)
+        Chem.SanitizeMol(mol)
+        rdPartialCharges.ComputeGasteigerCharges(mol)
+        return mol
+    except Exception as e:
+        log.debug(f"  Protonação falhou para {resname}{residue.id[1]}: "
+                  f"{type(e).__name__}: {e}")
+        return None
+
+
+def protonate_site_residues(
+    residues: list, ph: float = 7.4,
+) -> tuple[np.ndarray, list[str], np.ndarray, list[dict]]:
+    """Núcleo compartilhado de protonação: recebe uma lista JÁ SELECIONADA
+    de resíduos Bio.PDB (objetos `Residue`, com TODOS os átomos de cada
+    resíduo — não sub-conjuntos parciais, ver nota abaixo) e retorna os
+    arrays combinados protonados + fragmentos por resíduo.
+
+    Usada tanto por load_site_atoms_protonated (treino — lê o
+    binding_site.pdb inteiro) quanto por pipeline_generate.pdb_to_site_tensor
+    (inferência — resíduos selecionados por extract_site_from_pdb ou
+    load_site_from_residues_pdb). Ambos os lados chamam esta MESMA função
+    para que a lógica de protonação seja idêntica — é a mesma garantia de
+    paridade treino/inferência que motivou os canais 3-4 serem
+    site-derived em vez de vir do ligante (ver BLOCO 3B).
+
+    IMPORTANTE: cada `residue` deve conter o conjunto COMPLETO de átomos do
+    resíduo (backbone + cadeia lateral), não um subconjunto escolhido por
+    proximidade atômica ao ligante — do contrário, protonate_residue
+    interpretaria átomos ausentes no MEIO do resíduo (não apenas nas bordas
+    da cadeia) como valência cortada e adicionaria H espúrios. A seleção de
+    QUAIS resíduos incluir pode ser por proximidade (cutoff), mas uma vez
+    selecionado, o resíduo entra inteiro.
+
+    Resíduos-padrão (STANDARD_AMINO_ACIDS) são reconstruídos com H
+    explícitos e cargas Gasteiger REAIS (RDKit). Íons/metais/água/
+    heteroátomos não passam pela protonação e usam o fallback de carga
+    aproximada por elemento (_ELEM_CHARGE_APPROX). Se a protonação de um
+    resíduo-padrão falhar por qualquer motivo, esse resíduo específico
+    também cai no fallback — nunca derruba o par/sítio inteiro.
+
+    Returns:
+        coords, elements, charges — arrays combinados de todos os átomos
+            (heavy + H, na ordem dos resíduos de entrada).
+        fragments — lista de dicts {"resname", "start", "end", "mol"}, um
+            por resíduo — usada pela etapa de QM fragmentado
+            (_fragment_qm_weights). "mol" é None quando caiu no fallback.
+    """
+    coords_all: list = []
+    elements_all: list = []
+    charges_all: list = []
+    fragments: list = []
+
+    for residue in residues:
+        resname = residue.get_resname().upper()
+        is_standard = residue.id[0] == " " and resname in STANDARD_AMINO_ACIDS
+        mol = protonate_residue(residue, ph) if is_standard else None
+
+        start = len(coords_all)
+        if mol is not None:
+            conf = mol.GetConformer()
+            for atom in mol.GetAtoms():
+                pos = conf.GetAtomPosition(atom.GetIdx())
+                coords_all.append([pos.x, pos.y, pos.z])
+                elements_all.append(atom.GetSymbol().upper())
+                q = float(atom.GetDoubleProp("_GasteigerCharge")
+                          if atom.HasProp("_GasteigerCharge") else 0.0)
+                charges_all.append(q if np.isfinite(q) else 0.0)
+        else:
+            for atom in residue.get_atoms():
+                elem = (atom.element or atom.get_name()[0]).strip().upper()
+                if elem in ("H", "D", ""):
+                    continue
+                coords_all.append(atom.get_vector().get_array())
+                elements_all.append(elem)
+                charges_all.append(_ELEM_CHARGE_APPROX.get(elem, 0.0))
+        end = len(coords_all)
+        if end > start:
+            fragments.append({
+                "resname": resname, "start": start, "end": end, "mol": mol,
+            })
+
+    coords_arr  = np.array(coords_all, dtype=np.float32)
+    charges_arr = np.nan_to_num(np.array(charges_all, dtype=np.float32),
+                                 nan=0.0, posinf=0.0, neginf=0.0)
+    return coords_arr, elements_all, charges_arr, fragments
+
+
+def load_site_atoms_protonated(
+    pdb_path: Path, ph: float = 7.4,
+) -> tuple[np.ndarray, list[str], np.ndarray, list[dict]]:
+    """Lê TODO o binding_site.pdb e protona por pH — wrapper de
+    protonate_site_residues (ver lá para os detalhes). Usada no treino,
+    onde binding_site.pdb já contém exatamente os resíduos do bolso
+    (selecionados por pipeline_curate.get_binding_site, que sempre inclui
+    o resíduo inteiro, nunca átomos parciais).
+    """
+    parser = PDBParser(QUIET=True)
+    struct = parser.get_structure("site", str(pdb_path))
+    residues = [r for model in struct for chain in model for r in chain]
+    return protonate_site_residues(residues, ph)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -791,6 +1487,87 @@ def mol_to_graph(mol_rdkit, pair_id: str) -> Optional["PyGData"]:
     return graph
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 4B — ORDEM DE CONSTRUÇÃO ANCORADA NO SÍTIO (para o decoder autorregressivo)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_site_anchored_atom_order(
+    ch3: np.ndarray,
+    ch4: np.ndarray,
+    origin: np.ndarray,
+    voxel_size: float,
+    ligand_pos: np.ndarray,
+    edge_index: np.ndarray,
+) -> np.ndarray:
+    """Ordem canônica de construção do ligante para teacher forcing do
+    decoder autorregressivo — ancorada no sítio, ao estilo Pocket2Mol
+    (Peng et al., 2022): a molécula "cresce" a partir do ponto do bolso com
+    maior sinal doador/aceptor de elétrons (canais 3-4, ver
+    channel_site_orbital_field), em vez de uma ordem arbitrária (canônica
+    RDKit) desconectada da geometria do encaixe.
+
+    Algoritmo:
+      1. Âncora = voxel de maior (canal 3 + canal 4) → coordenada 3D.
+      2. Átomo semente = átomo real do ligante mais próximo da âncora.
+      3. Busca "melhor-primeiro" pelas ligações reais: a cada passo, expande
+         o átomo não-visitado mais próximo da âncora entre os vizinhos já
+         alcançados (não é BFS por profundidade — é por proximidade
+         espacial à âncora, gerando uma ordem que cresce de dentro do bolso
+         para fora).
+      4. Se o grafo for desconexo (ligantes multi-fragmento, comuns em
+         alguns datasets), ao esgotar um fragmento reinicia a busca a
+         partir do átomo não-visitado mais próximo da âncora entre os
+         fragmentos restantes — garante que TODOS os átomos entrem na
+         ordem, sem exigir conectividade global.
+
+    Limitação assumida: ordem única e determinística por ligante (calculada
+    uma vez aqui, cacheada no grafo). Pocket2Mol usa seleção de foco
+    ligeiramente randomizada durante o treino para robustez extra — não
+    implementado aqui por simplicidade; possível refinamento futuro.
+
+    Returns:
+        order — array (n_atoms,) com os índices originais dos átomos na
+            ordem de construção (order[0] = primeiro átomo a colocar).
+    """
+    n_atoms = ligand_pos.shape[0]
+    if n_atoms == 0:
+        return np.array([], dtype=np.int64)
+    if n_atoms == 1:
+        return np.array([0], dtype=np.int64)
+
+    combined = ch3 + ch4
+    ijk = np.unravel_index(int(np.argmax(combined)), combined.shape)
+    anchor_xyz = origin + voxel_size * np.array(ijk, dtype=np.float32)
+
+    adjacency: dict = {a: set() for a in range(n_atoms)}
+    for idx in range(edge_index.shape[1]):
+        i, j = int(edge_index[0, idx]), int(edge_index[1, idx])
+        if i != j:
+            adjacency[i].add(j)
+            adjacency[j].add(i)
+
+    dists = np.linalg.norm(ligand_pos - anchor_xyz[None, :], axis=1)
+
+    visited = np.zeros(n_atoms, dtype=bool)
+    order: list = []
+    while len(order) < n_atoms:
+        remaining = np.where(~visited)[0]
+        seed = int(remaining[np.argmin(dists[remaining])])
+        frontier = [seed]
+        while frontier:
+            frontier.sort(key=lambda a: (dists[a], a))   # mais próximo da âncora primeiro
+            atom = frontier.pop(0)
+            if visited[atom]:
+                continue
+            visited[atom] = True
+            order.append(atom)
+            for nb in adjacency[atom]:
+                if not visited[nb] and nb not in frontier:
+                    frontier.append(nb)
+
+    return np.array(order, dtype=np.int64)
+
+
 def load_ligand_mol(pdb_path: Path) -> Optional[object]:
     """Lê o ligand.pdb com RDKit. Tenta inferir ligações se necessário."""
     # Tenta leitura direta
@@ -851,9 +1628,14 @@ def process_pair(
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
-    # ── 1. Carrega átomos do sítio ────────────────────────────────────────────
+    # ── 1. Carrega átomos do sítio (protonados por pH, se config permitir) ────
     try:
-        site_coords, site_elements, site_charges = load_site_atoms(site_pdb)
+        if config.get("protonate_site", True):
+            site_coords, site_elements, site_charges, site_fragments = \
+                load_site_atoms_protonated(site_pdb, ph=config.get("ph", 7.4))
+        else:
+            site_coords, site_elements, site_charges = load_site_atoms(site_pdb)
+            site_fragments = []
     except Exception as e:
         return {"pair_id": pair_id, "status": "error_site_load", "msg": str(e)}
 
@@ -878,12 +1660,17 @@ def process_pair(
         batch=config.get("vox_batch", 500 if HAS_CUPY else 100),
     )
 
-    # Canais 3 e 4: HOMO/LUMO do ligante — QM (GPU4PySCF) ou aproximação
-    if mol is not None:
-        ch3, ch4 = channel_homo_lumo_qm(grid_coords, mol, origin, voxel_size, config)
-    else:
-        ch3 = np.zeros((n, n, n), dtype=np.float32)
-        ch4 = np.zeros((n, n, n), dtype=np.float32)
+    # Canais 3-4: campo doador/aceptor de elétrons do SÍTIO (HOMO/LUMO-like)
+    # — computados a partir dos átomos do próprio bolso de ligação, nunca do
+    # ligante (elimina o vazamento treino↔inferência que existia quando
+    # esses canais vinham do QM do ligante co-cristalizado). Independem de
+    # `mol`. Nível de teoria conforme config["site_qm_method"] — ver
+    # channel_site_orbital_field.
+    sigma_da = max(config["gaussian_sigma"] * 1.5, voxel_size)
+    ch3, ch4 = channel_site_orbital_field(
+        gf, site_coords, site_elements, site_charges, site_fragments,
+        sigma_da, (n, n, n), config,
+    )
 
     # ── 5. Normalização por canal (z-score robusto) ───────────────────────────
     tensor = np.stack([ch0, ch1, ch2, ch3, ch4], axis=-1)  # (n,n,n,5)
@@ -921,6 +1708,16 @@ def process_pair(
         try:
             graph = mol_to_graph(mol, pair_id)
             if graph is not None:
+                # Ordem de construção ancorada no sítio (ver
+                # compute_site_anchored_atom_order) — usada pelo decoder
+                # autorregressivo para teacher forcing. ch3/ch4 aqui ainda
+                # são os canais RAW (antes da normalização por canal em
+                # `tensor`), o que não afeta a posição do argmax.
+                order = compute_site_anchored_atom_order(
+                    ch3, ch4, origin, voxel_size,
+                    graph.pos.numpy(), graph.edge_index.numpy(),
+                )
+                graph.atom_order = torch.tensor(order, dtype=torch.long)
                 torch.save(graph, out_dir / "ligand_graph.pt")
                 graph_ok = True
         except Exception as e:
@@ -933,16 +1730,9 @@ def process_pair(
 
     # ── 8. Metadados ──────────────────────────────────────────────────────────
     elapsed = time.time() - t0
-    _qm_used = bool(
-        mol and HAS_PYSCF and
-        len([a for a in mol.GetAtoms() if a.GetAtomicNum() > 1]) <= config["max_qm_atoms"]
-    )
-    _qm_backend = (
-        "GPU4PySCF" if (HAS_GPU4PYSCF and _qm_used) else
-        "PySCF/CPU" if HAS_PYSCF else
-        "Gasteiger"
-    )
-        
+    # Canais 3-4 são sempre derivados do SÍTIO, nunca do ligante — o método
+    # exato (QM fragmentado, xTB ou heurística) depende de site_qm_method e
+    # da disponibilidade de fallback por resíduo (ver channel_site_orbital_field).
     meta = {
         "pair_id":         pair_id,
         "grid_size":       n,
@@ -951,8 +1741,9 @@ def process_pair(
         "n_site_atoms":    int(len(site_coords)),
         "n_ligand_atoms":  int(mol.GetNumAtoms()) if mol else 0,
         "ligand_smiles":   Chem.MolToSmiles(mol) if mol else "",
-        "qm_used":     _qm_used,
-        "qm_backend":  _qm_backend,
+        "orbital_channels_source": config.get("site_qm_method", "rhf_sto3g_fragments"),
+        "protonate_site":  bool(config.get("protonate_site", True)),
+        "site_ph":         float(config.get("ph", 7.4)),
         "vox_backend": "CuPy" if HAS_CUPY else "NumPy",
         "graph_saved":     graph_ok,
         "tensor_shape":    list(tensor.shape),
@@ -964,7 +1755,7 @@ def process_pair(
 
     log.info(
         f"  ✓ {pair_id} — {elapsed:.1f}s "
-        f"| QM: {_qm_backend} | Vox: {meta['vox_backend']} "
+        f"| Vox: {meta['vox_backend']} "
         f"| site={len(site_coords)} átomos | lig={meta['n_ligand_atoms']} átomos"
     )
     return meta
@@ -1071,21 +1862,17 @@ def run(
     log.info(f"  Curated  : {curated_dir}")
     log.info(f"  Output   : {tensor_dir}")
 
-    qm_backend = (
-        "GPU4PySCF (CUDA)" if HAS_GPU4PYSCF
-        else "PySCF (CPU)" if HAS_PYSCF
-        else "Aproximação Gasteiger (sem PySCF)"
-    )
     log.info(
         f"  Grid     : {VOXEL_CONFIG['grid_size']}³ voxels  |  "
-        f"Canais: {VOXEL_CONFIG['n_site_channels']}  |  QM: {qm_backend}"
+        f"Canais: {VOXEL_CONFIG['n_site_channels']} "
+        f"(0-2 vdW/carga/MEP do sítio, 3-4 doador/aceptor semi-empírico do sítio)"
     )
     log.info(
         f"  Grafos   : {'PyTorch Geometric (.pt)' if HAS_TORCH else 'NumPy (.npz)'}"
     )
-    if not HAS_GPU4PYSCF and HAS_CUDA:
-        log.info("  Dica     : instale gpu4pyscf para acelerar os cálculos QM na RTX")
-        log.info("             pip install gpu4pyscf-cuda12x")
+    # PySCF/GPU4PySCF permanecem disponíveis para channel_homo_lumo_qm
+    # (HOMO/LUMO do ligante), mas essa função não é mais chamada na
+    # construção do tensor do sítio — ver nota em channel_homo_lumo_qm.
 
     if args.pair:
         pair_dirs = [curated_dir / args.pair]

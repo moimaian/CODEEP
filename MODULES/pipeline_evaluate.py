@@ -234,17 +234,17 @@ def evaluate_on_test(ckpt_dir: Path, tensor_dir: Path) -> dict:
 
     # Loop de avaliação
     # Inicializa todos os componentes que cvae_loss pode retornar
-    totals = {k: 0.0 for k in ["total","recon","atom","bond","exist","pos","charge","kl"]}
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
     n = 0
     with torch.no_grad():
         for batch in test_loader:
             if batch is None:
                 continue
             site        = batch["tensor"].to(device)
-            graph       = batch["graph"].to(device)
+            graphs      = [g.to(device) for g in batch["graphs"]]
             voxel_sizes = batch["voxel_sizes"].to(device)
-            preds = model(site, graph, voxel_sizes)
-            losses = cvae_loss(preds, graph, beta=1.0)
+            preds = model(site, graphs, voxel_sizes)
+            losses = cvae_loss(preds, beta=1.0)
             # Acumula apenas as chaves presentes — robusto a versões diferentes
             for k in totals:
                 if k in losses and torch.isfinite(losses[k]):
@@ -260,6 +260,7 @@ def evaluate_on_test(ckpt_dir: Path, tensor_dir: Path) -> dict:
         "val_loss_ckpt":    round(float(ckpt.get("val_loss", 0)), 4),
         "test_total":       round(totals["total"]  / n, 4),
         "test_recon":       round(totals["recon"]  / n, 4),
+        "test_stop":        round(totals["stop"]   / n, 6),
         "test_atom":        round(totals["atom"]   / n, 6),  # 6 casas: valores ~1e-5
         "test_bond":        round(totals["bond"]   / n, 6),
         "test_exist":       round(totals["exist"]  / n, 6),
@@ -274,175 +275,36 @@ def evaluate_on_test(ckpt_dir: Path, tensor_dir: Path) -> dict:
 # BLOCO 3 — GERAÇÃO E VALIDAÇÃO DE LIGANTES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def decode_predictions_to_mol(preds: dict, threshold: float = 0.5):
-    """Converte predições do decoder em molécula RDKit.
+def _load_generate_module():
+    import importlib.util
+    gen_path = Path(__file__).resolve().parent / "pipeline_generate.py"
+    spec = importlib.util.spec_from_file_location("pipeline_generate", gen_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Não foi possível criar spec para {gen_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
-    O decoder gera:
-      - atom_logits  → tipo de átomo por softmax
-      - bond_logits  → tipo de ligação por softmax
-      - bond_exist   → probabilidade de a ligação existir
-      - positions    → coordenadas 3D
 
-    Esta função monta a molécula a partir dessas predições.
+def decode_predictions_to_mol(candidate: dict):
+    """Converte um candidato de LigandCVAE.sample() (decoder autorregressivo)
+    em molécula RDKit.
+
+    Fina wrapper sobre pipeline_generate.preds_to_mol — reaproveita a MESMA
+    lógica de validação química (valência, distância, reparo de fragmentos
+    desconexos) usada na geração real, em vez de manter uma cópia duplicada
+    aqui que divergiria com o tempo (era exatamente o que acontecia com a
+    versão anterior, escrita para o decoder de topologia fixa por template
+    — já incompatível com o formato de saída atual).
     """
     if not HAS_RDKIT:
         return None
-
-    import torch
-    atom_types = ["C","N","O","S","P","F","CL","BR","I","FE","ZN","MG","C","C"]
-    bond_map   = {0: Chem.rdchem.BondType.SINGLE,
-                  1: Chem.rdchem.BondType.DOUBLE,
-                  2: Chem.rdchem.BondType.TRIPLE,
-                  3: Chem.rdchem.BondType.AROMATIC}
-    max_valence = {
-        "C": 4, "N": 3, "O": 2, "S": 6, "P": 5, "F": 1,
-        "CL": 1, "BR": 1, "I": 1, "FE": 6, "ZN": 4, "MG": 2,
-    }
-    bond_budget = {
-        Chem.rdchem.BondType.SINGLE: 1.0,
-        Chem.rdchem.BondType.DOUBLE: 2.0,
-        Chem.rdchem.BondType.TRIPLE: 3.0,
-        Chem.rdchem.BondType.AROMATIC: 1.5,
-    }
-
-    def bond_distance_ok(sym_i: str, sym_j: str, bond_type, dist: float) -> bool:
-        if dist <= 0.9:
-            return False
-        limit = {
-            Chem.rdchem.BondType.SINGLE: 2.15,
-            Chem.rdchem.BondType.DOUBLE: 1.90,
-            Chem.rdchem.BondType.TRIPLE: 1.45,
-            Chem.rdchem.BondType.AROMATIC: 1.65,
-        }.get(bond_type, 2.15)
-        if {sym_i.upper(), sym_j.upper()} & {"S", "P", "FE", "ZN", "MG", "CL", "BR", "I"}:
-            limit += 0.25
-        return dist <= limit
-
-    def sanitize_generated_mol(mol):
-        try:
-            Chem.SanitizeMol(mol)
-            return mol
-        except Exception:
-            pass
-
-        aromatic_bonds = [
-            (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
-            for bond in mol.GetBonds()
-            if bond.GetBondType() == Chem.rdchem.BondType.AROMATIC
-        ]
-        if aromatic_bonds:
-            downgraded = Chem.RWMol(mol)
-            for i, j in aromatic_bonds:
-                bond = downgraded.GetBondBetweenAtoms(i, j)
-                if bond is None:
-                    continue
-                bond.SetBondType(Chem.rdchem.BondType.SINGLE)
-                bond.SetIsAromatic(False)
-            downgraded_mol = downgraded.GetMol()
-            try:
-                Chem.SanitizeMol(downgraded_mol)
-                return downgraded_mol
-            except Exception:
-                pass
-
+    try:
+        gen = _load_generate_module()
+        return gen.preds_to_mol(candidate)
+    except Exception as e:
+        log.warning(f"  decode_predictions_to_mol: {e}")
         return None
-
-    def relax_generated_geometry(mol):
-        if mol is None or mol.GetNumConformers() == 0 or mol.GetNumBonds() == 0:
-            return mol
-        try:
-            if AllChem.MMFFHasAllMoleculeParams(mol):
-                AllChem.MMFFOptimizeMolecule(mol, mmffVariant="MMFF94s", maxIters=200)
-            else:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
-        except Exception:
-            pass
-        return mol
-
-    atom_indices = preds["atom_logits"].argmax(dim=-1).cpu().numpy()
-    n_atoms      = len(atom_indices)
-    bond_probs   = torch.sigmoid(preds["bond_exist"]).cpu().numpy()
-    bond_types   = preds["bond_logits"].argmax(dim=-1).cpu().numpy()
-    positions    = preds["positions"].cpu().numpy()
-
-    rwmol = Chem.RWMol()
-    conf  = Chem.Conformer(n_atoms)
-
-    for i, atom_idx in enumerate(atom_indices):
-        sym = atom_types[min(int(atom_idx), len(atom_types)-1)]
-        rwmol.AddAtom(Chem.Atom(sym))
-        conf.SetAtomPosition(i, positions[i].tolist())
-
-    rwmol.AddConformer(conf, assignId=True)
-
-    valence_used = [0.0] * n_atoms
-    added = set()
-
-    if "edge_index" in preds:
-        edge_index = preds["edge_index"].cpu().numpy()
-        merged_edges = {}
-        for idx in range(edge_index.shape[1]):
-            i = int(edge_index[0, idx])
-            j = int(edge_index[1, idx])
-            if i == j or i >= n_atoms or j >= n_atoms:
-                continue
-            a, b = sorted((i, j))
-            item = merged_edges.setdefault((a, b), {"prob": [], "type": []})
-            item["prob"].append(float(bond_probs[idx]))
-            item["type"].append(int(bond_types[idx]))
-
-        ranked_edges = []
-        for (i, j), item in merged_edges.items():
-            prob = max(item["prob"]) if item["prob"] else 0.0
-            type_idx = max(set(item["type"]), key=item["type"].count) if item["type"] else 0
-            bond_type = bond_map.get(type_idx, Chem.rdchem.BondType.SINGLE)
-            dist = float(np.linalg.norm(positions[i] - positions[j]))
-            ranked_edges.append((prob, dist, i, j, bond_type))
-
-        ranked_edges.sort(key=lambda entry: (-entry[0], entry[1]))
-
-        for prob, dist, i, j, bond_type in ranked_edges:
-            if prob < threshold or (i, j) in added:
-                continue
-            sym_i = atom_types[min(int(atom_indices[i]), len(atom_types)-1)].upper()
-            sym_j = atom_types[min(int(atom_indices[j]), len(atom_types)-1)].upper()
-            budget = bond_budget.get(bond_type, 1.0)
-            if not bond_distance_ok(sym_i, sym_j, bond_type, dist):
-                continue
-            if valence_used[i] + budget > max_valence.get(sym_i, 4) + 1e-6:
-                continue
-            if valence_used[j] + budget > max_valence.get(sym_j, 4) + 1e-6:
-                continue
-            rwmol.AddBond(i, j, bond_type)
-            valence_used[i] += budget
-            valence_used[j] += budget
-            added.add((i, j))
-
-    if not added:
-        pairs = []
-        for i in range(n_atoms):
-            for j in range(i + 1, n_atoms):
-                dist = float(np.linalg.norm(positions[i] - positions[j]))
-                if 1.0 < dist < 1.9:
-                    pairs.append((dist, i, j))
-        pairs.sort()
-
-        for dist, i, j in pairs:
-            sym_i = atom_types[min(int(atom_indices[i]), len(atom_types)-1)].upper()
-            sym_j = atom_types[min(int(atom_indices[j]), len(atom_types)-1)].upper()
-            if valence_used[i] >= max_valence.get(sym_i, 4):
-                continue
-            if valence_used[j] >= max_valence.get(sym_j, 4):
-                continue
-            rwmol.AddBond(i, j, Chem.rdchem.BondType.SINGLE)
-            valence_used[i] += 1.0
-            valence_used[j] += 1.0
-            added.add((i, j))
-
-    mol = sanitize_generated_mol(rwmol.GetMol())
-    if mol is None:
-        return None
-    return relax_generated_geometry(mol)
 
 
 def compute_molecule_metrics(smiles_list) -> dict:
@@ -552,7 +414,8 @@ def generate_ligands_for_site(
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    # Pega um batch do teste como template
+    # Pega um par do teste como sítio de referência (só o tensor do sítio —
+    # o decoder autorregressivo não usa mais nenhum "template graph")
     test_ds = SiteLigandDataset(tensor_dir=tensor_dir, split="test")
     from torch.utils.data import DataLoader
     loader      = DataLoader(test_ds, batch_size=1, shuffle=True,
@@ -562,25 +425,22 @@ def generate_ligands_for_site(
         return []
 
     site        = batch["tensor"].to(device)
-    template    = batch["graph"].to(device)
     real_smiles = batch["smiles"][0]
 
     log.info(f"Sítio de referência: {batch['pair_ids'][0]}")
     log.info(f"Ligante real (cristal): {real_smiles}")
     log.info(f"Gerando {n_samples} ligantes (temperatura={temperature})...")
 
-    # Amostragem
+    # Amostragem — construção sequencial em lockstep (ver LigandCVAE.sample)
     generated_records = []
     voxel_sizes = batch["voxel_sizes"].to(device)
     with torch.no_grad():
-        samples = model.sample(site, template,
+        samples = model.sample(site,
                                n_samples=n_samples,
                                temperature=temperature,
                                voxel_sizes=voxel_sizes)
-        for preds in samples:
-            preds = dict(preds)
-            preds["edge_index"] = template.edge_index.detach().cpu()
-            mol = decode_predictions_to_mol(preds)
+        for candidate in samples:
+            mol = decode_predictions_to_mol(candidate)
             if mol:
                 smi = Chem.MolToSmiles(mol)
                 generated_records.append({"smiles": smi, "mol": mol})

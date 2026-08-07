@@ -119,18 +119,29 @@ def extract_site_from_pdb(
     pdb_path: Path,
     cutoff_A: float = 6.0,
     min_site_residues: int = 5,
-) -> tuple[np.ndarray, list[str], np.ndarray]:
+) -> tuple[np.ndarray, list[str], np.ndarray, list]:
     """Extrai o sítio de ligação de um PDB com ligante co-cristalizado.
 
     Estratégia:
       1. Procura ligantes HETATM orgânicos (com carbono, ≥7 átomos pesados)
-      2. Para cada ligante, identifica resíduos proteicos a ≤ cutoff_A Å
-      3. Retorna coordenadas, elementos e cargas do sítio
+      2. Para cada ligante, identifica RESÍDUOS proteicos com pelo menos um
+         átomo a ≤ cutoff_A Å — e inclui o resíduo INTEIRO (backbone +
+         cadeia lateral), nunca um subconjunto parcial de átomos. Mesma
+         regra de seleção usada no treino (pipeline_curate.get_binding_site)
+         — necessário para load_site_atoms_protonated/protonate_residue
+         funcionarem corretamente (um resíduo com átomos faltando NO MEIO,
+         não só nas bordas da cadeia, confundiria a lógica de H-capping).
+      3. Retorna coordenadas, elementos, cargas aproximadas E a lista de
+         objetos de resíduo Bio.PDB (para protonação — ver
+         pipeline_voxelize.protonate_site_residues).
 
     Returns:
         coords   : (N, 3) float32 — coordenadas dos átomos do sítio
         elements : [N] str        — símbolos dos elementos
         charges  : (N,) float32   — cargas parciais aproximadas por elemento
+        residues : list           — objetos Bio.PDB Residue selecionados
+                                     (resíduos completos), na mesma ordem
+                                     em que seus átomos aparecem em coords
     """
     from scipy.spatial import cKDTree
 
@@ -148,8 +159,8 @@ def extract_site_from_pdb(
         "P": +0.40, "FE": +0.30, "ZN": +0.40, "MG": +0.50,
     }
 
-    # Coleta todos os átomos proteicos
-    prot_coords, prot_elems = [], []
+    # Coleta todos os átomos proteicos, com o resíduo de origem de cada um
+    prot_coords, prot_elems, prot_residues = [], [], []
     for model in struct:
         for chain in model:
             for residue in chain:
@@ -160,6 +171,7 @@ def extract_site_from_pdb(
                     if e not in ("H", "D", "X"):
                         prot_coords.append(atom.get_vector().get_array())
                         prot_elems.append(e)
+                        prot_residues.append(residue)
 
     if not prot_coords:
         raise ValueError(f"Nenhum átomo proteico encontrado em {pdb_path}")
@@ -194,30 +206,44 @@ def extract_site_from_pdb(
         log.warning("Nenhum ligante orgânico co-cristalizado encontrado. "
                     "Usando o centro geométrico da proteína como sítio.")
         center = prot_arr.mean(axis=0)
-        # Pega os 80 átomos mais próximos do centro como sítio aproximado
+        # Pega os resíduos cujo átomo mais próximo está entre os 80
+        # mais próximos do centro geométrico (sítio aproximado)
         dists  = np.linalg.norm(prot_arr - center, axis=1)
         idx    = np.argsort(dists)[:80]
-        site_coords = prot_arr[idx]
-        site_elems  = [prot_elems[i] for i in idx]
+        site_residue_ids = {id(prot_residues[i]) for i in idx}
     else:
-        # Identifica resíduos do sítio via KDTree
+        # Resíduos com ao menos um átomo a ≤ cutoff_A do ligante
         indices = prot_tree.query_ball_point(best_ligand_coords, r=cutoff_A)
-        site_idx = sorted(set(i for sublist in indices for i in sublist))
-        if len(site_idx) < min_site_residues:
+        atom_idx = sorted(set(i for sublist in indices for i in sublist))
+        if len(atom_idx) < min_site_residues:
             raise ValueError(
-                f"Sítio muito pequeno ({len(site_idx)} átomos). "
+                f"Sítio muito pequeno ({len(atom_idx)} átomos). "
                 f"Tente aumentar --cutoff (atual: {cutoff_A} Å)."
             )
-        site_coords = prot_arr[site_idx]
-        site_elems  = [prot_elems[i] for i in site_idx]
+        site_residue_ids = {id(prot_residues[i]) for i in atom_idx}
 
+    # Expande para o resíduo INTEIRO (todos os átomos, não só os que caíram
+    # dentro do cutoff) — mesma regra de pipeline_curate.get_binding_site.
+    seen = set()
+    residues, site_coords, site_elems = [], [], []
+    for coord, elem, residue in zip(prot_coords, prot_elems, prot_residues):
+        if id(residue) not in site_residue_ids:
+            continue
+        site_coords.append(coord)
+        site_elems.append(elem)
+        if id(residue) not in seen:
+            seen.add(id(residue))
+            residues.append(residue)
+
+    site_coords = np.array(site_coords, dtype=np.float32)
     charges = np.array(
         [ELEM_CHARGE.get(e, 0.0) for e in site_elems],
         dtype=np.float32
     )
 
-    log.info(f"  Sítio extraído: {len(site_coords)} átomos pesados")
-    return site_coords, site_elems, charges
+    log.info(f"  Sítio extraído: {len(site_coords)} átomos pesados "
+             f"({len(residues)} resíduos completos)")
+    return site_coords, site_elems, charges, residues
 
 
 def load_site_from_residues_pdb(
@@ -237,17 +263,21 @@ def load_site_from_residues_pdb(
     parser_bio = PDBParser(QUIET=True)
     struct = parser_bio.get_structure("site", str(site_pdb))
 
-    coords, elements = [], []
+    coords, elements, residues = [], [], []
     for model in struct:
         for chain in model:
             for residue in chain:
                 if residue.get_resname().strip() in SKIP_RESNAMES:
                     continue
+                added = False
                 for atom in residue.get_atoms():
                     e = _infer_element(atom)
                     if e not in ("H","D","X",""):
                         coords.append(atom.get_vector().get_array())
                         elements.append(e)
+                        added = True
+                if added:
+                    residues.append(residue)
 
     if not coords:
         raise ValueError(f"Nenhum átomo encontrado em {site_pdb}")
@@ -256,8 +286,8 @@ def load_site_from_residues_pdb(
     charges    = np.array([ELEM_CHARGE.get(e, 0.0) for e in elements],
                           dtype=np.float32)
     log.info(f"  Sítio carregado de {site_pdb.name}: "
-             f"{len(coords_arr)} átomos pesados")
-    return coords_arr, elements, charges
+             f"{len(coords_arr)} átomos pesados ({len(residues)} resíduos)")
+    return coords_arr, elements, charges, residues
 
 def load_reference_ligand(ref_path: Path, out_dir: Path) -> tuple["Chem.Mol | None", "Path | None"]:
     """Carrega ligante de referência em SDF/PDB/MOL2 e normaliza para SDF.
@@ -316,12 +346,18 @@ def pdb_to_site_tensor(
     min_site_residues: int = 5,
     site_pdb: "Path | None" = None,
     project_dir: "Path | None" = None,
+    config_overrides: "dict | None" = None,
 ) -> np.ndarray:
     """Pipeline completo: PDB → tensor do sítio (5, 32, 32, 32).
 
     Se site_pdb for fornecido, carrega o sítio diretamente desse arquivo
     (sem detecção automática). Caso contrário, extrai automaticamente a
     partir do ligante co-cristalizado em pdb_path.
+
+    config_overrides permite sobrescrever ph/protonate_site/site_qm_method
+    (mesmas chaves de pipeline_voxelize.VOXEL_CONFIG) — por padrão usa os
+    valores default do módulo, que DEVEM ser os mesmos usados para gerar
+    os tensores de treino (ver nota de paridade abaixo).
     """
     # Carrega módulo de voxelização
     _proj = Path(project_dir) if project_dir else PROJECT_DIR
@@ -331,35 +367,60 @@ def pdb_to_site_tensor(
     spec.loader.exec_module(vox)
 
     config = vox.VOXEL_CONFIG.copy()
-    n      = config["grid_size"]  # 32
+    if config_overrides:
+        config.update(config_overrides)
+    n = config["grid_size"]  # 32
 
-    # Extrai sítio — modo manual (--site-pdb) ou automático
+    # Extrai sítio — modo manual (--site-pdb) ou automático. Em ambos os
+    # casos recebe também a lista de resíduos Bio.PDB (resíduos completos)
+    # para a etapa de protonação abaixo.
     if site_pdb is not None:
-        site_coords, site_elements, site_charges = \
+        site_coords, site_elements, site_charges, site_residues = \
             load_site_from_residues_pdb(site_pdb)
     else:
-        site_coords, site_elements, site_charges = extract_site_from_pdb(
-            pdb_path, cutoff_A, min_site_residues
-        )
+        site_coords, site_elements, site_charges, site_residues = \
+            extract_site_from_pdb(pdb_path, cutoff_A, min_site_residues)
+
+    # Protonação por pH (ver pipeline_voxelize.protonate_site_residues) —
+    # MESMA função usada em pipeline_voxelize.process_pair (treino), com o
+    # MESMO pH default (config["ph"]). Isso é o que garante que o tensor de
+    # inferência tenha a mesma distribuição do tensor de treino: qualquer
+    # divergência aqui (pH diferente, protonate_site desligado só de um
+    # lado) reabriria um mismatch treino↔inferência como o que motivou os
+    # canais 3-4 serem site-derived (ver pipeline_voxelize BLOCO 3B).
+    if config.get("protonate_site", True):
+        site_coords, site_elements, site_charges, site_fragments = \
+            vox.protonate_site_residues(site_residues, ph=config.get("ph", 7.4))
+    else:
+        site_fragments = []
 
     # Grade 3D
     grid_coords, origin, voxel_size = vox.build_grid(site_coords, config)
 
     # Canais 0-2: voxelização vetorizada (NumPy ou CuPy)
+    # sigma segue a MESMA fórmula usada em pipeline_voxelize.process_pair
+    # (piso de voxel_size) — necessário para que o tensor de inferência seja
+    # idêntico em distribuição ao tensor de treino.
+    sigma = max(config["gaussian_sigma"], voxel_size * 1.0)
     w_vdw = np.array(
         [vox.VDW_RADII.get(e.upper(), vox.VDW_DEFAULT) for e in site_elements],
         dtype=np.float32
     )
     gf = grid_coords.reshape(-1, 3)
     ch0, ch1, ch2 = vox._voxelize_atoms(
-        gf, site_coords, w_vdw, site_charges,
-        config["gaussian_sigma"], (n, n, n)
+        gf, site_coords, w_vdw, site_charges, sigma, (n, n, n)
     )
 
-    # Canais 3-4: HOMO/LUMO → zeros (sem ligante de referência)
-    # O modelo lerá o padrão do espaço latente para completar
-    ch3 = np.zeros((n, n, n), dtype=np.float32)
-    ch4 = np.zeros((n, n, n), dtype=np.float32)
+    # Canais 3-4: campo doador/aceptor de elétrons do SÍTIO (HOMO/LUMO-like)
+    # — mesmo dispatcher usado em pipeline_voxelize.process_pair
+    # (channel_site_orbital_field: QM fragmentado / xTB / heurística
+    # conforme config["site_qm_method"]), calculado apenas a partir dos
+    # átomos do sítio. Não depende de nenhum ligante de referência.
+    sigma_da = max(config["gaussian_sigma"] * 1.5, voxel_size)
+    ch3, ch4 = vox.channel_site_orbital_field(
+        gf, site_coords, site_elements, site_charges, site_fragments,
+        sigma_da, (n, n, n), config,
+    )
 
     # Monta e normaliza tensor
     tensor = np.stack([ch0, ch1, ch2, ch3, ch4], axis=-1)  # (n,n,n,5)
@@ -582,75 +643,57 @@ def _relax_generated_geometry(mol: "Chem.Mol") -> "Chem.Mol":
     return mol
 
 def preds_to_mol(
-    preds: dict,
-    template_graph=None,
-    bond_threshold: float = 0.35,
+    candidate: dict,
     cutoff_dist: float = 1.9,
 ) -> "Chem.Mol | None":
-    """Converte predições do decoder em molécula RDKit.
+    """Converte a saída de LigandCVAE.sample() (um candidato) em molécula
+    RDKit.
 
-    Estratégia:
-      1. Tipo de átomo → argmax dos logits
-      2. Posição 3D    → predição direta
-      3. Ligações      → usa o edge_index do template graph, bond_exist e
-         bond_logits para reconstruir a conectividade; se isso falhar, cai
-         para a heurística de distância como último recurso.
+    candidate: {"atom_types": LongTensor(n,), "charges": FloatTensor(n,),
+                "positions": FloatTensor(n,3), "bonds": list[(i,j,bond_type)]}
+    — o decoder autorregressivo já decidiu quais ligações existem durante
+    a própria geração (ver GNNDecoder/LigandCVAE.sample em
+    pipeline_train.py); esta função só valida quimicamente essas decisões
+    (valência, distância) e monta o objeto RDKit — não reconstrói mais a
+    topologia a partir de um "template graph" externo.
 
-    Isso preserva melhor a topologia 3D prevista pelo decoder e reduz a
-    geração de estruturas quimicamente irreais.
+    Sanidade aplicada nas ligações já decididas pelo modelo:
+      - distância átomo-átomo compatível com o tipo de ligação
+        (_bond_distance_ok)
+      - orçamento de valência não excedido (MAX_VALENCE)
+    Ligações que violam essas checagens são descartadas. Se restarem
+    fragmentos desconexos, _connect_components tenta uma reparação mínima
+    (liga o par mais próximo entre fragmentos, respeitando valência) antes
+    de desistir do candidato.
     """
     try:
-        atom_types = preds["atom_logits"].argmax(dim=-1).cpu().numpy()
-        positions  = preds["positions"].detach().cpu().numpy()
+        atom_types = candidate["atom_types"].cpu().numpy()
+        positions  = candidate["positions"].detach().cpu().numpy()
         n_atoms    = len(atom_types)
+        if n_atoms < 1:
+            return None
 
         rwmol = Chem.RWMol()
         conf  = Chem.Conformer(n_atoms)
-
         for i, at_idx in enumerate(atom_types):
-            sym = ATOM_TYPES_GEN[min(int(at_idx), len(ATOM_TYPES_GEN)-1)]
+            sym = ATOM_TYPES_GEN[min(int(at_idx), len(ATOM_TYPES_GEN) - 1)]
             rwmol.AddAtom(Chem.Atom(sym))
             conf.SetAtomPosition(i, positions[i].tolist())
-
         rwmol.AddConformer(conf, assignId=True)
 
         valence_used = [0.0] * n_atoms
         added = set()
-        edge_candidates = []
-
-        if template_graph is not None and hasattr(template_graph, "edge_index"):
-            edge_index = template_graph.edge_index.detach().cpu().numpy()
-            bond_probs = torch.sigmoid(preds["bond_exist"]).detach().cpu().numpy()
-            bond_types = preds["bond_logits"].argmax(dim=-1).detach().cpu().numpy()
-            merged_edges = {}
-
-            for idx in range(edge_index.shape[1]):
-                i = int(edge_index[0, idx])
-                j = int(edge_index[1, idx])
-                if i == j or i >= n_atoms or j >= n_atoms:
-                    continue
-                a, b = sorted((i, j))
-                item = merged_edges.setdefault((a, b), {"prob": [], "type": []})
-                item["prob"].append(float(bond_probs[idx]))
-                item["type"].append(int(bond_types[idx]))
-
-            for (i, j), item in merged_edges.items():
-                prob = max(item["prob"]) if item["prob"] else 0.0
-                type_idx = max(set(item["type"]), key=item["type"].count) if item["type"] else 0
-                bond_type = BOND_TYPE_MAP.get(type_idx, BondType.SINGLE)
-                dist = float(np.linalg.norm(positions[i] - positions[j]))
-                edge_candidates.append((prob, dist, i, j, bond_type))
-
-            edge_candidates.sort(key=lambda entry: (-entry[0], entry[1]))
-
-        for prob, dist, i, j, bond_type in edge_candidates:
-            if prob < bond_threshold or (i, j) in added:
+        for (i, j, type_idx) in candidate["bonds"]:
+            i, j = int(i), int(j)
+            if i == j or i >= n_atoms or j >= n_atoms or (i, j) in added or (j, i) in added:
                 continue
+            bond_type = BOND_TYPE_MAP.get(int(type_idx), BondType.SINGLE)
             sym_i = ATOM_TYPES_GEN[min(int(atom_types[i]), len(ATOM_TYPES_GEN) - 1)].upper()
             sym_j = ATOM_TYPES_GEN[min(int(atom_types[j]), len(ATOM_TYPES_GEN) - 1)].upper()
-            budget = BOND_ORDER_BUDGET.get(bond_type, 1.0)
+            dist = float(np.linalg.norm(positions[i] - positions[j]))
             if not _bond_distance_ok(sym_i, sym_j, bond_type, dist):
                 continue
+            budget = BOND_ORDER_BUDGET.get(bond_type, 1.0)
             if valence_used[i] + budget > MAX_VALENCE.get(sym_i, 4) + 1e-6:
                 continue
             if valence_used[j] + budget > MAX_VALENCE.get(sym_j, 4) + 1e-6:
@@ -660,11 +703,14 @@ def preds_to_mol(
             valence_used[j] += budget
             added.add((i, j))
 
-        if not added:
+        # Fallback por distância só se o modelo não decidiu NENHUMA ligação
+        # válida (ex.: candidato com 1-2 átomos onde a cabeça de ligação
+        # nunca disparou) — último recurso, igual à versão anterior.
+        if not added and n_atoms > 1:
             for i in range(n_atoms):
                 for j in range(i + 1, n_atoms):
                     d = float(np.linalg.norm(positions[i] - positions[j]))
-                    if 1.0 < d < cutoff_dist and (i, j) not in added:
+                    if 1.0 < d < cutoff_dist:
                         sym_i = ATOM_TYPES_GEN[min(int(atom_types[i]), len(ATOM_TYPES_GEN) - 1)].upper()
                         sym_j = ATOM_TYPES_GEN[min(int(atom_types[j]), len(ATOM_TYPES_GEN) - 1)].upper()
                         if valence_used[i] >= MAX_VALENCE.get(sym_i, 4):
@@ -689,41 +735,6 @@ def preds_to_mol(
     except Exception:
         return None
 
-def get_template_graph(mod, tensor_dir: Path) -> "PyGData | None":
-    """Obtém um grafo template do conjunto de validação para guiar o decoder."""
-    try:
-        ds = mod.SiteLigandDataset(tensor_dir=tensor_dir, split="val", max_atoms=50)
-        if len(ds) == 0:
-            ds = mod.SiteLigandDataset(tensor_dir=tensor_dir, split="train", max_atoms=50)
-        item = ds[0]
-        if item is None:
-            return None
-        from torch_geometric.data import Batch
-        return Batch.from_data_list([item["graph"]]).to(DEVICE)
-    except Exception as e:
-        log.warning(f"  Template graph: {e}")
-        return None
-
-
-def get_reference_template_graph(ref_mol) -> "PyGData | None":
-    """Converte o ligante de referência em grafo template compatível com o treino."""
-    if ref_mol is None:
-        return None
-    try:
-        import MODULES.pipeline_voxelize as vox
-        from torch_geometric.data import Batch
-
-        mol = Chem.Mol(ref_mol)
-        if mol.GetNumConformers() == 0:
-            AllChem.EmbedMolecule(mol, randomSeed=42)
-        graph = vox.mol_to_graph(mol, pair_id="reference_ligand")
-        if graph is None:
-            return None
-        return Batch.from_data_list([graph]).to(DEVICE)
-    except Exception as e:
-        log.warning(f"  Reference ligand template: {e}")
-        return None
-
 
 def generate_candidates(
     model,
@@ -733,51 +744,46 @@ def generate_candidates(
     n_samples: int = 200,
     temperature: float = 1.0,
     voxel_size: float = 1.0,
-    ref_mol = None,
+    ref_mol = None,   # não usado mais aqui (era o template) — mantido por
+                       # compatibilidade de assinatura; a similaridade de
+                       # Tanimoto com ref_mol é calculada depois, em
+                       # rank_candidates.
+    max_atoms: int = 60,
 ) -> list[dict]:
-    """Gera N candidatos a partir do tensor do sítio.
+    """Gera N candidatos a partir do tensor do sítio — construção
+    SEQUENCIAL autorregressiva (um átomo por vez), com TODOS os n_samples
+    candidatos avançando em lockstep numa única chamada a model.sample()
+    (não mais um template graph reclassificado, nem um loop Python
+    chamando o decoder uma vez por amostra — ver LigandCVAE.sample em
+    pipeline_train.py para a estratégia de paralelismo).
 
     Para cada amostra:
-      1. Codifica o sítio → z_mean via encoder
-      2. Amostra z = z_mean + temperatura × N(0,I)
-      3. Decodifica z + template → predições de átomos/ligações
-      4. Converte predições em molécula RDKit
-      5. Calcula métricas de drug-likeness
+      1. Codifica o sítio → z_mean via encoder (uma vez, compartilhado)
+      2. Constrói o grafo átomo-a-átomo condicionado em z = z_mean +
+         temperatura × N(0,I), decidindo tipo/posição/ligações a cada
+         passo (bond_exist agora com amostragem negativa real no treino —
+         não é mais poda de um template fixo)
+      3. Converte o resultado em molécula RDKit (preds_to_mol)
+      4. Calcula métricas de drug-likeness
 
     Returns lista de dicts com mol, smiles e métricas.
     """
-    # Prepara tensor
     arr    = np.transpose(site_tensor, (3, 0, 1, 2))         # (C,X,Y,Z)
     tensor = torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    voxel_sizes_gen = torch.tensor([voxel_size], dtype=torch.float32).to(DEVICE)
 
-    # Template para o decoder: prioriza o ligante de referência do sítio.
-    template = get_reference_template_graph(ref_mol)
-    if template is None:
-        template = get_template_graph(mod, tensor_dir)
-    if template is None:
-        log.warning("  Sem template graph — geração pode ser limitada")
-
-    # Obtém z_mean do encoder (ponto central do espaço latente para este sítio)
     with torch.no_grad():
-        voxel_sizes_gen = torch.tensor([voxel_size],
-                                        dtype=torch.float32).to(DEVICE)
-        z_mean, _ = model.encoder(tensor, voxel_sizes_gen)
+        samples = model.sample(
+            tensor, n_samples=n_samples, temperature=temperature,
+            voxel_sizes=voxel_sizes_gen, max_atoms=max_atoms,
+        )
 
     candidates = []
     failed     = 0
 
-    for i in tqdm(range(n_samples), desc="  Gerando candidatos", leave=False):
+    for i, candidate in enumerate(tqdm(samples, desc="  Montando candidatos", leave=False)):
         try:
-            with torch.no_grad():
-                # Amostragem com temperatura
-                z = z_mean + temperature * torch.randn_like(z_mean)
-
-                if template is not None:
-                    preds = model.decoder(z, template)
-                else:
-                    continue
-
-            mol = preds_to_mol(preds, template_graph=template)
+            mol = preds_to_mol(candidate)
             if mol is None or mol.GetNumAtoms() < 3:
                 failed += 1
                 continue

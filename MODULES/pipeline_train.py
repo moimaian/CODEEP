@@ -263,28 +263,42 @@ class SiteLigandDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Agrupa itens do Dataset em mini-batches, filtrando e sanitizando NaN/Inf."""
+        """Agrupa itens do Dataset em mini-batches, filtrando e sanitizando NaN/Inf.
+
+        `graphs` agora é uma LISTA de PyGData (não mais um PyG Batch
+        mesclado) — o decoder autorregressivo precisa de acesso a cada
+        molécula individualmente (via .atom_order) para construir os
+        grafos parciais passo a passo, ver
+        GNNDecoder.forward_teacher_forcing.
+        """
         batch = [b for b in batch if b is not None]
         # Filtra tensores de sítio corrompidos
         batch = [b for b in batch if torch.isfinite(b["tensor"]).all()]
+        # Requer atom_order — grafos gerados ANTES do decoder autorregressivo
+        # (ou vindos do fallback .npz sem PyTorch em pipeline_voxelize) não
+        # têm; reprocessar a voxelização resolve (ver process_pair).
+        batch = [b for b in batch
+                 if getattr(b["graph"], "atom_order", None) is not None]
         if not batch:
             return None
 
         tensors = torch.stack([b["tensor"] for b in batch])   # (B,C,X,Y,Z)
-        graphs  = Batch.from_data_list([b["graph"] for b in batch])
+        graphs = []
+        for b in batch:
+            g = b["graph"]
+            if not torch.isfinite(g.x).all():
+                g.x = torch.nan_to_num(g.x, nan=0.0, posinf=0.0, neginf=0.0)
+            if not torch.isfinite(g.pos).all():
+                g.pos = torch.nan_to_num(g.pos, nan=0.0, posinf=0.0, neginf=0.0)
+            graphs.append(g)
 
-        # Sanitiza graph.x após Batch.from_data_list — a concatenação pode
-        # preservar inf/NaN de grafos individuais mesmo após sanitização prévia
-        if not torch.isfinite(graphs.x).all():
-            graphs.x = torch.nan_to_num(graphs.x, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Descarta o batch inteiro se ainda houver NaN (ex: pos corrompido)
-        if not torch.isfinite(graphs.x).all():
+        # Descarta o batch inteiro se ainda houver NaN em algum grafo
+        if not all(torch.isfinite(g.x).all() and torch.isfinite(g.pos).all() for g in graphs):
             return None
 
         return {
             "tensor":      tensors,
-            "graph":       graphs,
+            "graphs":      graphs,
             "pair_ids":    [b["pair_id"]    for b in batch],
             "smiles":      [b["smiles"]     for b in batch],
             "voxel_sizes": torch.tensor([b["voxel_size"] for b in batch],
@@ -402,22 +416,105 @@ class SiteEncoder(nn.Module):
 ATOM_TYPE_DIM = 13
 BOND_TYPE_DIM = 4
 
+# Número atômico por índice de ATOM_TYPES — mesma ordem de
+# pipeline_voxelize.ATOM_TYPES = ["C","N","O","S","P","F","CL","BR","I",
+# "FE","ZN","MG","OTHER"]. Usado só para popular o campo [17] (número
+# atômico normalizado) ao reconstruir features de átomos já colocados no
+# grafo parcial — ver _make_partial_features.
+_ATOM_TYPE_Z = torch.tensor(
+    [6, 7, 8, 16, 15, 9, 17, 35, 53, 26, 30, 12, 6], dtype=torch.float32
+)
+
+
+def _make_partial_features(
+    atom_type_idx: torch.Tensor,   # (n,) long
+    charge:        torch.Tensor,   # (n,) float
+    degree:        torch.Tensor,   # (n,) float/long — grau NO GRAFO PARCIAL
+    node_feat_dim: int = 37,
+) -> torch.Tensor:
+    """Features (37-dim, mesmo layout de pipeline_voxelize.atom_features)
+    de átomos JÁ COLOCADOS no grafo parcial — usadas como entrada do
+    node_embed, tanto em treino (forward_teacher_forcing) quanto em
+    geração (LigandCVAE.sample).
+
+    Popula só os campos igualmente conhecíveis nos dois lados: tipo do
+    átomo [0:13], número atômico [17] (derivado do tipo), carga [19], grau
+    [21] (recomputado do grafo PARCIAL a cada passo — não é o grau da
+    molécula final). Os demais campos do vetor de 37 (hibridização
+    [13:17], carga formal [18], H implícitos [20], aromaticidade [22],
+    anel [23], quiralidade [24:28]) vêm do RDKit da molécula real completa
+    em treino, mas são desconhecidos em geração (dependem da molécula
+    final, ainda não decidida) — por isso ficam ZERADOS NOS DOIS LADOS.
+    Sem essa máscara, o treino ensinaria o decoder a depender de sinais
+    que não existem durante a geração — o mesmo tipo de vazamento
+    treino↔inferência corrigido nos canais 3-4 do tensor do sítio.
+
+    Nuance aceita (exposure bias): o campo de carga [19] em treino usa o
+    valor REAL (teacher forcing); em geração usa a carga que o PRÓPRIO
+    modelo previu para esse átomo no passo em que foi colocado. Essa
+    diferença (contexto real vs. autogerado) é inerente a qualquer modelo
+    autorregressivo com teacher forcing — não é um vazamento binário como
+    os outros dois casos, é o trade-off padrão da literatura (exposure
+    bias), com mitigações conhecidas (scheduled sampling) possíveis como
+    refinamento futuro.
+    """
+    n = atom_type_idx.shape[0]
+    device = atom_type_idx.device
+    clipped = atom_type_idx.clamp(max=ATOM_TYPE_DIM - 1)
+    x = torch.zeros((n, node_feat_dim), dtype=torch.float32, device=device)
+    x[torch.arange(n, device=device), clipped] = 1.0
+    x[:, 17] = _ATOM_TYPE_Z.to(device)[clipped] / 100.0
+    x[:, 19] = charge.float()
+    x[:, 21] = (degree.float() / 6.0).clamp(0.0, 1.0)
+    return x
+
+
+def _build_adjacency(graph) -> dict:
+    """dict: índice_original_do_átomo -> {vizinho_original: tipo_de_ligação}.
+
+    A partir de graph.edge_index/edge_attr (bidirecional — cada ligação
+    aparece como (i,j) e (j,i); o tipo de ligação é o argmax dos primeiros
+    BOND_TYPE_DIM canais de edge_attr, mesma convenção de
+    pipeline_voxelize.bond_features/mol_to_graph).
+    """
+    adj: dict = {}
+    ei, ea = graph.edge_index, graph.edge_attr
+    for k in range(ei.shape[1]):
+        i, j = int(ei[0, k]), int(ei[1, k])
+        bt = int(torch.argmax(ea[k, :BOND_TYPE_DIM]).item())
+        adj.setdefault(i, {})[j] = bt
+    return adj
+
+
 class GNNDecoder(nn.Module):
-    """Decoder GNN que converte vetor latente z → predição sobre o grafo.
+    """Decoder GNN AUTORREGRESSIVO: constrói o grafo do ligante um átomo por
+    vez, condicionado no grafo PARCIAL já construído (mensagens GAT rodam
+    sobre um grafo que cresce a cada passo, não sobre uma topologia fixa)
+    + no vetor latente z do sítio.
 
-    Modo de operação:
-      - Durante treino: o grafo real é fornecido (teacher forcing)
-        → prediz propriedades de cada nó e aresta
-      - Durante inferência: geração auto-regressiva (ver LigandGenerator)
+    Substitui a versão anterior — que rodava uma única passada sobre a
+    topologia de um "template graph" externo (o próprio ligante de
+    referência ou um grafo aleatório do treino) e só reclassificava
+    tipos/posições sobre essa topologia fixa, sem nunca criar ou remover
+    átomos, e com bond_exist treinado de forma trivial (só via arestas do
+    template, sempre positivas — nenhum par negativo real). Esta versão diz
+    respeito às duas limitações:
+      - número de átomos: decisão do modelo a cada passo (cabeça
+        parar/continuar), não herdado de um template.
+      - topologia: a cada passo, o novo átomo é testado contra TODOS os
+        átomos já existentes no grafo parcial — amostragem negativa real
+        (a maioria dos pares não é ligação; só uma minoria é).
 
-    Saídas por nó:
-      - tipo de átomo (softmax, 13 classes)
-      - carga parcial (regressão)
-      - posição 3D relativa ao centro do sítio (regressão)
+    Ordem de construção para teacher forcing: ver
+    pipeline_voxelize.compute_site_anchored_atom_order (ancorada no sítio,
+    estilo Pocket2Mol — Peng et al., 2022). Cada grafo de treino já vem com
+    `.atom_order` pré-computado (ver pipeline_voxelize.process_pair).
 
-    Saídas por aresta:
-      - tipo de ligação (softmax, 4 tipos)
-      - existe ligação? (sigmoid)
+    Paralelismo: dentro de uma molécula o passo t depende do grafo parcial
+    do passo t-1 (sequencial); entre moléculas do mesmo batch, cada passo é
+    computado para todas simultaneamente (uma passada em lote por passo,
+    não uma por molécula) — ver forward_teacher_forcing (treino) e
+    pipeline_generate para a geração em lockstep.
     """
 
     def __init__(
@@ -433,39 +530,30 @@ class GNNDecoder(nn.Module):
         ecfp4_bits:   int  = 512,
     ):
         super().__init__()
-        self.latent_dim   = latent_dim
-        self.hidden_dim   = hidden_dim
-        self.n_atom_types = n_atom_types
-        self.n_bond_types = n_bond_types
-        self.use_ecfp4    = use_ecfp4
-        self.ecfp4_bits   = ecfp4_bits
+        self.latent_dim    = latent_dim
+        self.hidden_dim     = hidden_dim
+        self.n_atom_types   = n_atom_types
+        self.n_bond_types   = n_bond_types
+        self.node_feat_dim  = node_feat_dim
+        self.use_ecfp4      = use_ecfp4
+        self.ecfp4_bits     = ecfp4_bits
 
-        # Dimensão de entrada do z_proj:
-        #   sem ECFP4: latent_dim
-        #   com ECFP4: latent_dim + ecfp4_bits  (z concatenado ao fingerprint)
-        #
-        # ECFP4 DESATIVADO por padrão (use_ecfp4=False).
-        # Quando ativo, ancora o decoder em fingerprints já vistos no treino,
-        # reduzindo a diversidade dos ligantes gerados — indesejável para
-        # descoberta de novos scaffolds. Ativar apenas para tarefas de
-        # otimização de lead (quando diversidade é menos prioritária).
+        # ECFP4 DESATIVADO por padrão — ver nota original: ancora o decoder
+        # em fingerprints já vistos no treino, reduzindo a diversidade dos
+        # ligantes gerados. Quando ativo, é concatenado a z UMA VEZ (não
+        # depende do grafo parcial, então fica fora do loop de passos).
         z_input_dim = latent_dim + ecfp4_bits if use_ecfp4 else latent_dim
 
-        # Projeta z (+ ECFP4 opcional) no espaço do grafo
         self.z_proj = nn.Sequential(
             nn.Linear(z_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
         )
-
-        # Projeta features dos nós para hidden_dim
         self.node_embed = nn.Sequential(
             nn.Linear(node_feat_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
         )
-
-        # Camadas GNN (GAT com múltiplas cabeças)
         self.gnn_layers = nn.ModuleList([
             GATConv(hidden_dim, hidden_dim // 4, heads=4,
                     dropout=dropout, concat=True)
@@ -475,81 +563,272 @@ class GNNDecoder(nn.Module):
             nn.LayerNorm(hidden_dim) for _ in range(n_gnn_layers)
         ])
 
-        # Cabeças de predição por nó
+        # Contexto de cada passo = [pool(grafo parcial) ; z_proj(z)]
+        ctx_dim = hidden_dim * 2
+
+        self.head_stop = nn.Sequential(
+            nn.Linear(ctx_dim, hidden_dim // 2), nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
         self.head_atom_type = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
+            nn.Linear(ctx_dim, hidden_dim // 2), nn.GELU(),
             nn.Linear(hidden_dim // 2, n_atom_types)
         )
         self.head_charge = nn.Sequential(
-            nn.Linear(hidden_dim, 64), nn.GELU(),
+            nn.Linear(ctx_dim, 64), nn.GELU(),
             nn.Linear(64, 1)
         )
         self.head_pos = nn.Sequential(
-            nn.Linear(hidden_dim, 128), nn.GELU(),
+            nn.Linear(ctx_dim, 128), nn.GELU(),
             nn.Linear(128, 3)
         )
 
-        # Cabeça de predição por aresta (concatena features dos dois nós)
+        # Cabeça de ligação: [embedding do átomo JÁ EXISTENTE ; contexto do
+        # NOVO átomo] — uma predição por par (novo, existente_i).
+        pair_dim = hidden_dim + ctx_dim
         self.head_bond_type = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
+            nn.Linear(pair_dim, hidden_dim), nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, n_bond_types)
         )
         self.head_bond_exist = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 64), nn.GELU(),
+            nn.Linear(pair_dim, 64), nn.GELU(),
             nn.Linear(64, 1)
         )
 
-    def forward(
-        self,
-        z: torch.Tensor,          # (B, latent_dim)
-        graph: "PyGData",         # batch de grafos PyG
-    ) -> dict:
+    # ── Núcleo: um passo, para um lote de grafos parciais já concatenados ──
+    def _encode_partial(self, z_input, partial_x, partial_edge_index,
+                         partial_batch_vec, n_active):
+        """z_input: (n_active, z_input_dim). partial_x/edge_index/batch_vec:
+        grafo parcial "solto" (não é PyG Batch — tensores concatenados +
+        vetor de pertencimento manual, ver forward_teacher_forcing), pode
+        ser vazio (t=0, nenhum átomo colocado ainda em nenhuma molécula
+        ativa). Retorna h (nós, pode ser vazio) e ctx (n_active, 2*hidden).
         """
-        Returns:
-            dict com predições por nó e por aresta
-        """
-        batch_vec = graph.batch  # (total_nodes,) — qual grafo cada nó pertence
-
-        # Concatena ECFP4 ao z se ativo — fornece impressão digital global
-        # do ligante de referência ao decoder (ver nota em __init__ sobre
-        # o trade-off diversidade vs fidelidade)
-        if self.use_ecfp4 and hasattr(graph, "ecfp4") and graph.ecfp4 is not None:
-            # graph.ecfp4 tem shape (total_nodes, ecfp4_bits) quando em batch
-            # ou (ecfp4_bits,) por grafo — normaliza para (B, ecfp4_bits)
-            ecfp4_global = global_mean_pool(graph.ecfp4, batch_vec)  # (B, bits)
-            z_input = torch.cat([z, ecfp4_global], dim=-1)           # (B, latent+bits)
+        z_proj = self.z_proj(z_input)
+        if partial_x.shape[0] == 0:
+            pooled = torch.zeros_like(z_proj)
+            h = z_proj.new_zeros((0, self.hidden_dim))
         else:
-            z_input = z
+            z_node = z_proj[partial_batch_vec]
+            h = self.node_embed(partial_x) + z_node
+            for gnn, ln in zip(self.gnn_layers, self.layer_norms):
+                h = ln(h + gnn(h, partial_edge_index))
+            pooled = global_mean_pool(h, partial_batch_vec, size=n_active)
+        ctx = torch.cat([pooled, z_proj], dim=-1)
+        return h, ctx
 
-        # Projeta z (+ ECFP4 opcional) e expande para cada nó do batch
-        z_node = self.z_proj(z_input)[batch_vec]  # (total_nodes, hidden_dim)
+    def forward_step(self, z_input, partial_x, partial_edge_index,
+                      partial_batch_vec, n_active):
+        """Prediz parar/tipo/carga/posição do PRÓXIMO átomo para as
+        n_active moléculas ativas neste passo. Retorna também (h, ctx) —
+        necessários para predict_bonds."""
+        h, ctx = self._encode_partial(
+            z_input, partial_x, partial_edge_index, partial_batch_vec, n_active
+        )
+        return {
+            "stop_logit":       self.head_stop(ctx).squeeze(-1),
+            "atom_type_logits": self.head_atom_type(ctx),
+            "charge":           self.head_charge(ctx).squeeze(-1),
+            "pos":              self.head_pos(ctx),
+            "_h": h, "_ctx": ctx,
+        }
 
-        # Embedding inicial dos nós
-        h = self.node_embed(graph.x) + z_node # (total_nodes, hidden_dim)
+    def predict_bonds(self, h, ctx, batch_vec_h, active_next_local):
+        """h/batch_vec_h: nós/pertencimento do grafo parcial DE TODAS as
+        n_active moléculas do passo (saída de forward_step). ctx: contexto
+        de todas as n_active moléculas. active_next_local: LongTensor
+        (índices dentro de 0..n_active-1, em ordem crescente) das
+        moléculas que têm um próximo átomo real neste passo — só elas
+        entram na predição de ligação.
 
-        # Passagens GNN
-        edge_index = graph.edge_index
-        for gnn, ln in zip(self.gnn_layers, self.layer_norms):
-            h = ln(h + gnn(h, edge_index))    # residual + normalização
+        Retorna bond_exist_logits, bond_type_logits — achatados por TODOS
+        os pares (molécula ativa-com-próximo, átomo já existente dela),
+        na ordem: para cada posição de active_next_local (nessa ordem),
+        os átomos existentes dela na ordem em que aparecem em
+        partial_batch_vec (ou seja, na ordem de atom_order[:t]). Essa
+        ordem é a mesma que forward_teacher_forcing usa para montar os
+        targets — ver teste de regressão no changelog desta função.
+        """
+        empty_logit = h.new_zeros((0,))
+        empty_type  = h.new_zeros((0, self.n_bond_types))
+        if active_next_local.numel() == 0 or h.shape[0] == 0:
+            return empty_logit, empty_type
 
-        # Predições por nó
-        atom_logits = self.head_atom_type(h)  # (total_nodes, n_atom_types)
-        charges     = self.head_charge(h)     # (total_nodes, 1)
-        positions   = self.head_pos(h)        # (total_nodes, 3)
+        n_active = ctx.shape[0]
+        lut = torch.full((n_active,), -1, dtype=torch.long, device=h.device)
+        lut[active_next_local] = torch.arange(active_next_local.numel(), device=h.device)
+        mapped = lut[batch_vec_h]
+        keep = mapped >= 0
+        if keep.sum() == 0:
+            return empty_logit, empty_type
 
-        # Predições por aresta
-        i, j = edge_index
-        edge_h = torch.cat([h[i], h[j]], dim=-1)    # (total_edges, 2*hidden)
-        bond_logits = self.head_bond_type(edge_h)   # (total_edges, n_bond_types)
-        bond_exist  = self.head_bond_exist(edge_h)  # (total_edges, 1)
+        h_sel = h[keep]
+        pair_mol_local = mapped[keep]                       # 0..len(active_next_local)-1
+        ctx_sel = ctx[active_next_local][pair_mol_local]      # contexto do novo átomo, repetido por par
+
+        pair_h = torch.cat([h_sel, ctx_sel], dim=-1)
+        bond_type_logits  = self.head_bond_type(pair_h)
+        bond_exist_logits = self.head_bond_exist(pair_h).squeeze(-1)
+        return bond_exist_logits, bond_type_logits
+
+    # ── Treino: teacher forcing completo, todos os passos, todo o batch ────
+    def forward_teacher_forcing(self, z: torch.Tensor, graphs: list,
+                                 ecfp4_batch: "torch.Tensor | None" = None) -> dict:
+        """z: (B, latent_dim), um por molécula, na MESMA ordem de `graphs`.
+        graphs: lista de PyGData (um por molécula), cada um com .x
+        (n_i,37), .edge_index (2,E_i), .edge_attr (E_i,8), .pos (n_i,3),
+        .atom_order (n_i,) LongTensor (ver pipeline_voxelize).
+
+        Itera t = 0..max(n_átomos)-1, construindo o grafo parcial de cada
+        molécula ainda ativa (n_átomos >= t) e comparando a predição do
+        passo com o estado real do treino (teacher forcing). Retorna um
+        dict com tudo ACHATADO por todos os passos e moléculas — pronto
+        para cvae_loss (sem necessidade de padding/máscara adicional, já
+        que só os itens realmente ativos em cada passo entram nos
+        tensores retornados).
+        """
+        device = z.device
+        B = len(graphs)
+        n_atoms = [int(g.atom_order.shape[0]) for g in graphs]
+        max_t = max(n_atoms) if n_atoms else 0
+        adjacencies = [_build_adjacency(g) for g in graphs]
+
+        if self.use_ecfp4 and ecfp4_batch is not None:
+            z_input_full = torch.cat([z, ecfp4_batch], dim=-1)
+        else:
+            z_input_full = z
+
+        acc = {k: [] for k in (
+            "stop_logits", "stop_targets", "atom_logits", "atom_targets",
+            "charges", "charge_targets", "positions", "pos_targets",
+            "bond_exist", "bond_exist_targets", "bond_logits", "bond_targets",
+        )}
+
+        for t in range(0, max_t + 1):
+            active_stop = [i for i in range(B) if n_atoms[i] >= t]
+            if not active_stop:
+                break
+            n_active = len(active_stop)
+
+            xs, eis, eas, batch_vec_parts = [], [], [], []
+            offset = 0
+            for local_i, orig_i in enumerate(active_stop):
+                g = graphs[orig_i]
+                if t == 0:
+                    continue
+                order_t = g.atom_order[:t]
+                pos_map = {int(idx): k for k, idx in enumerate(order_t.tolist())}
+                ei, ea = g.edge_index, g.edge_attr
+                keep_cols = [k for k in range(ei.shape[1])
+                             if int(ei[0, k]) in pos_map and int(ei[1, k]) in pos_map]
+
+                # Grau NO GRAFO PARCIAL (não o grau da molécula final) — ver
+                # _make_partial_features. Calculado nos índices LOCAIS
+                # (0..t-1) antes de aplicar o offset do batch.
+                degree_t = torch.zeros(t, dtype=torch.float32)
+                if keep_cols:
+                    idx_t = torch.tensor(keep_cols, dtype=torch.long)
+                    sub_ei_local = ei[:, idx_t].clone()
+                    for col in range(sub_ei_local.shape[1]):
+                        sub_ei_local[0, col] = pos_map[int(sub_ei_local[0, col])]
+                        sub_ei_local[1, col] = pos_map[int(sub_ei_local[1, col])]
+                    degree_t = torch.bincount(sub_ei_local[0], minlength=t).float()
+                    sub_ei = sub_ei_local + offset
+                    eis.append(sub_ei)
+                    eas.append(ea[idx_t])
+
+                atom_type_t = g.x[order_t, :ATOM_TYPE_DIM].argmax(dim=-1)
+                charge_t    = g.x[order_t, 19]
+                xs.append(_make_partial_features(atom_type_t, charge_t, degree_t))
+                batch_vec_parts.append(torch.full((t,), local_i, dtype=torch.long))
+                offset += t
+
+            if xs:
+                partial_x = torch.cat(xs, dim=0).to(device)
+                partial_batch_vec = torch.cat(batch_vec_parts, dim=0).to(device)
+                partial_edge_index = (torch.cat(eis, dim=1).to(device)
+                                      if eis else torch.zeros((2, 0), dtype=torch.long, device=device))
+            else:
+                partial_x = z.new_zeros((0, self.node_feat_dim))
+                partial_batch_vec = torch.zeros(0, dtype=torch.long, device=device)
+                partial_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+
+            active_stop_t = torch.tensor(active_stop, dtype=torch.long, device=device)
+            z_input_active = z_input_full[active_stop_t]
+            step_out = self.forward_step(
+                z_input_active, partial_x, partial_edge_index, partial_batch_vec, n_active
+            )
+
+            stop_target = torch.tensor(
+                [1.0 if n_atoms[i] == t else 0.0 for i in active_stop], device=device
+            )
+            acc["stop_logits"].append(step_out["stop_logit"])
+            acc["stop_targets"].append(stop_target)
+
+            active_next_local = torch.tensor(
+                [jl for jl, i in enumerate(active_stop) if n_atoms[i] > t],
+                dtype=torch.long, device=device,
+            )
+            if active_next_local.numel() == 0:
+                continue
+
+            anl_list = active_next_local.tolist()
+            next_orig = [int(graphs[active_stop[jl]].atom_order[t]) for jl in anl_list]
+            next_feats = torch.stack([
+                graphs[active_stop[jl]].x[no] for jl, no in zip(anl_list, next_orig)
+            ]).to(device)
+            next_pos_t = torch.stack([
+                graphs[active_stop[jl]].pos[no] for jl, no in zip(anl_list, next_orig)
+            ]).to(device)
+
+            acc["atom_logits"].append(step_out["atom_type_logits"][active_next_local])
+            acc["atom_targets"].append(next_feats[:, :ATOM_TYPE_DIM].argmax(dim=-1))
+            acc["charges"].append(step_out["charge"][active_next_local])
+            acc["charge_targets"].append(next_feats[:, 19])
+            acc["positions"].append(step_out["pos"][active_next_local])
+            acc["pos_targets"].append(next_pos_t)
+
+            bond_exist_logits, bond_type_logits = self.predict_bonds(
+                step_out["_h"], step_out["_ctx"], partial_batch_vec, active_next_local
+            )
+            if bond_exist_logits.numel() > 0:
+                bond_exist_t, bond_type_t = [], []
+                for jl, no in zip(anl_list, next_orig):
+                    orig_i = active_stop[jl]
+                    adj = adjacencies[orig_i]
+                    order_t = graphs[orig_i].atom_order[:t].tolist()
+                    for exist_o in order_t:
+                        if exist_o in adj.get(no, {}):
+                            bond_exist_t.append(1.0)
+                            bond_type_t.append(adj[no][exist_o])
+                        else:
+                            bond_exist_t.append(0.0)
+                            bond_type_t.append(0)   # dummy — mascarado via bond_exist na loss
+                acc["bond_exist"].append(bond_exist_logits)
+                acc["bond_exist_targets"].append(torch.tensor(bond_exist_t, device=device))
+                acc["bond_logits"].append(bond_type_logits)
+                acc["bond_targets"].append(torch.tensor(bond_type_t, dtype=torch.long, device=device))
+
+        def _cat(key, tail_shape=()):
+            lst = acc[key]
+            if lst:
+                return torch.cat(lst, dim=0)
+            return z.new_zeros((0,) + tail_shape)
 
         return {
-            "atom_logits":  atom_logits,
-            "charges":      charges.squeeze(-1),
-            "positions":    positions,
-            "bond_logits":  bond_logits,
-            "bond_exist":   bond_exist.squeeze(-1),
+            "stop_logits":        _cat("stop_logits"),
+            "stop_targets":       _cat("stop_targets"),
+            "atom_logits":        _cat("atom_logits", (self.n_atom_types,)),
+            "atom_targets":       _cat("atom_targets").long(),
+            "charges":            _cat("charges"),
+            "charge_targets":     _cat("charge_targets"),
+            "positions":          _cat("positions", (3,)),
+            "pos_targets":        _cat("pos_targets", (3,)),
+            "bond_exist":         _cat("bond_exist"),
+            "bond_exist_targets": _cat("bond_exist_targets"),
+            "bond_logits":        _cat("bond_logits", (self.n_bond_types,)),
+            "bond_targets":       _cat("bond_targets").long(),
         }
 
 
@@ -619,17 +898,30 @@ class LigandCVAE(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, site_tensor: torch.Tensor, graph: "PyGData",
+    def forward(self, site_tensor: torch.Tensor, graphs: list,
             voxel_sizes: torch.Tensor) -> dict:
-        """Passagem completa (treino com teacher forcing).
+        """Passagem completa de treino — teacher forcing autorregressivo.
 
-        Returns dict com predições + z_mean + z_logvar para calcular a loss.
+        graphs: lista de PyGData (um por molécula do batch, MESMA ordem das
+            linhas de site_tensor/voxel_sizes), cada um já com .atom_order
+            pré-computado (ver
+            pipeline_voxelize.compute_site_anchored_atom_order).
+
+        Returns dict com predições+targets de TODOS os passos (achatados,
+        ver GNNDecoder.forward_teacher_forcing) + z_mean + z_logvar.
         """
         z_mean, z_logvar = self.encoder(site_tensor, voxel_sizes)
         # Clipa z_logvar para prevenir exp(logvar) → inf
         z_logvar = torch.clamp(z_logvar, -10, 10)
         z = reparametrize(z_mean, z_logvar)
-        preds = self.decoder(z, graph)
+
+        ecfp4_batch = None
+        if self.decoder.use_ecfp4 and all(
+            hasattr(g, "ecfp4") and g.ecfp4 is not None for g in graphs
+        ):
+            ecfp4_batch = torch.stack([g.ecfp4 for g in graphs]).to(z.device)
+
+        preds = self.decoder.forward_teacher_forcing(z, graphs, ecfp4_batch)
         preds["z_mean"]   = z_mean
         preds["z_logvar"] = z_logvar
         return preds
@@ -637,33 +929,164 @@ class LigandCVAE(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        site_tensor:    torch.Tensor,
-        template_graph: "PyGData",
-        n_samples:      int   = 1,
-        temperature:    float = 1.0,
-        voxel_sizes:    torch.Tensor = None,  
+        site_tensor:     torch.Tensor,
+        n_samples:       int   = 1,
+        temperature:     float = 1.0,
+        voxel_sizes:     "torch.Tensor | None" = None,
+        max_atoms:       int   = 60,
+        stop_threshold:  float = 0.5,
+        bond_threshold:  float = 0.5,
+        ecfp4:           "torch.Tensor | None" = None,
     ) -> list:
-        """Gera novos ligantes condicionados no sítio.
+        """Gera novos ligantes condicionados no sítio — construção
+        SEQUENCIAL autorregressiva (um átomo por vez, condicionado no
+        grafo parcial já decidido), com todos os n_samples candidatos
+        avançando EM LOCKSTEP: a cada passo, uma única passada do decoder
+        cobre todos os candidatos ainda ativos simultaneamente (candidatos
+        que já pararam saem da máscara ativa e não custam mais nada). É a
+        mesma estratégia de geração em lote usada por LLMs — o custo real
+        é ~max_atoms passadas pequenas, não n_samples passadas
+        sequenciais (ver docstring de GNNDecoder sobre paralelismo).
 
         Args:
-            site_tensor   : (1, C, X, Y, Z) — tensor do sítio alvo
-            template_graph: grafo modelo (define n_atoms e topologia inicial)
-            n_samples     : quantas amostras gerar
-            temperature   : controla diversidade (> 1 = mais diverso)
+            site_tensor : (1, C, X, Y, Z) — tensor do sítio alvo
+            n_samples   : quantos candidatos gerar (em paralelo/lockstep)
+            temperature : controla diversidade (> 1 = mais diverso) —
+                escala tanto o ruído somado a z_mean quanto a softmax do
+                tipo de átomo
+            max_atoms   : teto de átomos por candidato (mesmo valor do
+                filtro do dataset de treino, default 60)
+            stop_threshold : probabilidade mínima da cabeça "parar" para
+                encerrar um candidato
+            bond_threshold : probabilidade mínima da cabeça bond_exist
+                para aceitar uma ligação
 
         Returns:
-            Lista de dicts com predições para cada amostra
+            Lista de n_samples dicts:
+              {"atom_types": LongTensor(n_i,), "charges": FloatTensor(n_i,),
+               "positions": FloatTensor(n_i,3),
+               "bonds": list[(i, j, bond_type)]}  — índices LOCAIS 0..n_i-1
+            prontos para pipeline_generate.preds_to_mol montar a molécula.
         """
         self.eval()
+        device = site_tensor.device
         if voxel_sizes is None:
-            voxel_sizes = torch.ones(site_tensor.shape[0],
-                                    device=site_tensor.device)
-        z_mean, z_logvar = self.encoder(site_tensor, voxel_sizes)
+            voxel_sizes = torch.ones(site_tensor.shape[0], device=device)
+        z_mean, _ = self.encoder(site_tensor, voxel_sizes)   # (1, latent_dim)
+        z_base = z_mean.repeat(n_samples, 1)
+        z = z_base + temperature * torch.randn_like(z_base)
+
+        z_input_full = z
+        if self.decoder.use_ecfp4 and ecfp4 is not None:
+            z_input_full = torch.cat([z, ecfp4.repeat(n_samples, 1)], dim=-1)
+
+        atom_types: list = [[] for _ in range(n_samples)]
+        charges:    list = [[] for _ in range(n_samples)]
+        positions:  list = [[] for _ in range(n_samples)]
+        bonds:      list = [[] for _ in range(n_samples)]   # (i, j, bond_type) locais
+        finished = [False] * n_samples
+
+        for t in range(max_atoms):
+            active = [c for c in range(n_samples) if not finished[c]]
+            if not active:
+                break
+
+            # ── monta o grafo parcial dos candidatos ativos ────────────────
+            xs, eis, eas, batch_vec_parts = [], [], [], []
+            offset = 0
+            for local_i, cand in enumerate(active):
+                n_i = len(atom_types[cand])
+                if n_i == 0:
+                    continue
+                type_t   = torch.tensor(atom_types[cand], dtype=torch.long, device=device)
+                charge_t = torch.tensor(charges[cand], dtype=torch.float32, device=device)
+                if bonds[cand]:
+                    pairs = [[a, b] for (a, b, _) in bonds[cand]] + \
+                            [[b, a] for (a, b, _) in bonds[cand]]
+                    ei_local = torch.tensor(pairs, dtype=torch.long, device=device).t()
+                    degree_t = torch.bincount(ei_local[0], minlength=n_i).float()
+                    ea_local = []
+                    for (_, _, bt) in bonds[cand]:
+                        v = [0.0] * 8; v[bt] = 1.0
+                        ea_local += [v, v]
+                    eis.append(ei_local + offset)
+                    eas.append(torch.tensor(ea_local, dtype=torch.float32, device=device))
+                else:
+                    degree_t = torch.zeros(n_i, dtype=torch.float32, device=device)
+                xs.append(_make_partial_features(type_t, charge_t, degree_t))
+                batch_vec_parts.append(torch.full((n_i,), local_i, dtype=torch.long, device=device))
+                offset += n_i
+
+            if xs:
+                partial_x = torch.cat(xs, dim=0)
+                partial_batch_vec = torch.cat(batch_vec_parts, dim=0)
+                partial_edge_index = (torch.cat(eis, dim=1) if eis
+                                      else torch.zeros((2, 0), dtype=torch.long, device=device))
+            else:
+                partial_x = z.new_zeros((0, self.decoder.node_feat_dim))
+                partial_batch_vec = torch.zeros(0, dtype=torch.long, device=device)
+                partial_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+
+            active_t = torch.tensor(active, dtype=torch.long, device=device)
+            z_input_active = z_input_full[active_t]
+            step_out = self.decoder.forward_step(
+                z_input_active, partial_x, partial_edge_index, partial_batch_vec, len(active)
+            )
+
+            stop_prob = torch.sigmoid(step_out["stop_logit"])
+            will_stop = stop_prob > stop_threshold
+            if t == max_atoms - 1:
+                will_stop = torch.ones_like(will_stop)   # força parar no teto
+
+            type_probs = (step_out["atom_type_logits"] / max(temperature, 1e-3)).softmax(dim=-1)
+            next_type  = torch.multinomial(type_probs, 1).squeeze(-1)
+            next_pos   = step_out["pos"]
+            next_charge = step_out["charge"]
+
+            continue_local = [li for li in range(len(active)) if not bool(will_stop[li])]
+            bond_exist_probs = bond_type_pred = None
+            if continue_local:
+                cl_t = torch.tensor(continue_local, dtype=torch.long, device=device)
+                bond_exist_logits, bond_type_logits = self.decoder.predict_bonds(
+                    step_out["_h"], step_out["_ctx"], partial_batch_vec, cl_t
+                )
+                if bond_exist_logits.numel() > 0:
+                    bond_exist_probs = torch.sigmoid(bond_exist_logits)
+                    bond_type_pred   = bond_type_logits.argmax(dim=-1)
+
+            # distribui as decisões de volta para cada candidato — a ordem
+            # dos pares em bond_exist_probs segue exatamente a ordem de
+            # continue_local (li crescente) × átomos já existentes (0..n_i-1
+            # na ordem de colocação), ver GNNDecoder.predict_bonds.
+            cursor = 0
+            for li in range(len(active)):
+                cand = active[li]
+                if bool(will_stop[li]):
+                    finished[cand] = True
+                    continue
+                n_i = len(atom_types[cand])
+                if bond_exist_probs is not None and n_i > 0:
+                    probs_i = bond_exist_probs[cursor:cursor + n_i]
+                    types_i = bond_type_pred[cursor:cursor + n_i]
+                    for k in range(n_i):
+                        if float(probs_i[k]) > bond_threshold:
+                            bonds[cand].append((k, n_i, int(types_i[k])))
+                    cursor += n_i
+                atom_types[cand].append(int(next_type[li]))
+                charges[cand].append(float(next_charge[li]))
+                positions[cand].append(next_pos[li].tolist())
+                if len(atom_types[cand]) >= max_atoms:
+                    finished[cand] = True
+
         results = []
-        for _ in range(n_samples):
-            z = z_mean + temperature * torch.randn_like(z_mean)
-            preds = self.decoder(z, template_graph)
-            results.append(preds)
+        for cand in range(n_samples):
+            results.append({
+                "atom_types": torch.tensor(atom_types[cand], dtype=torch.long),
+                "charges":    torch.tensor(charges[cand], dtype=torch.float32),
+                "positions":  (torch.tensor(positions[cand], dtype=torch.float32)
+                              if positions[cand] else torch.zeros((0, 3))),
+                "bonds":      bonds[cand],
+            })
         return results
 
 
@@ -673,18 +1096,32 @@ class LigandCVAE(nn.Module):
 
 def cvae_loss(
     preds: dict,
-    graph: "PyGData",
     beta: float = 1.0,
     pos_weight: float = 2.0,
+    stop_weight: float = 1.0,
 ) -> dict:
-    """Loss total do CVAE = reconstruction loss + β·KL divergence.
+    """Loss total do CVAE (decoder autorregressivo) = reconstruction loss +
+    β·KL divergence.
+
+    `preds` já vem com todos os targets embutidos e ACHATADOS por todos os
+    passos de construção (ver GNNDecoder.forward_teacher_forcing) — não
+    recebe mais o grafo original aqui, ao contrário da versão anterior
+    (decoder de topologia fixa).
 
     Componentes da reconstruction loss:
-      L_atom : cross-entropy no tipo de átomo
-      L_bond : cross-entropy no tipo de ligação
-      L_exist: BCE na existência de ligação
-      L_pos  : MSE nas coordenadas 3D (normalizado pela caixa)
-      L_charge: MSE na carga parcial
+      L_stop  : BCE na decisão parar/continuar a cada passo (nova)
+      L_atom  : cross-entropy no tipo do PRÓXIMO átomo
+      L_charge: MSE na carga parcial do próximo átomo
+      L_pos   : MSE na posição 3D do próximo átomo (normalizada pelo desvio
+                padrão do batch)
+      L_exist : BCE na existência de cada ligação candidata (novo átomo ×
+                CADA átomo já existente) — com amostragem negativa REAL
+                (a maioria dos pares não é ligação). Antes só existiam
+                positivos (arestas de um template fixo), o que tornava
+                essa cabeça trivial — corrigido aqui por construção.
+      L_bond  : cross-entropy no tipo de ligação, SÓ nos pares onde a
+                ligação realmente existe (bond_type não tem sentido para
+                um par não-ligado).
 
     KL divergence:
       L_KL = -0.5 · Σ (1 + logvar - mean² - exp(logvar))
@@ -692,34 +1129,33 @@ def cvae_loss(
     O hiperparâmetro beta controla o trade-off reconstrução vs. regularização.
     beta=1 → VAE padrão; beta<1 → mais ênfase em reconstrução.
     """
-    # Tipo de átomo: o voxelize codifica 13 classes no início de graph.x
-    atom_target = graph.x[:, :ATOM_TYPE_DIM].argmax(dim=-1)   # (total_nodes,)
-    L_atom = F.cross_entropy(preds["atom_logits"], atom_target)
+    device = preds["z_mean"].device
+    zero = torch.zeros((), device=device)
 
-    # Tipo de ligação: o voxelize codifica 4 classes no início de edge_attr
-    bond_target = graph.edge_attr[:, :BOND_TYPE_DIM].argmax(dim=-1)  # (total_edges,)
-    L_bond = F.cross_entropy(preds["bond_logits"], bond_target)
+    L_stop = (F.binary_cross_entropy_with_logits(preds["stop_logits"], preds["stop_targets"])
+              if preds["stop_logits"].shape[0] > 0 else zero)
+    L_atom = (F.cross_entropy(preds["atom_logits"], preds["atom_targets"])
+              if preds["atom_logits"].shape[0] > 0 else zero)
+    L_charge = (F.mse_loss(preds["charges"], preds["charge_targets"])
+                if preds["charges"].shape[0] > 0 else zero)
 
-    # Existência de ligação (todos os pares no grafo existem → target=1)
-    bond_exist_target = torch.ones(preds["bond_exist"].shape[0],
-                                   device=preds["bond_exist"].device)
-    L_exist = F.binary_cross_entropy_with_logits(preds["bond_exist"], bond_exist_target)
-
-    # Posições 3D (normaliza por desvio padrão para escalar)
-    if hasattr(graph, "pos") and graph.pos is not None:
-        pos_target = graph.pos
-        pos_scale  = pos_target.std() + 1e-6
-        L_pos = F.mse_loss(preds["positions"] / pos_scale,
-                           pos_target        / pos_scale)
+    if preds["positions"].shape[0] > 0:
+        pos_scale = preds["pos_targets"].std() + 1e-6
+        L_pos = F.mse_loss(preds["positions"] / pos_scale, preds["pos_targets"] / pos_scale)
     else:
-        L_pos = torch.tensor(0.0)
+        L_pos = zero
 
-    # Cargas parciais
-    if graph.x.shape[1] > 19:
-        charge_target = graph.x[:, 19]  # índice da carga Gasteiger no vetor
-        L_charge = F.mse_loss(preds["charges"], charge_target)
+    L_exist = (F.binary_cross_entropy_with_logits(preds["bond_exist"], preds["bond_exist_targets"])
+               if preds["bond_exist"].shape[0] > 0 else zero)
+
+    # Tipo de ligação: só nos pares REALMENTE ligados (bond_exist_target==1)
+    # — classificar o "tipo" de uma ligação que não existe não tem sentido.
+    if preds["bond_logits"].shape[0] > 0:
+        pos_mask = preds["bond_exist_targets"] > 0.5
+        L_bond = (F.cross_entropy(preds["bond_logits"][pos_mask], preds["bond_targets"][pos_mask])
+                  if pos_mask.any() else zero)
     else:
-        L_charge = torch.tensor(0.0)
+        L_bond = zero
 
     # KL divergence
     z_mean   = preds["z_mean"]
@@ -727,12 +1163,14 @@ def cvae_loss(
     L_KL = -0.5 * torch.mean(1 + z_logvar - z_mean.pow(2) - z_logvar.exp())
 
     # Total
-    L_recon = L_atom + L_bond + L_exist + pos_weight * L_pos + 0.5 * L_charge
+    L_recon = (stop_weight * L_stop + L_atom + L_bond + L_exist +
+               pos_weight * L_pos + 0.5 * L_charge)
     L_total = L_recon + beta * L_KL
 
     return {
         "total":  L_total,
         "recon":  L_recon,
+        "stop":   L_stop,
         "atom":   L_atom,
         "bond":   L_bond,
         "exist":  L_exist,
@@ -755,19 +1193,19 @@ def train_epoch(
     grad_clip: float = 0.5,   # reduzido de 1.0 para prevenir explosão
 ) -> dict:
     model.train()
-    totals = {k: 0.0 for k in ["total","recon","atom","bond","exist","pos","kl"]}
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","kl"]}
     n_batches = 0
 
     for batch in tqdm(loader, desc="  Train", leave=False):
         if batch is None:
             continue
         site   = batch["tensor"].to(device)
-        graph  = batch["graph"].to(device)
+        graphs = [g.to(device) for g in batch["graphs"]]
         voxel_sizes = batch["voxel_sizes"].to(device)
 
         optimizer.zero_grad()
-        preds  = model(site, graph, voxel_sizes)
-        losses = cvae_loss(preds, graph, beta=beta)
+        preds  = model(site, graphs, voxel_sizes)
+        losses = cvae_loss(preds, beta=beta)
 
         # Pula batch se a loss for NaN/Inf (tensor corrompido escapou do filtro)
         if not torch.isfinite(losses["total"]):
@@ -807,17 +1245,17 @@ def eval_epoch(
     beta:   float,
 ) -> dict:
     model.eval()
-    totals = {k: 0.0 for k in ["total","recon","atom","bond","exist","pos","kl"]}
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","kl"]}
     n_batches = 0
 
     for batch in tqdm(loader, desc="  Eval ", leave=False):
         if batch is None:
             continue
         site        = batch["tensor"].to(device)
-        graph       = batch["graph"].to(device)
+        graphs      = [g.to(device) for g in batch["graphs"]]
         voxel_sizes = batch["voxel_sizes"].to(device)
-        preds       = model(site, graph, voxel_sizes)
-        losses = cvae_loss(preds, graph, beta=beta)
+        preds       = model(site, graphs, voxel_sizes)
+        losses = cvae_loss(preds, beta=beta)
         # Pula batch com loss NaN (modelo corrompido ou dado degenerado)
         if not torch.isfinite(losses["total"]):
             continue

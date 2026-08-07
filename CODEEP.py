@@ -35,10 +35,9 @@
 from __future__ import annotations
 import os, sys, subprocess
 import logging
-<<<<<<< HEAD
+
 from ctypes.util import find_library
-=======
->>>>>>> 568a9cf63d3247dc1fb6c8cd0f9672b71948d547
+
 from pathlib import Path
 
 
@@ -253,7 +252,6 @@ except ImportError:
     _TORCH_OK       = False
     _DEVICE_DEFAULT = "cpu"
 
-<<<<<<< HEAD
 def _has_nvrtc_runtime() -> bool:
     if find_library("nvrtc"):
         return True
@@ -309,7 +307,7 @@ def _detect_cupy_support() -> bool:
 
 
 _CUPY_OK = _detect_cupy_support()
-=======
+
 try:
     import cupy as cp
     _t = cp.zeros((2, 4), dtype=cp.float32)
@@ -318,7 +316,7 @@ try:
     _CUPY_OK = True
 except Exception:
     _CUPY_OK = False
->>>>>>> 568a9cf63d3247dc1fb6c8cd0f9672b71948d547
+
 
 _BATCH_DEFAULT = 500 if _CUPY_OK else 100
 
@@ -843,7 +841,8 @@ def _pipeline_collect(dataset, moad_dir, phase1_max,
     m.show_status(job_dir=job_dir)
 
 def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
-                       cutoff, min_atoms, top_n, out, ligand_ref, site_pdb):
+                       cutoff, min_atoms, top_n, out, ligand_ref, site_pdb,
+                       site_config_overrides=None):
     """Função de módulo (pickle-safe) que executa a geração no processo filho."""
     import MODULES.pipeline_generate as m
     from pathlib import Path as _P
@@ -860,9 +859,13 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
 
     site_pdb_path = _P(site_pdb) if site_pdb else None
 
+    # protonate_site/ph/site_qm_method — DEVEM bater com o que foi usado
+    # para gerar os tensores de treino da fase (ver nota em
+    # pipeline_generate.pdb_to_site_tensor sobre paridade treino/inferência).
     site_tensor, origin, voxel_size = m.pdb_to_site_tensor(
         pdb_path, cutoff, min_atoms, site_pdb=site_pdb_path,
-        project_dir=_P(root))           # ver Problema 3
+        project_dir=_P(root),           # ver Problema 3
+        config_overrides=site_config_overrides)
     np.savez_compressed(
         out_dir / "site_tensor.npz",
         tensor=site_tensor, origin=origin,
@@ -2235,6 +2238,13 @@ class MainWindow(QMainWindow):
         self.sp_vox_pad.setRange(0.5,8.0); self.sp_vox_pad.setValue(3.0)
         self.sp_max_qm = QSpinBox()
         self.sp_max_qm.setRange(10,200); self.sp_max_qm.setValue(60)
+        self.sp_max_qm.setToolTip(
+            "Limite de átomos pesados para QM completo (RHF/STO-3G).\n"
+            "Usado tanto para o ligante (não conectado ao tensor hoje) quanto\n"
+            "para CADA RESÍDUO do sítio no método 'RHF/STO-3G per residue'\n"
+            "(um resíduo protonado raramente passa de ~25 átomos, então o\n"
+            "padrão de 60 quase sempre é suficiente)."
+        )
         self.sp_vox_batch = QSpinBox()
         self.sp_vox_batch.setRange(10, 2000)
         self.sp_vox_batch.setValue(_BATCH_DEFAULT)
@@ -2251,7 +2261,42 @@ class MainWindow(QMainWindow):
         self.chk_ecfp4 = QCheckBox("Use ECFP4 in graph (reduces diversity)")
         self.cb_vox_phase = QComboBox()
         self.cb_vox_phase.addItems(["1", "2", "3"])
-        
+
+        # ── Protonação do sítio + método QM dos canais 3-4 (doador/aceptor) ──
+        self.chk_protonate_site = QCheckBox("Protonate site residues (pH-based)")
+        self.chk_protonate_site.setChecked(True)
+        self.chk_protonate_site.setToolTip(
+            "Adiciona H explícitos aos resíduos do sítio conforme pKa padrão\n"
+            "e o pH abaixo (Asp/Glu/His/Cys/Tyr/Lys/Arg). Também troca a carga\n"
+            "aproximada por elemento por cargas Gasteiger reais por átomo.\n"
+            "Desligar volta ao comportamento legado (sem H, carga aproximada)."
+        )
+        self.dsb_site_ph = QDoubleSpinBox()
+        self.dsb_site_ph.setDecimals(1); self.dsb_site_ph.setRange(0.0, 14.0)
+        self.dsb_site_ph.setValue(7.4); self.dsb_site_ph.setSingleStep(0.5)
+        self.dsb_site_ph.setToolTip(
+            "pH usado para decidir o estado de protonação dos resíduos\n"
+            "ionizáveis do sítio (regra de limiar sobre pKa de tabela)."
+        )
+        self.cb_site_qm_method = QComboBox()
+        self.cb_site_qm_method.addItems([
+            "RHF/STO-3G per residue (fragmented)",
+            "GFN-xTB (whole site, requires xtb binary)",
+            "Heuristic (electronegativity, no QM)",
+        ])
+        self.cb_site_qm_method.setToolTip(
+            "Nível de teoria para os canais 3-4 (campo doador/aceptor do sítio):\n"
+            "  RHF/STO-3G por resíduo — QM real, fragmentado tipo FMO (mais lento,\n"
+            "    ~1s/resíduo; usa PySCF/GPU4PySCF já instalado).\n"
+            "  GFN-xTB no sítio inteiro — semi-empírico, mais rápido, requer o\n"
+            "    binário `xtb` no PATH (não instalado por padrão).\n"
+            "  Heurística — eletronegatividade + carga, sem QM (mais rápido,\n"
+            "    também o fallback automático quando os outros dois falham)."
+        )
+        self._SITE_QM_METHOD_VALUES = [
+            "rhf_sto3g_fragments", "gfn_xtb_full", "heuristic",
+        ]
+
         pf.addRow("Phase:", self.cb_vox_phase)
         pf.addRow("Specific pair:",    self.ed_vox_pair)
         pf.addRow("Workers (0=auto):", self.sp_vox_workers)
@@ -2261,6 +2306,9 @@ class MainWindow(QMainWindow):
         pf.addRow("Vox batch size:",   self.sp_vox_batch)
         pf.addRow("QM basis:",         self.cb_qm_basis)
         pf.addRow("",                  self.chk_ecfp4)
+        pf.addRow("",                  self.chk_protonate_site)
+        pf.addRow("Site pH:",          self.dsb_site_ph)
+        pf.addRow("Site channels 3-4 method:", self.cb_site_qm_method)
 
         def run_fn():
             import MODULES.pipeline_voxelize as m
@@ -2273,6 +2321,11 @@ class MainWindow(QMainWindow):
             config["vox_batch"]    = self.sp_vox_batch.value()
             config["qm_basis"] = self.cb_qm_basis.currentText()
             config["use_ecfp4"] = self.chk_ecfp4.isChecked()
+            config["protonate_site"] = self.chk_protonate_site.isChecked()
+            config["ph"] = self.dsb_site_ph.value()
+            config["site_qm_method"] = self._SITE_QM_METHOD_VALUES[
+                self.cb_site_qm_method.currentIndex()
+            ]
 
             root = Path(self.ed_root.text().strip())
             job = Path(self.job_dir)
@@ -2567,6 +2620,32 @@ class MainWindow(QMainWindow):
         self.sp_top_n      = QSpinBox(); self.sp_top_n.setRange(1,200); self.sp_top_n.setValue(20)
         self.sp_min_atoms_gen = QSpinBox(); self.sp_min_atoms_gen.setRange(1,30); self.sp_min_atoms_gen.setValue(5)
 
+        # ── Protonação do sítio + método QM — DEVE bater com o que foi usado
+        # para gerar os tensores de treino da fase escolhida, senão o tensor
+        # de inferência não tem a mesma distribuição do treino (ver nota em
+        # pipeline_generate.pdb_to_site_tensor). Defaults iguais aos da
+        # Step 5 por esse motivo — mude só se souber que o treino usou algo
+        # diferente.
+        self.chk_gen_protonate_site = QCheckBox("Protonate site residues (pH-based)")
+        self.chk_gen_protonate_site.setChecked(True)
+        self.dsb_gen_ph = QDoubleSpinBox()
+        self.dsb_gen_ph.setDecimals(1); self.dsb_gen_ph.setRange(0.0, 14.0)
+        self.dsb_gen_ph.setValue(7.4); self.dsb_gen_ph.setSingleStep(0.5)
+        self.cb_gen_site_qm_method = QComboBox()
+        self.cb_gen_site_qm_method.addItems([
+            "RHF/STO-3G per residue (fragmented)",
+            "GFN-xTB (whole site, requires xtb binary)",
+            "Heuristic (electronegativity, no QM)",
+        ])
+        self.cb_gen_site_qm_method.setToolTip(
+            "DEVE ser igual ao método usado para gerar os tensores de treino\n"
+            "desta fase (Step 5) — um mismatch aqui reintroduz a diferença\n"
+            "treino↔inferência que os canais 3-4 foram desenhados para evitar."
+        )
+        self._GEN_SITE_QM_METHOD_VALUES = [
+            "rhf_sto3g_fragments", "gfn_xtb_full", "heuristic",
+        ]
+
         for label, widget in [
             ("Model phase:",          self.cb_gen_phase),
             ("Protein (PDB):",       pdb_row),
@@ -2579,6 +2658,9 @@ class MainWindow(QMainWindow):
             ("Site cutoff (Å):",     self.sp_cutoff_gen),
             ("Top N report:",        self.sp_top_n),
             ("Min. site atoms:",     self.sp_min_atoms_gen),
+            ("",                     self.chk_gen_protonate_site),
+            ("Site pH:",             self.dsb_gen_ph),
+            ("Site channels 3-4 method:", self.cb_gen_site_qm_method),
         ]:
             pf.addRow(label, widget)
 
@@ -2617,6 +2699,13 @@ class MainWindow(QMainWindow):
                 out         = self.ed_gen_out.text().strip() or None,
                 ligand_ref  = self.ed_ligand_ref.text().strip() or None,
                 site_pdb    = site_pdb,
+                site_config_overrides = dict(
+                    protonate_site = self.chk_gen_protonate_site.isChecked(),
+                    ph             = self.dsb_gen_ph.value(),
+                    site_qm_method = self._GEN_SITE_QM_METHOD_VALUES[
+                        self.cb_gen_site_qm_method.currentIndex()
+                    ],
+                ),
             )
 
         return self._build_pipeline_tab(
