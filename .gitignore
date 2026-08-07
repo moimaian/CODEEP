@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+JOBS/
+ANTIGOS/
+packaging/dist/
+data/
+checkpoints/
+
