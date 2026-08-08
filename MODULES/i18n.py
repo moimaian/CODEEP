@@ -61,6 +61,7 @@ _TEXTOS = {
     "menu_exit": {"en": "Exit", "pt": "Sair"},
     "menu_help": {"en": "Help", "pt": "Ajuda"},
     "menu_install_requirements": {"en": "Install Requirements", "pt": "Instalar Dependências"},
+    "menu_final_report": {"en": "Generate Final Report", "pt": "Gerar Relatório Final"},
     "menu_about": {"en": "About", "pt": "Sobre"},
 
     # ---------------------------------------------------------------- Tab names (short)
@@ -174,12 +175,20 @@ _TEXTOS = {
     "title_step1": {"en": "Step 1 — Job Configuration", "pt": "Etapa 1 — Configuração do Job"},
     "s1_grp_root": {"en": "CODEEP Root Directory", "pt": "Diretório Raiz do CODEEP"},
     "s1_grp_job_id": {"en": "Job Identification", "pt": "Identificação do Job"},
+        "s1_lbl_job_mode": {"en": "Project Mode:", "pt": "Modo do Projeto:"},
+        "s1_rb_new_project": {"en": "New Project", "pt": "Novo Projeto"},
+        "s1_rb_load_project": {"en": "Load Previous Project", "pt": "Carregar Projeto Anterior"},
+        "s1_lbl_prev_job": {"en": "Previous Project:", "pt": "Projeto Anterior:"},
+        "s1_tooltip_prev_job": {
+          "en": "Select a previously created project to reload every saved tab state.",
+          "pt": "Selecione um projeto já criado para recarregar o estado salvo de todas as abas.",
+        },
     "s1_ph_job_name": {"en": "e.g.: KinaseInhibitors_run01", "pt": "ex.: KinaseInhibitors_run01"},
     "s1_tooltip_date": {
-        "en": "Date used to compose the Job ID.\nChange this to resume a job started on a "
-              "previous day\nwithout renaming the folder manually.",
-        "pt": "Data usada para compor o ID do Job.\nAltere isso para retomar um job iniciado em "
-              "um dia anterior\nsem precisar renomear a pasta manualmente.",
+          "en": "Date and time used to compose the Job ID prefix.\nChange this before creating a "
+              "new project if you need a custom timestamp.",
+          "pt": "Data e hora usadas para compor o prefixo do ID do Job.\nAltere isso antes de "
+              "criar um novo projeto se precisar de um timestamp personalizado.",
     },
     "s1_lbl_job_name": {"en": "Job Name:", "pt": "Nome do Job:"},
     "s1_lbl_date": {"en": "Date:", "pt": "Data:"},
@@ -224,8 +233,27 @@ _TEXTOS = {
         "en": "Please fill in the CODEEP root directory and a job name.",
         "pt": "Preencha o diretório raiz do CODEEP e um nome de job.",
     },
+    "s1_msg_select_previous_job": {
+        "en": "Select the CODEEP root directory and a previous project to load.",
+        "pt": "Selecione o diretório raiz do CODEEP e um projeto anterior para carregar.",
+    },
+    "s1_msg_job_loaded": {
+        "en": "✅  Project loaded:  {job_dir}",
+        "pt": "✅  Projeto carregado:  {job_dir}",
+    },
+    "s1_msg_job_not_found": {
+        "en": "Project folder not found:\n{job_dir}",
+        "pt": "Pasta do projeto não encontrada:\n{job_dir}",
+    },
     "dlg_select_root_title": {
         "en": "Select the CODEEP root folder", "pt": "Selecione a pasta raiz do CODEEP",
+    },
+
+    # ---------------------------------------------------------------- Final report
+    "report_title_done": {"en": "Final Report", "pt": "Relatório Final"},
+    "report_saved": {
+        "en": "Final report saved to:\n{path}",
+        "pt": "Relatório final salvo em:\n{path}",
     },
 
     # ---------------------------------------------------------------- STEP 2 — Collection

@@ -199,7 +199,7 @@ from datetime import datetime
 from typing import Optional
 
 # ── PyQt5 ─────────────────────────────────────────────────────────────────
-from PyQt5.QtCore    import Qt, QThread, pyqtSignal, QTimer, QDate, QSettings, QSize
+from PyQt5.QtCore    import Qt, QThread, pyqtSignal, QTimer, QDateTime, QSettings, QSize
 from PyQt5.QtGui     import QPixmap, QGuiApplication, QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
@@ -209,7 +209,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox, QProgressBar, QAction,
     QSplitter, QFrame, QScrollArea, QDialog,
     QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup,
-    QDateEdit,
+    QDateTimeEdit,
 )
 print("✅ PyQt5 importado com sucesso.")
 
@@ -984,12 +984,16 @@ class MainWindow(QMainWindow):
         self.dp_dir: str = str(Path(__file__).parent)
         self.job_dir: str = ""
         self._workers: dict = {}          # tag → worker ativo
+        self._applying_job_state = False
 
         self._build_menu()
         self._build_hw_monitor()
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self._build_tabs()
+        self._init_tab_state_specs()
+        self._connect_state_autosave()
+        self._refresh_previous_jobs()
 
     def _tr(self, chave, apply_fn, **kwargs):
         """Registra apply_fn (ex.: label.setText, btn.setToolTip, lambda txt:
@@ -1084,6 +1088,309 @@ class MainWindow(QMainWindow):
         if current_min < required_width:
             button.setMinimumWidth(required_width)
 
+    def _init_tab_state_specs(self):
+        self._tab_state_specs = {
+            "step1": [
+                "ed_root", "rb_job_new", "rb_job_load", "cb_prev_job",
+                "ed_job_name", "dt_job_stamp", "te_org_terms",
+                "te_desc_terms", "te_phase3_ids",
+            ],
+            "step2": [
+                "cb_dataset", "cb_phase", "sp_phase1_max", "ed_moad_dir", "chk_status",
+            ],
+            "step3": [
+                "sp_cur_workers", "sp_cutoff", "sp_min_site", "sp_max_mw",
+                "sp_min_heavy", "cb_cur_phase", "chk_cur_thread", "chk_cur_process",
+            ],
+            "step4": ["cb_explore_phase"],
+            "step5": [
+                "ed_vox_pair", "sp_vox_workers", "sp_grid", "sp_vox_pad", "sp_max_qm",
+                "sp_vox_batch", "cb_qm_basis", "chk_ecfp4", "cb_vox_phase",
+                "chk_protonate_site", "dsb_site_ph", "cb_site_qm_method",
+            ],
+            "step6": [
+                "cb_train_phase", "sp_epochs", "sp_batch", "sp_latent", "sp_hidden",
+                "sp_gnn_layers", "dsb_lr", "dsb_beta", "sp_warmup", "dsb_dropout",
+                "sp_patience", "cb_train_device", "ed_resume", "chk_freeze_enc",
+                "ed_ckpt_out",
+            ],
+            "step7": ["ed_eval_ckpt", "chk_do_generate", "cb_eval_phase"],
+            "step8": [
+                "cb_gen_phase", "ed_gen_pdb", "ed_gen_site_pdb", "ed_gen_ckpt",
+                "ed_gen_out", "ed_ligand_ref", "sp_n_samples", "dsb_temp",
+                "sp_cutoff_gen", "sp_top_n", "sp_min_atoms_gen", "chk_gen_protonate_site",
+                "dsb_gen_ph", "cb_gen_site_qm_method", "cb_gen_qm_basis", "cb_final_ff",
+                "chk_induced_fit",
+            ],
+        }
+
+    def _connect_state_autosave(self):
+        for step_key, attrs in self._tab_state_specs.items():
+            for attr in attrs:
+                widget = getattr(self, attr, None)
+                if widget is None:
+                    continue
+                if isinstance(widget, QLineEdit):
+                    widget.textChanged.connect(lambda _=None, key=step_key: self._save_tab_state(key))
+                elif isinstance(widget, QTextEdit):
+                    widget.textChanged.connect(lambda key=step_key: self._save_tab_state(key))
+                elif isinstance(widget, QComboBox):
+                    widget.currentIndexChanged.connect(lambda _=None, key=step_key: self._save_tab_state(key))
+                elif isinstance(widget, (QCheckBox, QRadioButton)):
+                    widget.toggled.connect(lambda _=None, key=step_key: self._save_tab_state(key))
+                elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                    widget.valueChanged.connect(lambda _=None, key=step_key: self._save_tab_state(key))
+                elif isinstance(widget, QDateTimeEdit):
+                    widget.dateTimeChanged.connect(lambda _=None, key=step_key: self._save_tab_state(key))
+
+    def _tab_state_path(self, step_key: str, job_dir: Optional[str] = None) -> Optional[str]:
+        base_dir = job_dir or self.job_dir
+        if not base_dir:
+            return None
+        return os.path.join(base_dir, f"{step_key}.json")
+
+    def _widget_state_value(self, widget):
+        if isinstance(widget, QComboBox):
+            return {"index": widget.currentIndex(), "text": widget.currentText()}
+        if isinstance(widget, (QCheckBox, QRadioButton)):
+            return widget.isChecked()
+        if isinstance(widget, QDateTimeEdit):
+            return widget.dateTime().toString("yyyy-MM-ddTHH:mm:ss")
+        if isinstance(widget, QDoubleSpinBox):
+            return widget.value()
+        if isinstance(widget, QSpinBox):
+            return widget.value()
+        if isinstance(widget, QTextEdit):
+            return widget.toPlainText()
+        if isinstance(widget, (QLineEdit, QLabel)):
+            return widget.text()
+        return None
+
+    def _widget_set_state_value(self, widget, value):
+        if widget is None or value is None:
+            return
+        try:
+            if isinstance(widget, QComboBox):
+                if isinstance(value, dict):
+                    idx = value.get("index")
+                    text = value.get("text", "")
+                else:
+                    idx = None
+                    text = str(value)
+                if isinstance(idx, int) and 0 <= idx < widget.count():
+                    widget.setCurrentIndex(idx)
+                else:
+                    found = widget.findText(text)
+                    if found >= 0:
+                        widget.setCurrentIndex(found)
+                    elif widget.isEditable():
+                        widget.setEditText(text)
+            elif isinstance(widget, (QCheckBox, QRadioButton)):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QDateTimeEdit):
+                dt = QDateTime.fromString(str(value), "yyyy-MM-ddTHH:mm:ss")
+                if dt.isValid():
+                    widget.setDateTime(dt)
+            elif isinstance(widget, QDoubleSpinBox):
+                widget.setValue(float(value))
+            elif isinstance(widget, QSpinBox):
+                widget.setValue(int(value))
+            elif isinstance(widget, QTextEdit):
+                widget.setPlainText(str(value))
+            elif isinstance(widget, (QLineEdit, QLabel)):
+                widget.setText(str(value))
+        except (TypeError, ValueError):
+            pass
+
+    def _collect_tab_state(self, step_key: str) -> dict:
+        state = {}
+        for attr in self._tab_state_specs.get(step_key, []):
+            widget = getattr(self, attr, None)
+            value = self._widget_state_value(widget)
+            if value is not None:
+                state[attr] = value
+
+        if step_key == "step1":
+            state["job_id"] = self.lbl_job_id.text().strip()
+            state["job_dir"] = self.job_dir
+            state["root_dir"] = self.ed_root.text().strip()
+
+        return state
+
+    def _apply_tab_state(self, step_key: str, state: dict):
+        if not isinstance(state, dict) or not state:
+            return
+
+        if step_key == "step1":
+            root_value = state.get("ed_root") or state.get("root_dir")
+            if root_value:
+                self._widget_set_state_value(getattr(self, "ed_root", None), root_value)
+            selected_job = None
+            prev_job_state = state.get("cb_prev_job")
+            if isinstance(prev_job_state, dict):
+                selected_job = prev_job_state.get("text", "")
+            elif prev_job_state:
+                selected_job = str(prev_job_state)
+            self._refresh_previous_jobs(selected_job=selected_job or state.get("job_id", ""))
+
+        for attr in self._tab_state_specs.get(step_key, []):
+            if attr not in state:
+                continue
+            self._widget_set_state_value(getattr(self, attr, None), state[attr])
+
+        if step_key == "step1":
+            self._sync_step1_job_mode()
+            self._update_job_id()
+            self._refresh_paths()
+
+    def _legacy_step1_state(self, job_dir: Optional[str]) -> dict:
+        if not job_dir:
+            return {}
+        cfg_path = os.path.join(job_dir, "job_config.json")
+        if not os.path.isfile(cfg_path):
+            return {}
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        job_id = payload.get("job_id") or os.path.basename(os.path.normpath(job_dir))
+        state = {
+            "ed_root": payload.get("root_dir", self.ed_root.text().strip()),
+            "ed_job_name": payload.get("job_name", ""),
+            "te_org_terms": "\n".join(payload.get("organism_terms", [])),
+            "te_desc_terms": "\n".join(payload.get("desc_terms", [])),
+            "te_phase3_ids": "\n".join(payload.get("phase3_pdb_ids", [])),
+            "rb_job_load": True,
+            "rb_job_new": False,
+            "cb_prev_job": {"text": job_id},
+            "job_id": job_id,
+            "job_dir": payload.get("job_dir", job_dir),
+            "root_dir": payload.get("root_dir", self.ed_root.text().strip()),
+        }
+        stamp_text = str(job_id)[:16]
+        dt = QDateTime.fromString(stamp_text, "yyyy-MM-dd_HH-mm")
+        if dt.isValid():
+            state["dt_job_stamp"] = dt.toString("yyyy-MM-ddTHH:mm:ss")
+        return state
+
+    def _read_tab_state(self, step_key: str, job_dir: Optional[str] = None) -> dict:
+        path = self._tab_state_path(step_key, job_dir)
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                state = payload.get("state")
+                if isinstance(state, dict):
+                    return state
+                return payload
+
+        if step_key == "step1":
+            return self._legacy_step1_state(job_dir)
+        return {}
+
+    def _save_tab_state(self, step_key: str):
+        if self._applying_job_state:
+            return
+        path = self._tab_state_path(step_key)
+        if not path:
+            return
+        payload = {
+            "step": step_key,
+            "job_id": os.path.basename(self.job_dir) if self.job_dir else self.lbl_job_id.text().strip(),
+            "job_dir": self.job_dir,
+            "saved_at": datetime.now().isoformat(),
+            "state": self._collect_tab_state(step_key),
+        }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _save_all_tab_states(self):
+        for step_key in self._tab_state_specs:
+            self._save_tab_state(step_key)
+
+    def _load_job_state_into_ui(self, job_dir: str):
+        self._applying_job_state = True
+        try:
+            for step_key in self._tab_state_specs:
+                self._apply_tab_state(step_key, self._read_tab_state(step_key, job_dir))
+        finally:
+            self._applying_job_state = False
+
+    def _refresh_previous_jobs(self, selected_job: str = ""):
+        combo = getattr(self, "cb_prev_job", None)
+        root_edit = getattr(self, "ed_root", None)
+        if combo is None or root_edit is None:
+            return
+
+        root = root_edit.text().strip() or self.dp_dir
+        jobs_dir = os.path.join(root, "JOBS")
+        jobs = []
+        if os.path.isdir(jobs_dir):
+            jobs = sorted(
+                [name for name in os.listdir(jobs_dir) if os.path.isdir(os.path.join(jobs_dir, name))],
+                reverse=True,
+            )
+
+        current = selected_job or combo.currentText().strip()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(jobs)
+        if current:
+            idx = combo.findText(current)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _sync_step1_job_mode(self):
+        is_load = getattr(self, "rb_job_load", None) is not None and self.rb_job_load.isChecked()
+        if hasattr(self, "ed_job_name"):
+            self.ed_job_name.setEnabled(not is_load)
+        if hasattr(self, "dt_job_stamp"):
+            self.dt_job_stamp.setEnabled(True)
+            if not is_load:
+                self.dt_job_stamp.setDateTime(QDateTime.currentDateTime())
+        if hasattr(self, "cb_prev_job"):
+            self.cb_prev_job.setEnabled(is_load)
+            if is_load:
+                self._refresh_previous_jobs()
+        self._update_job_id()
+
+    @staticmethod
+    def _datetime_from_job_id(job_id: str) -> Optional[QDateTime]:
+        job_id = (job_id or "").strip()
+        if len(job_id) < 16:
+            return None
+        dt = QDateTime.fromString(job_id[:16], "yyyy-MM-dd_HH-mm")
+        return dt if dt.isValid() else None
+
+    def _load_project(self, job_dir: str):
+        if not os.path.isdir(job_dir):
+            QMessageBox.warning(
+                self, i18n.t("msg_warning_title", self._idioma),
+                i18n.t("s1_msg_job_not_found", self._idioma, job_dir=job_dir),
+            )
+            return
+
+        self.job_dir = job_dir
+        self._load_job_state_into_ui(job_dir)
+        self._sync_step1_job_mode()
+        self.lbl_job_id.setText(os.path.basename(os.path.normpath(job_dir)))
+        self._refresh_previous_jobs(selected_job=self.lbl_job_id.text().strip())
+        self.lbl_job_status.setText(i18n.t("s1_msg_job_loaded", self._idioma, job_dir=job_dir))
+        root = self.ed_root.text().strip() or self.dp_dir
+        self._refresh_paths()
+        self._inject_root(root, job_dir)
+        self._save_all_tab_states()
+
     # ── Menu ──────────────────────────────────────────────────────────────
     def _build_menu(self):
         mb = self.menuBar()
@@ -1103,18 +1410,25 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _, idx=i: self.tabs.setCurrentIndex(idx))
             menu.addAction(act)
         menu.addSeparator()
-        act_exit = QAction(self, triggered=self.close)
+        act_exit = QAction(self)
         self._tr("menu_exit", act_exit.setText)
+        act_exit.triggered.connect(lambda: self.close())
         menu.addAction(act_exit)
 
         help_menu = mb.addMenu("")
         self._tr("menu_help", help_menu.setTitle)
-        act_req = QAction(self, triggered=self._show_requirements)
+        act_req = QAction(self)
         self._tr("menu_install_requirements", act_req.setText)
+        act_req.triggered.connect(self._show_requirements)
         help_menu.addAction(act_req)
+        act_report = QAction(self)
+        self._tr("menu_final_report", act_report.setText)
+        act_report.triggered.connect(self._generate_final_report)
+        help_menu.addAction(act_report)
         help_menu.addSeparator()
-        act_about = QAction(self, triggered=self._show_about)
+        act_about = QAction(self)
         self._tr("menu_about", act_about.setText)
+        act_about.triggered.connect(self._show_about)
         help_menu.addAction(act_about)
 
     # ── Monitor CPU + GPU ─────────────────────────────────────────────────
@@ -1687,21 +2001,42 @@ class MainWindow(QMainWindow):
         grp_job = QGroupBox(); self._tr("s1_grp_job_id", grp_job.setTitle)
         grp_job.setStyleSheet(_SS_GROUPBOX_NO_BG)
         jf = QFormLayout(grp_job); jf.setHorizontalSpacing(20)
+        self.rb_job_new = QRadioButton()
+        self._tr("s1_rb_new_project", self.rb_job_new.setText)
+        self.rb_job_new.setChecked(True)
+        self.rb_job_load = QRadioButton()
+        self._tr("s1_rb_load_project", self.rb_job_load.setText)
+        mode_row = QWidget(); mode_l = QHBoxLayout(mode_row); mode_l.setContentsMargins(0,0,0,0)
+        mode_l.addWidget(self.rb_job_new)
+        mode_l.addWidget(self.rb_job_load)
+        mode_l.addStretch(1)
+        self.bg_job_mode = QButtonGroup(self)
+        self.bg_job_mode.addButton(self.rb_job_new)
+        self.bg_job_mode.addButton(self.rb_job_load)
+
+        self.cb_prev_job = QComboBox()
+        self.cb_prev_job.setEnabled(False)
+        self._tr("s1_tooltip_prev_job", self.cb_prev_job.setToolTip)
         self.ed_job_name = QLineEdit()
         self._tr("s1_ph_job_name", self.ed_job_name.setPlaceholderText)
         self.ed_job_name.setMaximumWidth(340)
-        self.de_job_date = QDateEdit()
-        self.de_job_date.setCalendarPopup(True)
-        self.de_job_date.setDate(QDate.currentDate())
-        self.de_job_date.setDisplayFormat("yyyy-MM-dd")
-        self.de_job_date.setMaximumWidth(160)
-        self._tr("s1_tooltip_date", self.de_job_date.setToolTip)
+        self.dt_job_stamp = QDateTimeEdit()
+        self.dt_job_stamp.setCalendarPopup(False)
+        self.dt_job_stamp.setDateTime(QDateTime.currentDateTime())
+        self.dt_job_stamp.setDisplayFormat("yyyy-MM-dd_HH-mm")
+        self.dt_job_stamp.setMaximumWidth(200)
+        self.dt_job_stamp.setReadOnly(True)
+        self._tr("s1_tooltip_date", self.dt_job_stamp.setToolTip)
         self.lbl_job_id = QLabel("—")
         self.lbl_job_id.setStyleSheet("font-weight:bold;color:#2ECC71;")
         self.ed_job_name.textChanged.connect(self._update_job_id)
-        self.de_job_date.dateChanged.connect(self._update_job_id)
+        self.rb_job_new.toggled.connect(self._sync_step1_job_mode)
+        self.rb_job_load.toggled.connect(self._sync_step1_job_mode)
+        self.cb_prev_job.currentIndexChanged.connect(self._update_job_id)
+        jf.addRow(self._trL("s1_lbl_job_mode"), mode_row)
         jf.addRow(self._trL("s1_lbl_job_name"), self.ed_job_name)
-        jf.addRow(self._trL("s1_lbl_date"),     self.de_job_date)
+        jf.addRow(self._trL("s1_lbl_date"),     self.dt_job_stamp)
+        jf.addRow(self._trL("s1_lbl_prev_job"), self.cb_prev_job)
         jf.addRow(self._trL("s1_lbl_job_id"),   self.lbl_job_id)
 
         # ── Termos de busca para Fases 2 e 3 ──────────────────────────────
@@ -1805,6 +2140,7 @@ class MainWindow(QMainWindow):
         nl.addLayout(self._mk_nav_row_tr(lambda: self.tabs.setCurrentIndex(0),
                                           lambda: self.tabs.setCurrentIndex(2)))
         outer.addWidget(nav)
+        self._sync_step1_job_mode()
         return w
 
     def _browse_root(self):
@@ -1812,12 +2148,22 @@ class MainWindow(QMainWindow):
             self, i18n.t("dlg_select_root_title", self._idioma), self.dp_dir)
         if d:
             self.dp_dir = d; self.ed_root.setText(d)
+            self._refresh_previous_jobs()
             self._refresh_paths()
 
     def _update_job_id(self):
+        if hasattr(self, "rb_job_load") and self.rb_job_load.isChecked():
+            prev = self.cb_prev_job.currentText().strip() if hasattr(self, "cb_prev_job") else ""
+            dt = self._datetime_from_job_id(prev)
+            if dt is not None and hasattr(self, "dt_job_stamp"):
+                self.dt_job_stamp.setDateTime(dt)
+            self.lbl_job_id.setText(prev or "—")
+            return
+        if hasattr(self, "dt_job_stamp"):
+            self.dt_job_stamp.setDateTime(QDateTime.currentDateTime())
         name = self.ed_job_name.text().strip()
-        date = self.de_job_date.date().toString("yyyy-MM-dd")
-        self.lbl_job_id.setText(f"{date}_{name}" if name else "—")
+        stamp = self.dt_job_stamp.dateTime().toString("yyyy-MM-dd_HH-mm")
+        self.lbl_job_id.setText(f"{stamp}_{name}" if name else "—")
 
     def _refresh_paths(self):
         """Atualiza os labels de Detected Paths para global e job-specific."""
@@ -1884,14 +2230,26 @@ class MainWindow(QMainWindow):
 
     def _job_run(self):
         root = self.ed_root.text().strip()
+        is_load = hasattr(self, "rb_job_load") and self.rb_job_load.isChecked()
         name = self.ed_job_name.text().strip()
+        if is_load:
+            selected_job = self.cb_prev_job.currentText().strip()
+            if not root or not selected_job:
+                QMessageBox.warning(
+                    self, i18n.t("msg_warning_title", self._idioma),
+                    i18n.t("s1_msg_select_previous_job", self._idioma)); return
+            self._load_project(os.path.join(root, "JOBS", selected_job))
+            return
+
         if not root or not name:
             QMessageBox.warning(
                 self, i18n.t("msg_warning_title", self._idioma),
                 i18n.t("s1_msg_fill_root_name", self._idioma)); return
 
-        date     = self.de_job_date.date().toString("yyyy-MM-dd")
-        job_id   = f"{date}_{name}"
+        current_dt = QDateTime.currentDateTime()
+        self.dt_job_stamp.setDateTime(current_dt)
+        stamp    = current_dt.toString("yyyy-MM-dd_HH-mm")
+        job_id   = f"{stamp}_{name}"
         job_dir  = os.path.join(root, "JOBS", job_id)
 
         # Estrutura global da Fase 1
@@ -1938,14 +2296,16 @@ class MainWindow(QMainWindow):
             "phase3_pdb_ids":  self._parse_csv_ids(self.te_phase3_ids.toPlainText()),
         }
         cfg_path = os.path.join(job_dir, "job_config.json")
-        with open(cfg_path, "w") as f:
-            json.dump(job_config, f, indent=2)
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(job_config, f, indent=2, ensure_ascii=False)
 
         self.job_dir = job_dir
         self.lbl_job_id.setText(job_id)
+        self._refresh_previous_jobs(selected_job=job_id)
         self.lbl_job_status.setText(i18n.t("s1_msg_job_ready", self._idioma, job_dir=job_dir))
         self._refresh_paths()
         self._inject_root(root, job_dir)
+        self._save_all_tab_states()
 
     @staticmethod
     def _parse_text_list(text: str) -> list:
@@ -2968,6 +3328,40 @@ class MainWindow(QMainWindow):
             self,
             i18n.t("about_title", self._idioma),
             f"{i18n.t('about_body', self._idioma)}\n\nVersion: {VERSAO}")
+
+    def _generate_final_report(self):
+        if not self.job_dir:
+            QMessageBox.warning(
+                self, i18n.t("msg_warning_title", self._idioma),
+                i18n.t("msg_please_start_job", self._idioma),
+            )
+            return
+
+        self._save_all_tab_states()
+        report_payload = {
+            "job_id": os.path.basename(os.path.normpath(self.job_dir)),
+            "job_dir": self.job_dir,
+            "root_dir": self.ed_root.text().strip(),
+            "generated_at": datetime.now().isoformat(),
+            "version": VERSAO,
+            "tabs": {},
+        }
+
+        for step_key in self._tab_state_specs:
+            report_payload["tabs"][step_key] = self._read_tab_state(step_key, self.job_dir)
+
+        report_path = os.path.join(self.job_dir, "final_report.json")
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report_payload, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            QMessageBox.critical(self, i18n.t("msg_error_title", self._idioma), str(e))
+            return
+
+        QMessageBox.information(
+            self, i18n.t("report_title_done", self._idioma),
+            i18n.t("report_saved", self._idioma, path=report_path),
+        )
 
 
 # ==========================================================================================================================================
