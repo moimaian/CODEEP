@@ -498,6 +498,13 @@ QTextEdit {
 _SS_LABEL_TITLE   = "font-size:14pt; font-weight:bold; color:#2ECC71;"
 _SS_LABEL_SECTION = "font-size:11pt; font-weight:bold; color:#C9D1D9;"
 
+# QGroupBox sem cor de fundo própria (só a borda) — sobrepõe localmente o "background:
+# #14253A" do QGroupBox global (_SS_MAIN acima) com o mesmo tom da janela principal
+# (BG_DEEP #0D1B2A), mantendo borda/título/margens herdados do estilo global (o Qt mescla
+# propriedade a propriedade entre o stylesheet local do widget e o da aplicação — só a
+# propriedade especificada aqui é sobrescrita). Usado nos grupos da aba Home.
+_SS_GROUPBOX_NO_BG = "QGroupBox { background: #0D1B2A; }"
+
 
 # ==========================================================================================================================================
 # ═══════════════════════════ WORKER GENÉRICO ══════════════════════════════
@@ -884,89 +891,6 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
     print(f"\n✅ {len(df)} valid candidates saved to: {out_dir}")
     
 # ==========================================================================================================================================
-# ══════════════════════════ SPLASH SCREEN ═════════════════════════════════
-# ==========================================================================================================================================
-class SplashScreen(QDialog):
-    ready_signal = pyqtSignal()
-
-    def __init__(self):
-        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        # Idioma persistido de uma sessão anterior (ver MainWindow._definir_idioma) — a splash
-        # não tem bandeiras próprias (é transitória, sem interação), só respeita a última escolha.
-        self._idioma = QSettings("CODEEP", "CODEEP").value("idioma", i18n.IDIOMA_PADRAO)
-        if self._idioma not in ("en", "pt"):
-            self._idioma = i18n.IDIOMA_PADRAO
-        self.setFixedSize(500, 300)
-        self.setStyleSheet("background:#0D1B2A; border-radius:10px;")
-        sc = QGuiApplication.primaryScreen().availableGeometry()
-        self.move((sc.width()-500)//2, (sc.height()-300)//2)
-        lay = QVBoxLayout(self); lay.setContentsMargins(40, 36, 40, 24); lay.setSpacing(10)
-
-        _logo_path = Path(__file__).resolve().parent / "ICONS" / "CODEEP2.png"
-        t = QLabel()
-        t.setAlignment(Qt.AlignCenter)
-        if _logo_path.exists():
-            _pix = QPixmap(str(_logo_path))
-            # Escala para largura máxima de 420px mantendo proporção
-            # Ajuste o valor conforme o tamanho da sua imagem
-            if not _pix.isNull():
-                _pix = _pix.scaledToWidth(100, Qt.SmoothTransformation)
-            t.setPixmap(_pix)
-        else:
-            # Fallback: texto original caso a imagem não seja encontrada
-            t.setText("CODEEP")
-            t.setStyleSheet(
-                "font-size:42pt;font-weight:bold;color:#2ECC71;letter-spacing:8px;")
-        lay.addWidget(t)
-        for txt, ss in [
-            (i18n.t("splash_subtitle", self._idioma),
-             "font-size:11pt;color:#95A5A6;"),
-            ("CODOC  ·  CODYN  ·  CODEEP  ·  CODRUG",
-             "font-size:8pt;color:#3D5A4A;margin-top:2px;"),
-        ]:
-            l = QLabel(txt); l.setAlignment(Qt.AlignCenter); l.setStyleSheet(ss)
-            lay.addWidget(l)
-
-        lay.addSpacing(14)
-        self.lbl_status = QLabel(i18n.t("splash_status_init", self._idioma))
-        self.lbl_status.setAlignment(Qt.AlignCenter)
-        self.lbl_status.setStyleSheet("font-size:9pt;color:#BDC3C7;")
-        lay.addWidget(self.lbl_status)
-
-        self.bar = QProgressBar(); self.bar.setRange(0,100); self.bar.setValue(0)
-        self.bar.setTextVisible(False); self.bar.setFixedHeight(8)
-        self.bar.setStyleSheet(
-            "QProgressBar{background:#1C2D3A;border-radius:4px;border:none;}"
-            "QProgressBar::chunk{background:#2ECC71;border-radius:4px;}")
-        lay.addWidget(self.bar)
-
-        v = QLabel("v1.0 beta  ·  © 2024–2026 CEB / UFPR  ·  GPL-3.0")
-        v.setAlignment(Qt.AlignCenter)
-        v.setStyleSheet("font-size:8pt;color:#3D5A4A;margin-top:10px;")
-        lay.addWidget(v)
-
-    def start(self):
-        self._steps = [
-            (20, i18n.t("splash_step_python", self._idioma)),
-            (45, i18n.t("splash_step_pyqt5", self._idioma)),
-            (65, i18n.t("splash_step_pytorch", self._idioma)),
-            (85, i18n.t("splash_step_env", self._idioma)),
-            (100, i18n.t("splash_step_ready", self._idioma)),
-        ]
-        self._i = 0
-        self._t = QTimer(self); self._t.timeout.connect(self._tick); self._t.start(320)
-
-    def _tick(self):
-        if self._i >= len(self._steps):
-            self._t.stop(); QTimer.singleShot(250, self._done); return
-        v, msg = self._steps[self._i]
-        self.bar.setValue(v); self.lbl_status.setText(msg); self._i += 1
-
-    def _done(self):
-        self.ready_signal.emit(); self.accept()
-
-
-# ==========================================================================================================================================
 # ══════════════════════ JANELA PRINCIPAL ══════════════════════════════════
 # ==========================================================================================================================================
 class MainWindow(QMainWindow):
@@ -986,7 +910,7 @@ class MainWindow(QMainWindow):
         self._tr("app_titulo", self.setWindowTitle)
         self.setStyleSheet(_SS_MAIN)
         sc = QGuiApplication.primaryScreen().availableGeometry()
-        self.resize(int(sc.width()*0.60), int(sc.height()*0.80))
+        self.resize(int(sc.width()*0.50), int(sc.height()*0.75))
         self.move((sc.width()-self.width())//2, (sc.height()-self.height())//2)
 
         self.dp_dir: str = str(Path(__file__).parent)
@@ -1557,6 +1481,7 @@ class MainWindow(QMainWindow):
 
         # Quadro CPU
         cpu_grp = QGroupBox()
+        cpu_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_cpu", cpu_grp.setTitle)
         cpu_form = QFormLayout(cpu_grp)
         cpu_form.setHorizontalSpacing(16); cpu_form.setVerticalSpacing(4)
@@ -1571,6 +1496,7 @@ class MainWindow(QMainWindow):
 
         # Quadro GPU
         gpu_grp = QGroupBox()
+        gpu_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_gpu", gpu_grp.setTitle)
         gpu_form = QFormLayout(gpu_grp)
         gpu_form.setHorizontalSpacing(16); gpu_form.setVerticalSpacing(4)
@@ -1587,6 +1513,7 @@ class MainWindow(QMainWindow):
 
         # ── Software Specs ─────────────────────────────────────────────────
         sw_grp = QGroupBox()
+        sw_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_sw", sw_grp.setTitle)
         sw_grid = QGridLayout(sw_grp)
         sw_grid.setHorizontalSpacing(24); sw_grid.setVerticalSpacing(4)
@@ -1595,13 +1522,11 @@ class MainWindow(QMainWindow):
         cols = 3
         for i, (lib, ver) in enumerate(sw_items):
             row, col = divmod(i, cols)
-            ok = ver != "not installed"
             lbl_lib = QLabel(lib)
             lbl_lib.setStyleSheet("color:#6E8CA8;font-size:9pt;")
             lbl_ver = QLabel(ver)
-            lbl_ver.setStyleSheet(
-                f"font-weight:bold;font-size:9pt;"
-                f"color:{'#27AE60' if ok else '#E74C3C'};")
+            # Mesma fonte branca em negrito usada nos valores de Hardware Specs — CPU/GPU.
+            lbl_ver.setStyleSheet("font-weight:bold;font-size:9pt;color:#C9D1D9;")
             lbl_ver.setTextInteractionFlags(Qt.TextSelectableByMouse)
             sw_grid.addWidget(lbl_lib, row, col*2)
             sw_grid.addWidget(lbl_ver, row, col*2+1)
@@ -1609,6 +1534,7 @@ class MainWindow(QMainWindow):
 
         # ── Pipeline — Steps ───────────────────────────────────────────────
         pipe_grp = QGroupBox()
+        pipe_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_pipeline", pipe_grp.setTitle)
         pipe_lay = QGridLayout(pipe_grp)
         pipe_lay.setHorizontalSpacing(20); pipe_lay.setVerticalSpacing(4)
@@ -1623,7 +1549,9 @@ class MainWindow(QMainWindow):
             ("home_step8_name", "home_step8_desc"),
         ]
         for i, (name_key, desc_key) in enumerate(step_keys):
-            name_lbl = QLabel(); name_lbl.setStyleSheet("color:#2ECC71;font-size:9pt;")
+            name_lbl = QLabel()
+            # Mesma fonte branca em negrito usada nos valores de Hardware Specs — CPU/GPU.
+            name_lbl.setStyleSheet("font-weight:bold;font-size:9pt;color:#C9D1D9;")
             self._tr(name_key, lambda txt, lbl=name_lbl: lbl.setText(f"<b>{txt}</b>"))
             desc_lbl = self._trL(desc_key)
             desc_lbl.setStyleSheet("color:#6E8CA8;font-size:9pt;")
@@ -2965,13 +2893,6 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("CODEEP")
 
-    splash = SplashScreen()
-    splash.show()
-
-    def _on_ready():
-        window = MainWindow()
-        window.show()
-
-    splash.ready_signal.connect(_on_ready)
-    splash.start()
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec_())

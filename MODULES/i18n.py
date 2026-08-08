@@ -97,18 +97,6 @@ _TEXTOS = {
         "pt": "Não foi possível abrir a janela do monitor:\n{error}",
     },
 
-    # ---------------------------------------------------------------- Splash screen
-    "splash_subtitle": {
-        "en": "Deep Learning · Ligand Generation Pipeline",
-        "pt": "Deep Learning · Pipeline de Geração de Ligantes",
-    },
-    "splash_status_init": {"en": "Initializing...", "pt": "Inicializando..."},
-    "splash_step_python": {"en": "Checking Python...", "pt": "Verificando Python..."},
-    "splash_step_pyqt5": {"en": "Checking PyQt5...", "pt": "Verificando PyQt5..."},
-    "splash_step_pytorch": {"en": "Checking PyTorch...", "pt": "Verificando PyTorch..."},
-    "splash_step_env": {"en": "Checking environment...", "pt": "Verificando ambiente..."},
-    "splash_step_ready": {"en": "Ready!", "pt": "Pronto!"},
-
     # ---------------------------------------------------------------- HOME tab
     "home_tagline": {
         "en": "Deep learning applied to the Ligands Generation Pipeline",
