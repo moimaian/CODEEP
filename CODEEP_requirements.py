@@ -432,7 +432,7 @@ QGroupBox::title {
     subcontrol-origin: margin;
     left: 10px;
     padding: 0 4px;
-    color: #2ECC71;
+    color: #F57C6F;
 }
 QGroupBox QLabel {
     background: transparent;
@@ -513,6 +513,20 @@ QPushButton {
 QPushButton:hover   { background: #27AE60; color: #0D1B2A; }
 QPushButton:pressed { background: #1E8449; color: #FFF; }
 QPushButton:disabled{ background: #1C2E20; color: #3D6B4A; border-color: #2A4A36; }
+"""
+
+_SS_BTN_SECONDARY = """
+QPushButton {
+    background: #243746;
+    color: #C9D1D9;
+    font-weight: bold;
+    border: 1px solid #6E8CA8;
+    border-radius: 5px;
+    padding: 7px 20px;
+}
+QPushButton:hover   { background: #37536C; color: #FFFFFF; }
+QPushButton:pressed { background: #1C3249; color: #FFF; }
+QPushButton:disabled{ background: #1B2730; color: #4F6577; border-color: #344654; }
 """
 
 _SS_BTN_CLOSE = """
@@ -596,7 +610,7 @@ class RequirementsInstaller(QWidget):
 
         # ── Cabeçalho ──────────────────────────────────────────────────────
         hdr = QLabel("CODEEP — Install Requirements")
-        hdr.setStyleSheet("font-size: 13pt; font-weight: bold; color: #2ECC71;")
+        hdr.setStyleSheet("font-size: 13pt; font-weight: bold; color: #F57C6F;")
         root.addWidget(hdr)
 
         # Detecta se já estamos no venv correto
@@ -636,7 +650,7 @@ class RequirementsInstaller(QWidget):
         ]):
             lbl = QLabel(f"<b>{text}</b>")
             lbl.setFixedWidth(width)
-            lbl.setStyleSheet("color: #2ECC71;")
+            lbl.setStyleSheet("color: #F57C6F;")
             pkg_lay.addWidget(lbl, 0, col)
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
@@ -725,15 +739,15 @@ class RequirementsInstaller(QWidget):
         btn_row = QHBoxLayout()
 
         self.btn_check = QPushButton("Check again")
-        self.btn_check.setStyleSheet(_SS_BTN_INSTALL)
+        self.btn_check.setStyleSheet(_SS_BTN_SECONDARY)
         self.btn_check.clicked.connect(self._detect_and_refresh)
 
         self.btn_select_all = QPushButton("Select all")
-        self.btn_select_all.setStyleSheet(_SS_BTN_INSTALL)
+        self.btn_select_all.setStyleSheet(_SS_BTN_SECONDARY)
         self.btn_select_all.clicked.connect(lambda: self._set_all_checks(True))
 
         self.btn_select_missing = QPushButton("Missing only")
-        self.btn_select_missing.setStyleSheet(_SS_BTN_INSTALL)
+        self.btn_select_missing.setStyleSheet(_SS_BTN_SECONDARY)
         self.btn_select_missing.clicked.connect(self._select_only_missing)
 
         self.btn_install = QPushButton("Install selected")

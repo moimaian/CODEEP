@@ -37,6 +37,7 @@ import os, sys, subprocess
 import logging
 
 from pathlib import Path
+from versao import VERSAO, LICENCA_CURTA
 
 
 # Caminho canônico do venv dedicado ao CODEEP
@@ -56,7 +57,7 @@ def _write_desktop() -> None:
     icon_path = _APP_DIR / "ICONS" / "CODEEP.png"
     content = (
         "[Desktop Entry]\n"
-        "Version=1.0\n"
+        f"Version={VERSAO}\n"
         "Name=CODEEP\n"
         "Comment=Deep Learning Pipeline for Ligand Generation\n"
         f"Exec=bash -i -c \"env PYTHONNOUSERSITE=1 '{_VENV_PYTHON}' '{_APP_DIR / 'CODEEP.py'}'\"\n"
@@ -405,8 +406,8 @@ QCheckBox::indicator {
     background: #1C3249;
 }
 QCheckBox::indicator:checked {
-    background: #2ECC71;
-    border-color: #2ECC71;
+    background: #F57C6F;
+    border-color: #F57C6F;
 }
 QRadioButton { color: #C9D1D9; }
 QFrame[frameShape="4"] { color: #2A4A6B; }
@@ -459,6 +460,20 @@ QPushButton:pressed { background: #1E8449; color: #FFF; }
 QPushButton:disabled{ background: #1C2E20; color: #3D6B4A; border-color: #2A4A36; }
 """
 
+_SS_BTN_SECONDARY = """
+QPushButton {
+    background: #243746;
+    color: #C9D1D9;
+    font-weight: bold;
+    border: 1px solid #6E8CA8;
+    border-radius: 5px;
+    padding: 6px 16px;
+}
+QPushButton:hover   { background: #37536C; color: #FFFFFF; }
+QPushButton:pressed { background: #1C3249; color: #FFF; }
+QPushButton:disabled{ background: #1B2730; color: #4F6577; border-color: #344654; }
+"""
+
 _SS_BTN_DANGER = """
 QPushButton {
     background: #4A1A1A;
@@ -481,7 +496,7 @@ QPushButton {
     font-size: 12pt;
     font-weight: bold;
 }
-QPushButton:hover { color: #2ECC71; }
+QPushButton:hover { color: #F57C6F; }
 """
 
 _SS_LOG = """
@@ -495,7 +510,7 @@ QTextEdit {
 }
 """
 
-_SS_LABEL_TITLE   = "font-size:14pt; font-weight:bold; color:#2ECC71;"
+_SS_LABEL_TITLE   = "font-size:14pt; font-weight:bold; color:#FFFFFF;"
 _SS_LABEL_SECTION = "font-size:11pt; font-weight:bold; color:#C9D1D9;"
 
 # QGroupBox sem cor de fundo própria (só a borda) — sobrepõe localmente o "background:
@@ -504,6 +519,59 @@ _SS_LABEL_SECTION = "font-size:11pt; font-weight:bold; color:#C9D1D9;"
 # propriedade a propriedade entre o stylesheet local do widget e o da aplicação — só a
 # propriedade especificada aqui é sobrescrita). Usado nos grupos da aba Home.
 _SS_GROUPBOX_NO_BG = "QGroupBox { background: #0D1B2A; }"
+
+
+class CollapsibleGroupBox(QGroupBox):
+    """QGroupBox colapsável ao clicar no título ou na borda."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._collapsed = False
+
+    def _collapsed_height(self):
+        return max(28, self.fontMetrics().height() + 14)
+
+    def _set_layout_widgets_visible(self, layout, visible):
+        if layout is None:
+            return
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget()
+            if widget is not None:
+                widget.setVisible(visible)
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._set_layout_widgets_visible(child_layout, visible)
+
+    def set_collapsed(self, collapsed):
+        self._collapsed = bool(collapsed)
+        self._set_layout_widgets_visible(self.layout(), not self._collapsed)
+        if self._collapsed:
+            h = self._collapsed_height()
+            self.setMinimumHeight(h)
+            self.setMaximumHeight(h)
+        else:
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
+            self.adjustSize()
+
+    def _is_toggle_hit(self, pos):
+        title_h = self._collapsed_height()
+        border = 6
+        if pos.y() <= title_h:
+            return True
+        return (
+            pos.x() <= border
+            or pos.x() >= self.width() - border
+            or pos.y() >= self.height() - border
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._is_toggle_hit(event.pos()):
+            self.set_collapsed(not self._collapsed)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 # ==========================================================================================================================================
@@ -910,7 +978,7 @@ class MainWindow(QMainWindow):
         self._tr("app_titulo", self.setWindowTitle)
         self.setStyleSheet(_SS_MAIN)
         sc = QGuiApplication.primaryScreen().availableGeometry()
-        self.resize(int(sc.width()*0.50), int(sc.height()*0.75))
+        self.resize(int(sc.width()*0.50), int(sc.height()*0.60))
         self.move((sc.width()-self.width())//2, (sc.height()-self.height())//2)
 
         self.dp_dir: str = str(Path(__file__).parent)
@@ -1480,7 +1548,7 @@ class MainWindow(QMainWindow):
         hw_row = QHBoxLayout(); hw_row.setSpacing(14)
 
         # Quadro CPU
-        cpu_grp = QGroupBox()
+        cpu_grp = CollapsibleGroupBox()
         cpu_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_cpu", cpu_grp.setTitle)
         cpu_form = QFormLayout(cpu_grp)
@@ -1492,10 +1560,11 @@ class MainWindow(QMainWindow):
             lbl_v.setStyleSheet("font-weight:bold;font-size:9pt;color:#C9D1D9;")
             lbl_v.setTextInteractionFlags(Qt.TextSelectableByMouse)
             cpu_form.addRow(lbl_k, lbl_v)
+        cpu_grp.set_collapsed(False)
         hw_row.addWidget(cpu_grp, 1)
 
         # Quadro GPU
-        gpu_grp = QGroupBox()
+        gpu_grp = CollapsibleGroupBox()
         gpu_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_gpu", gpu_grp.setTitle)
         gpu_form = QFormLayout(gpu_grp)
@@ -1507,12 +1576,13 @@ class MainWindow(QMainWindow):
             lbl_v.setStyleSheet("font-weight:bold;font-size:9pt;color:#C9D1D9;")
             lbl_v.setTextInteractionFlags(Qt.TextSelectableByMouse)
             gpu_form.addRow(lbl_k, lbl_v)
+        gpu_grp.set_collapsed(False)
         hw_row.addWidget(gpu_grp, 1)
 
         lay.addLayout(hw_row)
 
         # ── Software Specs ─────────────────────────────────────────────────
-        sw_grp = QGroupBox()
+        sw_grp = CollapsibleGroupBox()
         sw_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_sw", sw_grp.setTitle)
         sw_grid = QGridLayout(sw_grp)
@@ -1530,10 +1600,11 @@ class MainWindow(QMainWindow):
             lbl_ver.setTextInteractionFlags(Qt.TextSelectableByMouse)
             sw_grid.addWidget(lbl_lib, row, col*2)
             sw_grid.addWidget(lbl_ver, row, col*2+1)
+        sw_grp.set_collapsed(True)
         lay.addWidget(sw_grp)
 
         # ── Pipeline — Steps ───────────────────────────────────────────────
-        pipe_grp = QGroupBox()
+        pipe_grp = CollapsibleGroupBox()
         pipe_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
         self._tr("home_grp_pipeline", pipe_grp.setTitle)
         pipe_lay = QGridLayout(pipe_grp)
@@ -1557,6 +1628,7 @@ class MainWindow(QMainWindow):
             desc_lbl.setStyleSheet("color:#6E8CA8;font-size:9pt;")
             pipe_lay.addWidget(name_lbl, i, 0)
             pipe_lay.addWidget(desc_lbl, i, 1)
+        pipe_grp.set_collapsed(True)
         lay.addWidget(pipe_grp)
 
         lay.addWidget(_mk_separator())
@@ -1566,7 +1638,7 @@ class MainWindow(QMainWindow):
         btn_start = self._mk_btn_tr("home_btn_start", _SS_BTN_PRIMARY, 160)
         btn_start.setFixedHeight(38)
         btn_start.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
-        btn_req = self._mk_btn_tr("home_btn_install", _SS_BTN_PRIMARY, 190)
+        btn_req = self._mk_btn_tr("home_btn_install", _SS_BTN_SECONDARY, 190)
         btn_req.setFixedHeight(38)
         btn_req.clicked.connect(self._show_requirements)
         if not _REQ_MODULE_OK:
@@ -1578,9 +1650,9 @@ class MainWindow(QMainWindow):
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
-        ver = QLabel("v1.0 beta  ·  © 2024–2026 CEB/UFPR  ·  GPL-3.0")
+        ver = QLabel(f"v{VERSAO}  ·  © 2024–2026 CEB/UFPR  ·  {LICENCA_CURTA}")
         ver.setAlignment(Qt.AlignCenter)
-        ver.setStyleSheet("font-size:8pt;color:#3D5A4A;margin-top:6px;")
+        ver.setStyleSheet("font-size:8pt;color:#6E8CA8;margin-top:6px;")
         lay.addWidget(ver)
 
         # Empacota scroll na aba
@@ -1603,16 +1675,17 @@ class MainWindow(QMainWindow):
 
         # ── Diretório raiz do CODEEP ───────────────────────────────────────
         grp_dir = QGroupBox(); self._tr("s1_grp_root", grp_dir.setTitle)
-        dl = QHBoxLayout(grp_dir)
+        grp_dir.setStyleSheet(_SS_GROUPBOX_NO_BG)
+        dl = QVBoxLayout(grp_dir)
         self.ed_root = QLineEdit(self.dp_dir); self.ed_root.setReadOnly(True)
         dl.addWidget(self.ed_root)
-        btn_br = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_br = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_br.clicked.connect(self._browse_root)
-        dl.addWidget(btn_br)
-        lay.addWidget(grp_dir)
+        dl.addWidget(btn_br, alignment=Qt.AlignLeft)
 
         # ── Identificação do Job ───────────────────────────────────────────
         grp_job = QGroupBox(); self._tr("s1_grp_job_id", grp_job.setTitle)
+        grp_job.setStyleSheet(_SS_GROUPBOX_NO_BG)
         jf = QFormLayout(grp_job); jf.setHorizontalSpacing(20)
         self.ed_job_name = QLineEdit()
         self._tr("s1_ph_job_name", self.ed_job_name.setPlaceholderText)
@@ -1630,10 +1703,10 @@ class MainWindow(QMainWindow):
         jf.addRow(self._trL("s1_lbl_job_name"), self.ed_job_name)
         jf.addRow(self._trL("s1_lbl_date"),     self.de_job_date)
         jf.addRow(self._trL("s1_lbl_job_id"),   self.lbl_job_id)
-        lay.addWidget(grp_job)
 
         # ── Termos de busca para Fases 2 e 3 ──────────────────────────────
         grp_search = QGroupBox(); self._tr("s1_grp_search", grp_search.setTitle)
+        grp_search.setStyleSheet(_SS_GROUPBOX_NO_BG)
         sl = QVBoxLayout(grp_search); sl.setSpacing(6)
 
         sl.addWidget(self._mk_section_tr("s1_sec_org_terms"))
@@ -1654,10 +1727,15 @@ class MainWindow(QMainWindow):
         self.te_phase3_ids.setFixedHeight(60)
         sl.addWidget(self.te_phase3_ids)
 
-        lay.addWidget(grp_search)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+        top_row.addWidget(grp_dir, 1)
+        top_row.addWidget(grp_job, 1)
+        lay.addLayout(top_row)
 
         # ── Detected Paths ─────────────────────────────────────────────────
         grp_paths = QGroupBox(); self._tr("s1_grp_paths", grp_paths.setTitle)
+        grp_paths.setStyleSheet(_SS_GROUPBOX_NO_BG)
         pf = QFormLayout(grp_paths); pf.setHorizontalSpacing(16)
         pf.setVerticalSpacing(3)
 
@@ -1700,7 +1778,11 @@ class MainWindow(QMainWindow):
             self._path_labels[key] = (lbl, sub, "job")
             pf.addRow(label, lbl)
 
-        lay.addWidget(grp_paths)
+        second_row = QHBoxLayout()
+        second_row.setSpacing(12)
+        second_row.addWidget(grp_search, 1)
+        second_row.addWidget(grp_paths, 1)
+        lay.addLayout(second_row)
 
         # ── Botão e status ─────────────────────────────────────────────────
         self.btn_job_run = self._mk_btn_tr("s1_btn_create_job", _SS_BTN_PRIMARY, 230)
@@ -2024,7 +2106,7 @@ class MainWindow(QMainWindow):
 
         self.ed_moad_dir = QLineEdit()
         self._tr("s2_ph_moad_dir", self.ed_moad_dir.setPlaceholderText)
-        btn_moad = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_moad = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_moad.clicked.connect(self._browse_moad_dir)
         moad_row = QWidget(); ml = QHBoxLayout(moad_row); ml.setContentsMargins(0,0,0,0)
         ml.addWidget(self.ed_moad_dir); ml.addWidget(btn_moad)
@@ -2196,7 +2278,7 @@ class MainWindow(QMainWindow):
         pf.addWidget(lbl)
 
         # Botão para visualizar o dashboard gerado
-        self.btn_view_dash = self._mk_btn_tr("s4_btn_view_dash", _SS_BTN_PRIMARY, 160)
+        self.btn_view_dash = self._mk_btn_tr("s4_btn_view_dash", _SS_BTN_SECONDARY, 160)
         self.btn_view_dash.clicked.connect(self._view_explore_dashboard)
 
         pf.addWidget(self._trL("lbl_phase"))
@@ -2386,7 +2468,7 @@ class MainWindow(QMainWindow):
         # Campo para retomada de treino / fine-tuning
         self.ed_resume = QLineEdit(); self._tr("s6_ph_resume", self.ed_resume.setPlaceholderText)
         self.ed_resume.setReadOnly(True)
-        btn_resume = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_resume = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         resume_row = QWidget(); rl = QHBoxLayout(resume_row); rl.setContentsMargins(0,0,0,0)
         rl.addWidget(self.ed_resume); rl.addWidget(btn_resume)
         btn_resume.clicked.connect(self._browse_resume)
@@ -2394,7 +2476,7 @@ class MainWindow(QMainWindow):
 
         self.ed_ckpt_out = QLineEdit(); self.ed_ckpt_out.setPlaceholderText("checkpoints/")
         self.ed_ckpt_out.setReadOnly(True)
-        btn_ckpt = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_ckpt = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         ckpt_row = QWidget(); cl = QHBoxLayout(ckpt_row); cl.setContentsMargins(0,0,0,0)
         cl.addWidget(self.ed_ckpt_out); cl.addWidget(btn_ckpt)
         btn_ckpt.clicked.connect(self._browse_ckpt_out)
@@ -2511,7 +2593,7 @@ class MainWindow(QMainWindow):
 
         self.ed_eval_ckpt = QLineEdit(); self.ed_eval_ckpt.setReadOnly(True)
         self._tr("ph_checkpoints_default", self.ed_eval_ckpt.setPlaceholderText)
-        btn_eval_ckpt = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_eval_ckpt = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_eval_ckpt.clicked.connect(self._browse_eval_ckpt)
         eck_row = QWidget(); el = QHBoxLayout(eck_row); el.setContentsMargins(0,0,0,0)
         el.addWidget(self.ed_eval_ckpt); el.addWidget(btn_eval_ckpt)
@@ -2527,7 +2609,7 @@ class MainWindow(QMainWindow):
         vis_row = QWidget(); vl = QHBoxLayout(vis_row); vl.setContentsMargins(0,0,0,0)
         for name_key, stem in [("s7_btn_training_curves", "training_curves"),
                                 ("s7_btn_performance_report", "performance_report")]:
-            b = self._mk_btn_tr(name_key, _SS_BTN_PRIMARY, 180)
+            b = self._mk_btn_tr(name_key, _SS_BTN_SECONDARY, 180)
             b.clicked.connect(
                 lambda _, s=stem, k=name_key: self._view_eval_fig(s, i18n.t(k, self._idioma))
             )
@@ -2584,35 +2666,35 @@ class MainWindow(QMainWindow):
         self.cb_gen_phase.addItems(["1", "2", "3"])
         self.ed_gen_pdb = QLineEdit(); self.ed_gen_pdb.setReadOnly(True)
         self._tr("s8_ph_pdb", self.ed_gen_pdb.setPlaceholderText)
-        btn_pdb = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_pdb = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_pdb.clicked.connect(self._browse_gen_pdb)
         pdb_row = QWidget(); pl = QHBoxLayout(pdb_row); pl.setContentsMargins(0,0,0,0)
         pl.addWidget(self.ed_gen_pdb); pl.addWidget(btn_pdb)
 
         self.ed_gen_site_pdb = QLineEdit(); self.ed_gen_site_pdb.setReadOnly(True)
         self._tr("s8_ph_site_pdb", self.ed_gen_site_pdb.setPlaceholderText)
-        btn_site_pdb = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_site_pdb = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_site_pdb.clicked.connect(self._browse_gen_site_pdb)
         site_pdb_row = QWidget(); spl = QHBoxLayout(site_pdb_row); spl.setContentsMargins(0,0,0,0)
         spl.addWidget(self.ed_gen_site_pdb); spl.addWidget(btn_site_pdb)
 
         self.ed_gen_ckpt = QLineEdit(); self.ed_gen_ckpt.setReadOnly(True)
         self._tr("ph_checkpoints_default", self.ed_gen_ckpt.setPlaceholderText)
-        btn_gc = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_gc = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_gc.clicked.connect(self._browse_gen_ckpt)
         gc_row = QWidget(); gl2 = QHBoxLayout(gc_row); gl2.setContentsMargins(0,0,0,0)
         gl2.addWidget(self.ed_gen_ckpt); gl2.addWidget(btn_gc)
 
         self.ed_gen_out = QLineEdit(); self.ed_gen_out.setReadOnly(True)
         self._tr("s8_ph_out", self.ed_gen_out.setPlaceholderText)
-        btn_gout = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_gout = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_gout.clicked.connect(self._browse_gen_out)
         gout_row = QWidget(); gl3 = QHBoxLayout(gout_row); gl3.setContentsMargins(0,0,0,0)
         gl3.addWidget(self.ed_gen_out); gl3.addWidget(btn_gout)
 
         self.ed_ligand_ref = QLineEdit(); self.ed_ligand_ref.setReadOnly(True)
         self._tr("s8_ph_ligand_ref", self.ed_ligand_ref.setPlaceholderText)
-        btn_ref = self._mk_btn_tr("btn_browse", _SS_BTN_PRIMARY, 100)
+        btn_ref = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_ref.clicked.connect(self._browse_ligand_ref)
         ref_row = QWidget(); rl2 = QHBoxLayout(ref_row); rl2.setContentsMargins(0,0,0,0)
         rl2.addWidget(self.ed_ligand_ref); rl2.addWidget(btn_ref)
@@ -2883,7 +2965,9 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         QMessageBox.about(
-            self, i18n.t("about_title", self._idioma), i18n.t("about_body", self._idioma))
+            self,
+            i18n.t("about_title", self._idioma),
+            f"{i18n.t('about_body', self._idioma)}\n\nVersion: {VERSAO}")
 
 
 # ==========================================================================================================================================

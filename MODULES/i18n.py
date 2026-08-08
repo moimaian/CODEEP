@@ -633,11 +633,11 @@ _TEXTOS = {
         "en": "CODEEP\nDeep Learning Ligand Generation Pipeline\n\nPart of the suite:\n   "
               "CODOC · CODYN · CODEEP · CODRUG\n\nDeveloped by:\n   Moisés Maia Neto\n   "
               "CEB / Universidade Federal do Paraná - UFPR\n\n   Brasil\n\n"
-              "Contact: moimaian@gmail.com\n\nVersion 1.0 (beta)   © 2024–2026",
+              "Contact: moimaian@gmail.com\n\n",
         "pt": "CODEEP\nPipeline de Geração de Ligantes por Aprendizado Profundo\n\nParte do "
               "conjunto:\n   CODOC · CODYN · CODEEP · CODRUG\n\nDesenvolvido por:\n   Moisés "
               "Maia Neto\n   CEB / Universidade Federal do Paraná - UFPR\n\n   Brasil\n\n"
-              "Contato: moimaian@gmail.com\n\nVersão 1.0 (beta)   © 2024–2026",
+              "Contato: moimaian@gmail.com\n\n",
     },
 }
 
