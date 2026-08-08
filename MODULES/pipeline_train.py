@@ -1339,6 +1339,31 @@ def train(
     train_ds = SiteLigandDataset(tensor_dir=dataset_dir, split="train")
     val_ds   = SiteLigandDataset(tensor_dir=dataset_dir, split="val")
 
+    # Retrato da config de voxelização que gerou ESSES tensores (ver
+    # pipeline_voxelize.save_voxel_config_snapshot) — embutido no checkpoint
+    # salvo abaixo (best_model.pt["config"]["voxel_config"]) para que a
+    # geração (Etapa 8) possa reconstruir o tensor de um sítio novo com a
+    # MESMA config usada aqui, sem depender do usuário reproduzi-la
+    # manualmente na interface (risco de mismatch treino↔inferência nos
+    # canais 3-4, ver pipeline_generate.load_model). Ausente (dict vazio)
+    # para tensores gerados antes desta funcionalidade existir — nesse caso
+    # a geração cai para o comportamento legado (config manual da UI).
+    voxel_config_snapshot = {}
+    _vc_path = dataset_dir / "voxel_config.json"
+    if _vc_path.exists():
+        try:
+            voxel_config_snapshot = json.loads(_vc_path.read_text())
+            log.info(f"  Voxel config herdada de {_vc_path}: {voxel_config_snapshot}")
+        except Exception as e:
+            log.warning(f"  Não foi possível ler {_vc_path}: {e}")
+    else:
+        log.warning(
+            f"  {_vc_path} não encontrado — o checkpoint salvo NÃO terá a config de "
+            "voxelização embutida (tensores gerados antes desta funcionalidade existir, "
+            "ou tensor_dir não é o mesmo usado na Etapa 5). A geração cairá para a "
+            "config manual da interface (Etapa 8)."
+        )
+
     # pipeline_train.py, linhas 840–845
     # num_workers=0: carregamento de dados no mesmo processo, sem fork.
     # O gargalo do treinamento é o compute GPU (forward/backward), não o I/O
@@ -1460,6 +1485,7 @@ def train(
                     "latent_dim":   latent_dim,
                     "hidden_dim":   hidden_dim,
                     "n_gnn_layers": n_gnn_layers,
+                    "voxel_config": voxel_config_snapshot,
                 },
             }, ckpt_dir / "best_model.pt")
             log.info(f"  ★ Melhor modelo salvo (val_loss={best_val:.4f})")

@@ -300,6 +300,41 @@ VOXEL_CONFIG = {
     "ecfp4_radius": 2,
 }
 
+# Chaves de VOXEL_CONFIG que realmente mudam os VALORES do tensor do sítio
+# (grade/canais 0-4) — únicas que precisam ser reproduzidas EXATAMENTE na
+# geração (Etapa 8) para que o encoder treinado receba um tensor da mesma
+# distribuição do treino (ver process_pair/pdb_to_site_tensor). Ficam de
+# fora de propósito: "vox_batch" (só afeta velocidade, não o resultado),
+# "n_site_channels" (constante arquitetural, não é escolha do usuário) e
+# "use_ecfp4"/"ecfp4_*" (afetam o grafo do ligante no treino, não o tensor
+# do sítio consumido pelo encoder).
+VOXEL_CONFIG_TENSOR_KEYS = (
+    "grid_size", "padding_A", "gaussian_sigma", "max_qm_atoms",
+    "qm_basis", "ph", "protonate_site", "site_qm_method",
+)
+
+
+def save_voxel_config_snapshot(tensor_dir: "Path | str", config: "dict | None" = None) -> None:
+    """Grava um retrato da config de voxelização REALMENTE usada nesta rodada
+    (ver VOXEL_CONFIG_TENSOR_KEYS) em <tensor_dir>/voxel_config.json.
+
+    Consumido por pipeline_train.train() (que embute esse retrato no
+    best_model.pt salvo) e por pipeline_generate.load_model() (que o lê de
+    volta do checkpoint) — fecha o elo que faltava entre "com que config o
+    tensor de treino foi construído" e "com que config o tensor de um sítio
+    novo precisa ser construído na geração", sem depender do usuário lembrar
+    e repetir manualmente os mesmos valores na Etapa 8 da interface.
+    """
+    cfg = config if config is not None else VOXEL_CONFIG
+    snapshot = {k: cfg[k] for k in VOXEL_CONFIG_TENSOR_KEYS if k in cfg}
+    out_path = Path(tensor_dir) / "voxel_config.json"
+    try:
+        out_path.write_text(json.dumps(snapshot, indent=2))
+        log.info(f"  Retrato da config de voxelização salvo em {out_path}")
+    except Exception as e:
+        log.warning(f"  Não foi possível salvar {out_path}: {e}")
+
+
 # Raios de van der Waals por elemento (Å) — Bondi 1964
 VDW_RADII = {
     "H": 1.20, "C": 1.70, "N": 1.55, "O": 1.52, "S": 1.80,
@@ -1078,6 +1113,17 @@ STANDARD_AMINO_ACIDS = {
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
 }
 
+# Átomos de backbone (cadeia principal) — usados para decidir o que fica
+# travado no modo "induced-fit" da minimização final (ver
+# pipeline_generate._minimize_complex_rdkit/_minimize_complex_gromacs):
+# backbone travado (representa onde o resto da proteína real prende esse
+# resíduo no lugar — não temos a cadeia inteira, só o sítio recortado),
+# cadeia lateral livre para se ajustar ao ligante. Nota: o caminho GROMACS
+# não reaproveita esta lista diretamente (reconstrói o próprio backbone
+# flag a partir da topologia que o pdb2gmx gera, ver BACKBONE_ATOM_NAMES em
+# pipeline_generate.py) — só o caminho RDKit usa esta lista aqui.
+BACKBONE_ATOM_NAMES = {"N", "CA", "C", "O"}
+
 # pKa padrão dos grupos ionizáveis em água a 25°C (Nelson & Cox, Lehninger
 # Principles of Biochemistry) — não considera microambiente/estrutura.
 RESIDUE_PKA = {
@@ -1299,6 +1345,94 @@ def protonate_site_residues(
     charges_arr = np.nan_to_num(np.array(charges_all, dtype=np.float32),
                                  nan=0.0, posinf=0.0, neginf=0.0)
     return coords_arr, elements_all, charges_arr, fragments
+
+
+def _classify_fragment_backbone(mol: "Chem.Mol") -> list[bool]:
+    """Para um fragmento residual protonado (ver protonate_residue), retorna
+    um bool por átomo: True = backbone (N, Cα, C, O), False = cadeia
+    lateral. Átomos sem informação de resíduo (hidrogênios adicionados por
+    Chem.AddHs — nunca herdam PDBResidueInfo) herdam a classificação do
+    único átomo pesado ao qual estão ligados.
+    """
+    flags = [False] * mol.GetNumAtoms()
+    for atom in mol.GetAtoms():
+        info = atom.GetPDBResidueInfo()
+        if info is not None:
+            flags[atom.GetIdx()] = info.GetName().strip() in BACKBONE_ATOM_NAMES
+    for atom in mol.GetAtoms():
+        if atom.GetPDBResidueInfo() is None:   # hidrogênio sem nome de átomo
+            nbrs = atom.GetNeighbors()
+            if len(nbrs) == 1:
+                flags[atom.GetIdx()] = flags[nbrs[0].GetIdx()]
+    return flags
+
+
+def build_combined_site_mol(
+    coords: np.ndarray,
+    elements: list[str],
+    fragments: list[dict],
+) -> tuple["Chem.Mol", list[bool]]:
+    """Combina os fragmentos residuais protonados (ver
+    protonate_site_residues) num único Mol do sítio, preservando as
+    ligações REAIS intra-resíduo — necessário para o modo "induced-fit" da
+    minimização final: se os átomos de cadeia lateral vão poder se mover,
+    o campo de força precisa das ligações entre eles para manter a
+    geometria interna do resíduo sã durante a minimização (sem isso, nada
+    impede um comprimento de ligação absurdo dentro da própria cadeia
+    lateral). No modo travado (sítio 100% rígido), as ligações não fazem
+    diferença — mas mantê-las sempre presentes evita ter dois caminhos de
+    construção do Mol do sítio para manter em sincronia.
+
+    Fragmentos sem protonação bem-sucedida (mol=None — íons, água,
+    heteroátomos, ou falha pontual de protonação) entram como átomos
+    isolados, sem ligações — tratados como sempre-backbone (sempre
+    travados no modo induced-fit também, já que não há como classificá-los
+    nem geometria interna a preservar).
+
+    Returns:
+        combined_mol — Mol único, MESMA ORDEM de átomos que `elements`
+            (e portanto de site_coords, ver pdb_to_site_tensor).
+        is_backbone — lista de bool, mesma ordem/tamanho.
+    """
+    pieces: list["Chem.Mol"] = []
+    is_backbone: list[bool] = []
+
+    for frag in fragments:
+        mol = frag["mol"]
+        if mol is not None:
+            pieces.append(mol)
+            is_backbone.extend(_classify_fragment_backbone(mol))
+        else:
+            n = frag["end"] - frag["start"]
+            rw = Chem.RWMol()
+            conf = Chem.Conformer(n)
+            for k in range(n):
+                idx = frag["start"] + k
+                try:
+                    atom = Chem.Atom(elements[idx].capitalize())
+                except Exception:
+                    atom = Chem.Atom(6)
+                rw.AddAtom(atom)
+            rw.AddConformer(conf, assignId=True)   # posições reais setadas depois
+            pieces.append(rw.GetMol())
+            is_backbone.extend([True] * n)
+
+    combined = pieces[0]
+    for piece in pieces[1:]:
+        combined = Chem.CombineMols(combined, piece)
+    Chem.SanitizeMol(combined, sanitizeOps=Chem.SANITIZE_ALL ^ Chem.SANITIZE_ADJUSTHS)
+
+    # Re-atribui as posições explicitamente a partir de `coords` (autoridade
+    # única) — evita depender de como Chem.CombineMols funde conformers
+    # entre peças reais (protonate_residue) e peças falsas sem posição
+    # (fragmentos fallback, criados acima com um conformer vazio).
+    if combined.GetNumConformers() == 0:
+        combined.AddConformer(Chem.Conformer(combined.GetNumAtoms()), assignId=True)
+    conf = combined.GetConformer()
+    for i in range(combined.GetNumAtoms()):
+        conf.SetAtomPosition(i, [float(x) for x in coords[i]])
+
+    return combined, is_backbone
 
 
 def load_site_atoms_protonated(
@@ -1851,9 +1985,14 @@ def run(
     curated_dir = Path(curated_dir)
     tensor_dir = Path(tensor_dir)
     tensor_dir.mkdir(parents=True, exist_ok=True)
-    _setup_log_file(Path(config.pop("log_dir"))) 
+    _setup_log_file(Path(config.pop("log_dir")))
     if config:
         VOXEL_CONFIG.update(config)
+
+    # Grava a config efetiva ANTES de processar (não só em caso de sucesso
+    # completo) — mesmo uma rodada interrompida deixa registrado com que
+    # config os tensores já gerados até então foram construídos.
+    save_voxel_config_snapshot(tensor_dir)
 
     log.info("=" * 65)
     log.info("PIPELINE ETAPA 4: Voxelização 3D + Grafos Moleculares")

@@ -288,13 +288,77 @@ sem qualquer estrutura template externa) é convertido em objeto RDKit com valid
 - orçamento de valência por átomo (rejeita ligações que excederiam a valência máxima do elemento);
 - reparo de fragmentos desconexos residuais (liga o par válido mais próximo entre componentes,
   se necessário);
-- sanitização RDKit, com *fallback* de desaromatização se a sanitização direta falhar;
-- otimização de geometria local (MMFF94s, com UFF como alternativa) pós-reconstrução.
+- sanitização RDKit, com *fallback* de desaromatização se a sanitização direta falhar.
+
+**Minimização conjunta ligante+sítio e checagem de colisão estérica.** Diferente de minimizar o
+ligante isoladamente e só então compará-lo a um bolso rígido (o que ou sinaliza colisões que uma
+pequena reacomodação resolveria, ou aprova poses que nunca "sentiram" a proteína durante o ajuste
+de geometria), a etapa final de otimização combina o candidato gerado com os átomos do sítio
+(protonados, Seção 3) num único sistema — o ligante minimiza sentindo a repulsão/atração real da
+proteína, não um bolso hipotético nunca considerado durante o ajuste de geometria. Dois eixos são
+selecionáveis independentemente:
+
+**Nível de teoria** (parâmetro `final_ff`), do mais simples ao mais rigoroso:
+
+1. **MMFF94s/UFF (RDKit)** — padrão, sem dependência externa. Tenta MMFF94s primeiro; recai para
+   UFF quando o sítio contém átomos que o MMFF não tipa bem (metais de cofator — Zn, Fe, Mg — o
+   MMFF foi parametrizado majoritariamente para moléculas orgânicas *drug-like*, não ambientes
+   proteicos metálicos). Validado empiricamente: constrói e minimiza mesmo com um átomo de Zn²⁺
+   não reconhecido pelo tipador UFF.
+2. **AMBER ff14SB** / **CHARMM36** (proteína) + ligante parametrizado como GAFF2 (cargas
+   Gasteiger por padrão; AM1-BCC via `sqm` opcional, ~100× mais lento e sem ganho relevante aqui,
+   já que o rigor adicional deste caminho vem do campo de força da *proteína*, não da carga do
+   ligante), orquestrados via GROMACS (`pdb2gmx`/`editconf`/`grompp`/`mdrun`) + AmberTools
+   (`antechamber`/`parmchk2`/`tleap`, chamados pelo `acpype`) — tudo por `subprocess`, nunca
+   importado dentro do processo Python do CODEEP (decisão deliberada: GROMACS já é uma dependência
+   do CODYN, o companheiro de dinâmica molecular do mesmo conjunto de ferramentas, então reusar seu
+   binário evita uma segunda cadeia de dependências científicas Python — `openmm`+
+   `openmmforcefields`+`openff-toolkit` foi cogitado e descartado por este último não ser
+   instalável via `pip` em nenhuma versão do Python, só via `conda-forge`, o que forçaria um
+   ambiente híbrido pip/conda só para esta funcionalidade). A topologia do sítio
+   (`pdb2gmx`) é construída **uma única vez por rodada de geração** e reaproveitada por todos os N
+   candidatos — o sítio não muda entre eles, só o ligante — evitando N chamadas redundantes ao
+   `pdb2gmx`; cada candidato paga apenas o custo (menor) de reparametrizar seu próprio ligante via
+   `acpype`. Usa os campos de força AMBER/CHARMM já empacotados com a instalação do GROMACS
+   (`amber99sb-ildn`/`charmm27`) por padrão, com aviso no log; versões mais recentes
+   (`amber14sb.ff`/`charmm36.ff`, baixadas separadamente) podem ser adicionadas por quem instala o
+   CODEEP colocando a pasta `<nome>.ff` em `MODULES/forcefields/` — nunca no diretório
+   compartilhado da instalação do GROMACS, para não afetar outras ferramentas do mesmo conjunto
+   (CODYN incluso). Cai automaticamente para o caminho RDKit, com aviso no log, quando GROMACS
+   (`gmx`) ou `acpype` não estão no `PATH`.
+
+**Flexibilidade do sítio** (parâmetro `induced_fit`, desligado por padrão):
+
+- **Rígido** (padrão): todos os átomos do sítio travados — só o ligante se move.
+- **Induced-fit**: só o **backbone** (N, Cα, C, O) fica travado — representa o fato de que apenas
+  o bolso recortado está presente no sistema, não a proteína inteira, então nada mais seguraria
+  essa porção da cadeia no lugar. Os átomos de **cadeia lateral** ficam livres para se mover na
+  mesma minimização, respondendo à presença do ligante (não é uma dinâmica térmica separada —
+  é o mesmo passo de minimização de energia, com mais graus de liberdade). Isso exige que as
+  ligações intra-resíduo reais estejam presentes no sistema combinado (preservadas dos fragmentos
+  protonados por resíduo, Seção 3) — sem elas, nada impediria a cadeia lateral livre de colapsar
+  sobre si mesma durante a otimização. Validado empiricamente: a energia total do sistema
+  pós-minimização é sistematicamente menor em modo induced-fit do que em modo rígido (mais graus
+  de liberdade → mínimo de energia pelo menos tão bom), embora a distância a um único par
+  específico de átomos não seja necessariamente menor — a minimização otimiza a energia do
+  sistema como um todo, não uma distância isolada.
+
+Ambos os eixos combinam livremente (MMFF/UFF ou AMBER/CHARMM36, cada um rígido ou induced-fit).
+
+Após a minimização, uma checagem de plausibilidade geométrica pós-*hoc*, no espírito do PoseBusters
+(Buttenschoen, Morris & Deane, 2024), verifica: (i) colisão estérica — algum par
+(átomo do ligante, átomo do sítio) mais próximo que 0,75× a soma dos raios de van der Waals
+(Bondi, 1964)?; (ii) comprimento de ligação — alguma ligação do candidato fora de
+[0,75, 1,25]× o comprimento canônico do seu tipo? O resultado (`has_pocket_clash`,
+`n_pocket_clashes`) é anexado ao candidato e usado como fator de penalização no *score* composto
+de ranqueamento (Seção 9, adiante) — não é uma checagem exaustiva (não cobre planaridade de anel,
+ângulos de ligação, nem energia relativa a conformações de referência; ver limitação remanescente
+na Seção 10).
 
 Candidatos são então ranqueados por métricas de *drug-likeness* padrão (QED — Bickerton et al.,
-2012; regra dos cinco de Lipinski — Lipinski et al., 2001; peso molecular; LogP) e, quando um
-ligante de referência está disponível, por similaridade de Tanimoto sobre *fingerprints* de
-Morgan/ECFP.
+2012; regra dos cinco de Lipinski — Lipinski et al., 2001; peso molecular; LogP), pela ausência de
+colisão estérica com o sítio (acima) e, quando um ligante de referência está disponível, por
+similaridade de Tanimoto sobre *fingerprints* de Morgan/ECFP.
 
 ---
 
@@ -321,6 +385,47 @@ Registradas aqui para referência direta na seção de Discussão do artigo:
    arcabouço CVAE + GNN autorregressivo — mais leve computacionalmente, mas potencialmente menos
    expressivo que modelos de difusão de última geração; uma comparação quantitativa direta
    (validade, unicidade, novidade, afinidade de *docking*) é deixada para a seção de Resultados.
+6. **Plausibilidade geométrica da pose — parcialmente endereçada; sinal de afinidade ortogonal —
+   ainda ausente.** Duas lacunas distintas, frequentemente confundidas sob o rótulo genérico
+   "validação estrutural" — vale separá-las com precisão:
+   - A checagem de colisão estérica ligante↔sítio (Seção 9) cobre o par de critérios mais
+     diretamente ligados a "esse candidato colide com a proteína": distância mínima
+     (vs. soma de raios de van der Waals) e comprimento de ligação pós-minimização, no espírito
+     do PoseBusters (Buttenschoen, Morris & Deane, 2024). **Não** cobre o conjunto completo de
+     checagens do PoseBusters — faltam ângulos de ligação, planaridade de anéis e energia da
+     pose relativa a conformações de referência. A minimização em si também é uma aproximação:
+     campo de força clássico (RDKit MMFF/UFF por padrão, sem parametrização específica para
+     ambiente proteico), e mesmo no modo induced-fit (Seção 9) só a cadeia lateral dos resíduos
+     do bolso recortado se move — sem backbone flexível, sem repacking de rotâmeros discreto, sem
+     movimento de outras partes da proteína fora do bolso, e sem busca de pose completa nem
+     dinâmica molecular real (é minimização de energia local a partir de uma única geometria
+     inicial, não uma amostragem conformacional). Os caminhos AMBER ff14SB/CHARMM36 (via
+     GROMACS+AmberTools, Seção 9) oferecem um campo de força de proteína mais rigoroso e suportam
+     o mesmo esquema induced-fit — validados ponta a ponta neste ambiente de desenvolvimento
+     (topologia do sítio via `pdb2gmx`, ligante via `acpype`/GAFF2, minimização com grupo de
+     índice `[Frozen]` seletivo por GROMACS), incluindo a checagem de que o backbone permanece
+     fixo (deslocamento residual ~10⁻⁵ Å, consistente com precisão numérica) enquanto a cadeia
+     lateral se move de fato (dezenas de centésimos de Å, num teste sintético) — mas usando os
+     campos de força AMBER/CHARMM já empacotados com esta instalação específica do GROMACS
+     (`amber99sb-ildn`/`charmm27`, não as versões mais recentes `ff14SB`/`36`, que exigiriam baixar
+     à parte a pasta `<nome>.ff` correspondente); ainda não avaliados em lote sobre um conjunto
+     real de candidatos gerados pelo modelo treinado (só com ligantes sintéticos de 3 átomos, para
+     isolar a corretude do encadeamento GROMACS/acpype da qualidade química do candidato em si).
+   - Continua sem nenhum sinal **externo e independente** de afinidade prevista (docking com
+     AutoDock Vina/Glide, ou métodos mais rigorosos como MM-GBSA/FEP) para ranquear/filtrar
+     candidatos. Vale frisar o que esse tipo de sinal, se adicionado, de fato forneceria: um
+     escore de docking **não é uma prova de correção estrutural** — é uma função empírica
+     calibrada para correlacionar com afinidade relativa entre químicas diversas, usada para
+     *priorizar* candidatos, não para *validar* que a geração está correta. Ainda assim, é
+     evidência complementar padrão na literatura de geração estrutural *de novo* (Pocket2Mol,
+     DiffSBDD e TargetDiff reportam o escore de Vina dos candidatos gerados como métrica
+     comparativa) e vale incorporar como filtro adicional na etapa de ranqueamento
+     (`rank_candidates`) em trabalho futuro.
+   - RMSD contra uma pose de referência — outra métrica às vezes citada como "validação
+     estrutural" — não se aplica diretamente aqui: pressupõe uma pose experimental conhecida
+     para comparação átomo-a-átomo, o que só faz sentido em tarefas de *predição* de pose
+     (redocking) para uma molécula de identidade fixa, não para geração *de novo*, onde o
+     candidato gerado tem topologia e contagem de átomos diferentes do ligante real.
 
 ---
 
@@ -335,6 +440,9 @@ Registradas aqui para referência direta na seção de Discussão do artigo:
 - Bickerton, G. R.; Paolini, G. V.; Besnard, J.; Muresan, S.; Hopkins, A. L. Quantifying the
   Chemical Beauty of Drugs. *Nat. Chem.* **2012**, *4*, 90–98.
 - Bondi, A. van der Waals Volumes and Radii. *J. Phys. Chem.* **1964**, *68* (3), 441–451.
+- Buttenschoen, M.; Morris, G. M.; Deane, C. M. PoseBusters: AI-Based Docking Methods Fail to
+  Generate Physically Valid Poses or Generalise to Novel Sequences. *Chem. Sci.* **2024**, *15*
+  (9), 3130–3139.
 - Fey, M.; Lenssen, J. E. Fast Graph Representation Learning with PyTorch Geometric. *ICLR
   Workshop on Representation Learning on Graphs and Manifolds* **2019**.
 - Gasteiger, J.; Marsili, M. Iterative Partial Equalization of Orbital Electronegativity — A Rapid

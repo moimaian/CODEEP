@@ -36,10 +36,22 @@ except ImportError:
 try:
     from rdkit import Chem
     from rdkit.Chem import Draw, AllChem, Descriptors, QED
-    from rdkit.Chem import rdMolDescriptors
+    from rdkit.Chem import rdMolDescriptors, rdFingerprintGenerator
+    from rdkit.DataStructs import TanimotoSimilarity
     HAS_RDKIT = True
 except ImportError:
     HAS_RDKIT = False
+
+# SA Score (Ertl & Schuffenhauer, 2009) — script Contrib do RDKit, não faz
+# parte da API principal. Precisa do caminho adicionado manualmente.
+try:
+    import sys as _sys
+    from rdkit.Chem import RDConfig as _RDConfig
+    _sys.path.append(str(Path(_RDConfig.RDContribDir) / "SA_Score"))
+    import sascorer
+    HAS_SASCORER = True
+except Exception:
+    HAS_SASCORER = False
 
 PROJECT_ROOT = Path(globals().get("_CODEEP_ROOT", Path(__file__).resolve().parent.parent))
 BASE_DIR = PROJECT_ROOT / "data"
@@ -307,17 +319,41 @@ def decode_predictions_to_mol(candidate: dict):
         return None
 
 
-def compute_molecule_metrics(smiles_list) -> dict:
+def compute_molecule_metrics(smiles_list, train_smiles: "set[str] | list[str] | None" = None) -> dict:
     """Calcula métricas de qualidade de moléculas geradas.
 
-    Métricas padrão em drug design generativo:
+    Métricas padrão em avaliação de geração molecular de novo (MOSES —
+    Polykovskiy et al., 2020; GuacaMol — Brown et al., 2019):
       - Validity    : % de SMILES que são moléculas válidas
-      - Uniqueness  : % de moléculas únicas entre as válidas
+      - Uniqueness  : % de moléculas únicas (canônicas) entre as válidas
+      - Novelty     : % das moléculas únicas válidas AUSENTES de
+                       `train_smiles` — descarta memorização trivial do
+                       conjunto de treino. None se train_smiles não for
+                       passado (em vez de um valor enganoso tipo 0 ou 1).
+      - Internal diversity (IntDiv1): 1 − similaridade de Tanimoto média
+                       par-a-par (Morgan/ECFP4 r=2, 2048 bits) entre as
+                       moléculas únicas válidas. Alto = candidatos
+                       quimicamente diferentes entre si, não apenas
+                       variações do mesmo esqueleto.
       - QED         : Drug-likeness (0-1, maior = mais drug-like)
       - MW          : Peso molecular médio
       - LogP        : Coeficiente de partição (lipofilia)
-      - SA Score    : Facilidade de síntese (1=fácil, 10=difícil)
+      - SA Score    : Facilidade de síntese estimada (Ertl & Schuffenhauer,
+                       2009; 1=fácil, 10=difícil) via o script Contrib
+                       `sascorer` do RDKit. None se HAS_SASCORER=False
+                       (script indisponível) — antes este campo era
+                       prometido no docstring mas nunca calculado.
       - Lipinski    : % que passa na Regra dos 5 de Lipinski
+
+    QED/MW/LogP/SA/Lipinski são calculados sobre o conjunto DEDUPLICADO
+    (uma ocorrência por SMILES canônico) — evita que um candidato muito
+    repetido distorça as médias, consistente com a prática de MOSES/
+    GuacaMol.
+
+    Args:
+        train_smiles: SMILES do split de TREINO, usado só para novelty
+            (comparação por forma canônica). Passe None para pular esse
+            cálculo.
     """
     if not HAS_RDKIT or not smiles_list:
         return {}
@@ -327,41 +363,86 @@ def compute_molecule_metrics(smiles_list) -> dict:
         if smi:
             mol = Chem.MolFromSmiles(smi)
             if mol:
-                valid_mols.append((smi, mol))
+                valid_mols.append(mol)
 
     validity = len(valid_mols) / len(smiles_list) if smiles_list else 0
-    unique_smiles = set(s for s, _ in valid_mols)
-    uniqueness = len(unique_smiles) / len(valid_mols) if valid_mols else 0
+
+    # Deduplica por SMILES CANÔNICO — duas strings de entrada diferentes
+    # podem representar a mesma molécula.
+    unique_canon: dict = {}
+    for mol in valid_mols:
+        try:
+            canon = Chem.MolToSmiles(mol)
+        except Exception:
+            continue
+        unique_canon.setdefault(canon, mol)
+    uniqueness = len(unique_canon) / len(valid_mols) if valid_mols else 0
 
     if not valid_mols:
         return {"validity": 0.0, "uniqueness": 0.0, "n_valid": 0}
 
-    qed_scores, mws, logps, lipinski_pass = [], [], [], []
-
-    for smi, mol in valid_mols:
+    qed_scores, mws, logps, lipinski_pass, sa_scores = [], [], [], [], []
+    for mol in unique_canon.values():
         try:
-            qed_scores.append(QED.qed(mol))
-            mws.append(Descriptors.MolWt(mol))
-            logps.append(Descriptors.MolLogP(mol))
             mw   = Descriptors.MolWt(mol)
             logp = Descriptors.MolLogP(mol)
             hbd  = rdMolDescriptors.CalcNumHBD(mol)
             hba  = rdMolDescriptors.CalcNumHBA(mol)
-            lipinski_pass.append(
-                mw <= 500 and logp <= 5 and hbd <= 5 and hba <= 10
-            )
+            qed_scores.append(QED.qed(mol))
+            mws.append(mw)
+            logps.append(logp)
+            lipinski_pass.append(mw <= 500 and logp <= 5 and hbd <= 5 and hba <= 10)
         except Exception:
             pass
+        if HAS_SASCORER:
+            try:
+                sa_scores.append(sascorer.calculateScore(mol))
+            except Exception:
+                pass
+
+    # ── Novelty vs. conjunto de treino ──────────────────────────────────
+    novelty = None
+    if train_smiles:
+        train_canon = set()
+        for smi in train_smiles:
+            if not smi:
+                continue
+            m = Chem.MolFromSmiles(smi)
+            if m is not None:
+                train_canon.add(Chem.MolToSmiles(m))
+        if train_canon:
+            n_novel = sum(1 for canon in unique_canon if canon not in train_canon)
+            novelty = n_novel / len(unique_canon)
+
+    # ── Diversidade interna (IntDiv1) ───────────────────────────────────
+    internal_diversity = None
+    unique_mol_list = list(unique_canon.values())
+    if len(unique_mol_list) >= 2:
+        try:
+            generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+            fps = [generator.GetFingerprint(m) for m in unique_mol_list]
+            sims = [
+                TanimotoSimilarity(fps[i], fps[j])
+                for i in range(len(fps)) for j in range(i + 1, len(fps))
+            ]
+            internal_diversity = 1.0 - (sum(sims) / len(sims)) if sims else None
+        except Exception:
+            internal_diversity = None
 
     return {
-        "n_total":     len(smiles_list),
-        "n_valid":     len(valid_mols),
-        "validity":    round(validity, 3),
-        "uniqueness":  round(uniqueness, 3),
+        "n_total":            len(smiles_list),
+        "n_valid":             len(valid_mols),
+        "n_unique":            len(unique_canon),
+        "validity":            round(validity, 3),
+        "uniqueness":          round(uniqueness, 3),
+        "novelty":             round(novelty, 3) if novelty is not None else None,
+        "internal_diversity":  round(internal_diversity, 3) if internal_diversity is not None else None,
         "qed_mean":    round(np.mean(qed_scores), 3)    if qed_scores else None,
         "qed_std":     round(np.std(qed_scores), 3)     if qed_scores else None,
         "mw_mean":     round(np.mean(mws), 1)           if mws else None,
         "logp_mean":   round(np.mean(logps), 2)         if logps else None,
+        "sa_score_mean": round(np.mean(sa_scores), 2)   if sa_scores else None,
+        "sa_score_std":  round(np.std(sa_scores), 2)    if sa_scores else None,
         "lipinski_%":  round(np.mean(lipinski_pass)*100, 1) if lipinski_pass else None,
     }
 
@@ -649,16 +730,35 @@ def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path):
 
         gen_smiles = [record["smiles"] for record in generated_records]
 
-        metrics = compute_molecule_metrics(gen_smiles)
+        # SMILES do split de TREINO — só para novelty (ver
+        # compute_molecule_metrics). Falha aqui não deve derrubar a
+        # avaliação inteira: sem isso, novelty simplesmente fica None.
+        train_smiles = None
+        try:
+            mod = _load_train_module()
+            train_ds = mod.SiteLigandDataset(tensor_dir=tensor_dir, split="train")
+            train_smiles = train_ds.records["ligand_smiles"].dropna().tolist()
+        except Exception as e:
+            log.warning(f"  Não foi possível carregar SMILES de treino p/ novelty: {e}")
+
+        metrics = compute_molecule_metrics(gen_smiles, train_smiles=train_smiles)
         log.info(f"  Real crystal ligand: {real_smi}")
         log.info(f"  Generated molecules     : {metrics.get('n_total', 0)}")
         log.info(f"  Valid                   : {metrics.get('n_valid', 0)} "
                  f"({metrics.get('validity', 0)*100:.1f}%)")
         log.info(f"  Unique                  : {metrics.get('uniqueness', 0)*100:.1f}%")
+        novelty = metrics.get('novelty')
+        log.info(f"  Novelty (vs. treino)    : "
+                 f"{'N/A' if novelty is None else f'{novelty*100:.1f}%'}")
+        int_div = metrics.get('internal_diversity')
+        log.info(f"  Internal diversity      : {'N/A' if int_div is None else int_div}")
         log.info(f"  Mean QED                : {metrics.get('qed_mean', 'N/A')} "
                  f"(± {metrics.get('qed_std', 'N/A')})")
         log.info(f"  Mean MW                 : {metrics.get('mw_mean', 'N/A')} Da")
         log.info(f"  Mean LogP               : {metrics.get('logp_mean', 'N/A')}")
+        sa_mean = metrics.get('sa_score_mean')
+        log.info(f"  Mean SA Score           : "
+                 f"{'N/A (sascorer indisponível)' if sa_mean is None else sa_mean}")
         log.info(f"  Lipinski Rule           : {metrics.get('lipinski_%', 'N/A')}%")
 
         out_sdf = ckpt_dir / "generated_ligands_3d.sdf"
