@@ -1267,15 +1267,20 @@ def eval_epoch(
 
 
 def train(
-    latent_dim:    int   = 128,
-    hidden_dim:    int   = 128,
-    n_gnn_layers:  int   = 3,
-    batch_size:    int   = 8,
-    epochs:        int   = 200,   # máximo — early stopping interrompe antes
+    # Defaults revisados: eram calibrados para <1000 pares (ver comentário
+    # em SiteEncoder — "Arquitetura reduzida para datasets pequenos").
+    # Dataset atual tem >33.000 pares e a GPU tem folga de sobra para o
+    # modelo (~1,8-2,4M parâmetros) — latent/hidden/gnn_layers/dropout
+    # voltam aos defaults de fábrica das classes.
+    latent_dim:    int   = 256,
+    hidden_dim:    int   = 256,
+    n_gnn_layers:  int   = 4,
+    batch_size:    int   = 32,
+    epochs:        int   = 150,   # máximo — early stopping interrompe antes
     lr:            float = 3e-4,
     beta_max:      float = 0.5,
     beta_warmup:   int   = 30,
-    dropout:       float = 0.35,
+    dropout:       float = 0.20,
     checkpoint_dir: str = "checkpoints",
     tensor_dir: str | None = None,
     resume: "str | None" = None,
@@ -1532,13 +1537,19 @@ Exemplos de uso:
       --checkpoint-dir checkpoints_phase3_target_specific/
         """
     )
-    parser.add_argument("--epochs",         type=int,   default=40)
-    parser.add_argument("--batch",          type=int,   default=8)
-    parser.add_argument("--latent",         type=int,   default=128)
-    parser.add_argument("--hidden",         type=int,   default=128)
+    # Defaults revisados: calibrados originalmente para <1000 pares (ver
+    # comentário em SiteEncoder). Dataset atual tem >33.000 pares e a GPU
+    # tem folga de sobra para o modelo — latent/hidden/gnn_layers/dropout
+    # voltam aos defaults de fábrica das classes (SiteEncoder/GNNDecoder/
+    # LigandCVAE); epochs unificado com o default de train() (era 40 aqui
+    # vs. 200 em train() vs. 100 na interface — três valores diferentes).
+    parser.add_argument("--epochs",         type=int,   default=150)
+    parser.add_argument("--batch",          type=int,   default=32)
+    parser.add_argument("--latent",         type=int,   default=256)
+    parser.add_argument("--hidden",         type=int,   default=256)
     parser.add_argument("--lr",             type=float, default=3e-4)
-    parser.add_argument("--gnn-layers",     type=int,   default=3)
-    parser.add_argument("--dropout",        type=float, default=0.35)
+    parser.add_argument("--gnn-layers",     type=int,   default=4)
+    parser.add_argument("--dropout",        type=float, default=0.20)
     parser.add_argument("--beta",           type=float, default=0.5)
     parser.add_argument("--beta-warmup",    type=int,   default=30)
     parser.add_argument(

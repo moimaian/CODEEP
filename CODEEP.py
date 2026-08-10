@@ -2748,11 +2748,11 @@ class MainWindow(QMainWindow):
         self._tr("s5_tooltip_site_ph", self.dsb_site_ph.setToolTip)
         self.cb_site_qm_method = self._mk_combo_tr(
             ["qm_method_rhf_fragments", "qm_method_gfn_xtb_fragments",
-             "qm_method_gfn_xtb", "qm_method_heuristic"]
+             "qm_method_heuristic"]
         )
         self._tr("s5_tooltip_site_qm_method", self.cb_site_qm_method.setToolTip)
         self._SITE_QM_METHOD_VALUES = [
-            "rhf_sto3g_fragments", "gfn_xtb_fragments", "gfn_xtb_full", "heuristic",
+            "rhf_sto3g_fragments", "gfn_xtb_fragments", "heuristic",
         ]
 
         pf.addRow(self._trL("lbl_phase"), self.cb_vox_phase)
@@ -2832,18 +2832,28 @@ class MainWindow(QMainWindow):
 
         self.cb_train_phase = QComboBox()
         self.cb_train_phase.addItems(["1", "2", "3"])
-        self.sp_epochs     = QSpinBox(); self.sp_epochs.setRange(1,5000); self.sp_epochs.setValue(100)
-        self.sp_batch      = QSpinBox(); self.sp_batch.setRange(1,512);   self.sp_batch.setValue(8)
-        self.sp_latent     = QSpinBox(); self.sp_latent.setRange(2,1024); self.sp_latent.setValue(128)
-        self.sp_hidden     = QSpinBox(); self.sp_hidden.setRange(16,4096);self.sp_hidden.setValue(128)
-        self.sp_gnn_layers = QSpinBox(); self.sp_gnn_layers.setRange(1,12);self.sp_gnn_layers.setValue(3)
+        # Defaults revisados nesta sessão: os valores antigos (epochs=100,
+        # batch=8, latent/hidden=128, gnn_layers=3, dropout=0.35) foram
+        # calibrados para um dataset de <1000 pares (ver comentário em
+        # SiteEncoder — "Arquitetura reduzida para datasets pequenos").
+        # O dataset curado atual tem >33.000 pares utilizáveis e a GPU
+        # (RTX 4080 Super, 16GB) tem folga enorme para um modelo desse
+        # tamanho (~1,8-2,4M parâmetros) — não há mais razão para manter a
+        # capacidade/regularização reduzidas. latent_dim/hidden_dim/
+        # n_gnn_layers/dropout voltam para os defaults de fábrica das
+        # próprias classes (SiteEncoder/GNNDecoder/LigandCVAE).
+        self.sp_epochs     = QSpinBox(); self.sp_epochs.setRange(1,5000); self.sp_epochs.setValue(150)
+        self.sp_batch      = QSpinBox(); self.sp_batch.setRange(1,512);   self.sp_batch.setValue(32)
+        self.sp_latent     = QSpinBox(); self.sp_latent.setRange(2,1024); self.sp_latent.setValue(256)
+        self.sp_hidden     = QSpinBox(); self.sp_hidden.setRange(16,4096);self.sp_hidden.setValue(256)
+        self.sp_gnn_layers = QSpinBox(); self.sp_gnn_layers.setRange(1,12);self.sp_gnn_layers.setValue(4)
         self.dsb_lr        = QDoubleSpinBox()
         self.dsb_lr.setDecimals(6); self.dsb_lr.setRange(1e-6,1.0); self.dsb_lr.setValue(3e-4)
         self.dsb_beta      = QDoubleSpinBox()
         self.dsb_beta.setDecimals(3); self.dsb_beta.setRange(0,10); self.dsb_beta.setValue(0.5)
         self.sp_warmup     = QSpinBox(); self.sp_warmup.setRange(1,500); self.sp_warmup.setValue(30)
         self.dsb_dropout   = QDoubleSpinBox()
-        self.dsb_dropout.setDecimals(2); self.dsb_dropout.setRange(0,0.9); self.dsb_dropout.setValue(0.35)
+        self.dsb_dropout.setDecimals(2); self.dsb_dropout.setRange(0,0.9); self.dsb_dropout.setValue(0.20)
         self.sp_patience   = QSpinBox(); self.sp_patience.setRange(1,500); self.sp_patience.setValue(15)
         self.cb_train_device = QComboBox()
         self.cb_train_device.addItems(["cuda","cpu","cuda:0","cuda:1"])
@@ -3114,11 +3124,11 @@ class MainWindow(QMainWindow):
         self.dsb_gen_ph.setValue(7.4); self.dsb_gen_ph.setSingleStep(0.5)
         self.cb_gen_site_qm_method = self._mk_combo_tr(
             ["qm_method_rhf_fragments", "qm_method_gfn_xtb_fragments",
-             "qm_method_gfn_xtb", "qm_method_heuristic"]
+             "qm_method_heuristic"]
         )
         self._tr("s8_tooltip_gen_qm_method", self.cb_gen_site_qm_method.setToolTip)
         self._GEN_SITE_QM_METHOD_VALUES = [
-            "rhf_sto3g_fragments", "gfn_xtb_fragments", "gfn_xtb_full", "heuristic",
+            "rhf_sto3g_fragments", "gfn_xtb_fragments", "heuristic",
         ]
         # qm_basis (base do RHF/STO-3G por resíduo) — antes desta correção
         # não existia NENHUM controle equivalente na Etapa 8: a geração

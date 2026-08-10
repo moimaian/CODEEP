@@ -47,7 +47,7 @@ Notas sobre os canais 2-4 do sítio:
       (channel_homo_lumo_qm/_homo_lumo_approx) foram mantidas no código
       mas não são mais usadas na construção do tensor.
     • Como o sítio é protonado por resíduo (ver protonate_residue, pH
-      configurável), há quatro níveis de teoria disponíveis para os canais
+      configurável), há três níveis de teoria disponíveis para os canais
       3-4 (config["site_qm_method"]):
         1. "rhf_sto3g_fragments" (padrão) — RHF/STO-3G real por RESÍDUO
            (fragmentação tipo FMO, cada fragmento protonado e capado com H
@@ -66,19 +66,20 @@ Notas sobre os canais 2-4 do sítio:
            resíduos), robusto mesmo em sítios grandes/multi-cadeia.
            Requer o binário `xtb` no PATH (`conda install -c conda-forge
            xtb`, ou crie um env dedicado e link o binário em ~/.local/bin).
-        3. "gfn_xtb_full" — GFN-xTB no sítio protonado INTEIRO, sem
-           fragmentar. LEGADO/instável — validado nesta sessão que trava
-           com segmentation fault em sítios reais (o xtb detecta múltiplos
-           fragmentos moleculares desconectados, já que o sítio é uma
-           concatenação de resíduos capados independentemente, e crasha ao
-           tentar restringi-los com uma força de "constraining FC"), além
-           de convergência lenta (minutos) mesmo quando não crasha. Mantido
-           só por compatibilidade — prefira "gfn_xtb_fragments".
-        4. "heuristic" — aproximação por eletronegatividade de Pauling +
+        3. "heuristic" — aproximação por eletronegatividade de Pauling +
            carga parcial (mais rápida, sem QM) — também o fallback
            automático das demais quando o cálculo real falha (por
-           resíduo/fragmento nos métodos fragmentados, ou no sítio inteiro
-           em "gfn_xtb_full").
+           resíduo/fragmento nos métodos fragmentados).
+
+      Havia um quarto nível, "gfn_xtb_full" (GFN-xTB no sítio protonado
+      INTEIRO, sem fragmentar), removido do código: travava com
+      segmentation fault em sítios reais (o xtb detecta múltiplos
+      fragmentos moleculares desconectados, já que o sítio é uma
+      concatenação de resíduos capados independentemente, e crasha ao
+      tentar restringi-los com uma força de "constraining FC"), além de
+      convergência lenta (minutos) mesmo quando não crashava. Configs
+      antigas com site_qm_method="gfn_xtb_full" caem no fallback
+      "heuristic" (valor não reconhecido, ver channel_site_orbital_field).
     • Para ligantes com > MAX_QM_ATOMS átomos pesados na etapa de QM do
       ligante (hoje não usada no tensor, ver acima), o cálculo cairia
       para a aproximação semi-empírica correspondente.
@@ -285,9 +286,9 @@ VOXEL_CONFIG = {
 
     # Método para os canais 3-4 (doador/aceptor de elétrons do sítio):
     #   "rhf_sto3g_fragments" — QM real por resíduo (fragmentação FMO-like)
-    #   "gfn_xtb_full"        — GFN-xTB no sítio protonado inteiro (requer
-    #                           o binário `xtb` no PATH — não instalado por
-    #                           padrão, ver _xtb_whole_site_weights)
+    #   "gfn_xtb_fragments"   — GFN-xTB por resíduo, em paralelo (requer o
+    #                           binário `xtb` no PATH — não instalado por
+    #                           padrão, ver _xtb_fragment_weights)
     #   "heuristic"           — eletronegatividade de Pauling + carga (sem
     #                           QM; também o fallback automático das outras
     #                           duas quando o cálculo real falha)
@@ -593,9 +594,9 @@ def channel_site_donor_acceptor(
 
     Este é o nível mais rápido dos três disponíveis em
     config["site_qm_method"] (ver channel_site_orbital_field para os
-    níveis "rhf_sto3g_fragments" e "gfn_xtb_full") — e também o fallback
-    automático dos outros dois quando o cálculo QM real falha ou está
-    indisponível.
+    níveis "rhf_sto3g_fragments" e "gfn_xtb_fragments") — e também o
+    fallback automático dos outros dois quando o cálculo QM real falha ou
+    está indisponível.
 
     Por que a partir do SÍTIO e não do ligante:
       Esta é a substituição direta de uma versão anterior que calculava
@@ -735,9 +736,8 @@ def _run_xtb_vfukui(
         f(-) → suscetibilidade a ataque ELETROFÍLICO → caráter DOADOR (HOMO-like)
         f(+) → suscetibilidade a ataque NUCLEOFÍLICO → caráter ACEPTOR (LUMO-like)
 
-    Usado tanto por _xtb_whole_site_weights (sítio inteiro, legado — ver
-    ressalva de instabilidade lá) quanto por _xtb_fragment_weights (um
-    resíduo por vez, ver channel_site_orbital_field/"gfn_xtb_fragments").
+    Usado por _xtb_fragment_weights (um resíduo por vez, ver
+    channel_site_orbital_field/"gfn_xtb_fragments").
 
     omp_threads limita OMP_NUM_THREADS desta chamada — necessário quando
     várias chamadas rodam em paralelo (modo fragmentado, via
@@ -799,35 +799,6 @@ def _run_xtb_vfukui(
         return None
 
 
-def _xtb_whole_site_weights(
-    site_coords: np.ndarray,
-    site_elements: list[str],
-    total_charge: int,
-    config: dict,
-) -> "tuple[np.ndarray, np.ndarray] | None":
-    """Roda GFN-xTB no sítio protonado INTEIRO de uma só vez (sem
-    fragmentar por resíduo). Modo LEGADO — mantido por compatibilidade,
-    mas não é mais o padrão recomendado.
-
-    INSTÁVEL para sítios reais: validado nesta sessão contra pares
-    curados reais — trava com *segmentation fault* quando o xtb detecta
-    o sítio como múltiplos fragmentos moleculares desconectados
-    ("molecular fragmentation" + "constraining FC" no stdout do xtb),
-    o que é o caso normal de um sítio construído por protonate_residue
-    residue a residue (dezenas de fragmentos capados, não uma molécula
-    covalentemente contínua). Mesmo quando não crasha, a convergência de
-    SCF para um sítio de centenas de átomos pode levar minutos.
-    Prefira "gfn_xtb_fragments" (ver channel_site_orbital_field), que
-    roda o xtb por resíduo — mesma unidade que já funciona de forma
-    robusta e rápida (validado: ~0.1-0.2s por fragmento de ~10-30 átomos)
-    e evita esse problema por construção.
-    """
-    xtb_bin = _xtb_bin()
-    if xtb_bin is None:
-        return None
-    return _run_xtb_vfukui(site_elements, site_coords, total_charge, config, xtb_bin)
-
-
 def _pick_fragment_parallelism(n_fragments: int, config: dict) -> tuple[int, int]:
     """Decide quantos fragmentos rodar em paralelo (n_workers) e quantas
     threads OpenMP por chamada de xtb (threads_per_call), de forma que
@@ -858,11 +829,12 @@ def _xtb_fragment_weights(
 
     Cada fragmento é uma molécula única e covalentemente conectada
     (resíduo protonado e capado nas bordas cortadas por protonate_residue)
-    — ao contrário do sítio inteiro concatenado, não dispara a detecção de
-    "múltiplos fragmentos desconectados" do xtb que causa o crash descrito
-    em _xtb_whole_site_weights. Retorna None se o fragmento exceder
-    config["max_qm_atoms"], se o cálculo falhar ou não convergir — o
-    chamador cai para a aproximação semi-empírica só nesse fragmento.
+    — ao contrário do sítio inteiro concatenado (abordagem tentada e
+    removida: o xtb detecta múltiplos fragmentos desconectados nesse caso
+    e trava com segmentation fault), não dispara esse problema. Retorna
+    None se o fragmento exceder config["max_qm_atoms"], se o cálculo
+    falhar ou não convergir — o chamador cai para a aproximação
+    semi-empírica só nesse fragmento.
     """
     n_heavy = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() > 1)
     if n_heavy > config.get("max_qm_atoms", 60):
@@ -884,9 +856,8 @@ def _xtb_fragment_weights(
 def _parse_xtb_fukui(text: str, n_atoms: int) -> "tuple[np.ndarray, np.ndarray] | None":
     """Extrai os índices de Fukui condensados de `xtb --vfukui`, a partir
     do texto de fukui.txt (versões antigas) OU do stdout completo do xtb
-    (validado com xtb 6.7.1, que só imprime no terminal — ver
-    _xtb_whole_site_weights). Formato real, sob o cabeçalho
-    "Fukui functions:":
+    (validado com xtb 6.7.1, que só imprime no terminal). Formato real,
+    sob o cabeçalho "Fukui functions:":
 
         Fukui functions:
              #        f(+)     f(-)     f(0)
@@ -961,18 +932,21 @@ def channel_site_orbital_field(
             com fallback heurístico POR FRAGMENTO quando o QM falha só num
             resíduo (o resto do sítio continua com o valor real).
         "gfn_xtb_fragments" — GFN-xTB por resíduo, em paralelo (ver
-            _xtb_fragment_weights/_pick_fragment_parallelism) — RECOMENDADO
-            em vez de "gfn_xtb_full": mesma unidade de fragmentação do
-            RHF/STO-3G, robusto (evita o crash de "sítio inteiro" descrito
-            em _xtb_whole_site_weights) e paraleliza várias chamadas de
-            xtb via ThreadPoolExecutor (thread, não processo — cada
-            chamada já é um subprocess do SO, não compete pelo GIL nem
-            toca CUDA, então não esbarra na restrição de workers=1 que
+            _xtb_fragment_weights/_pick_fragment_parallelism): mesma
+            unidade de fragmentação do RHF/STO-3G, e paraleliza várias
+            chamadas de xtb via ThreadPoolExecutor (thread, não processo —
+            cada chamada já é um subprocess do SO, não compete pelo GIL
+            nem toca CUDA, então não esbarra na restrição de workers=1 que
             existe para a parte de voxelização em GPU).
-        "gfn_xtb_full" — GFN-xTB no sítio protonado inteiro de uma vez.
-            LEGADO/instável — ver ressalva em _xtb_whole_site_weights.
         "heuristic" (ou qualquer valor não reconhecido) — eletronegatividade
             + carga (channel_site_donor_acceptor), sem QM.
+
+    Não fragmentar (rodar GFN-xTB no sítio protonado inteiro de uma vez)
+    foi tentado e removido: o xtb detecta o sítio como múltiplos
+    fragmentos moleculares desconectados (é uma concatenação de resíduos
+    capados independentemente, não uma molécula covalentemente contínua)
+    e trava com segmentation fault em sítios reais, além de convergência
+    lenta (minutos) mesmo quando não crashava.
 
     Em todos os casos o resultado final é sempre um peso doador/aceptor
     por átomo espalhado na grade pela mesma _voxelize_atoms — unifica os
@@ -981,11 +955,10 @@ def channel_site_orbital_field(
     Retorna (donor, acceptor, method_used) — o terceiro valor é o método
     que REALMENTE gerou os canais (não o configurado): "*_fragments" só se
     TODOS os resíduos tiveram QM real, "*_fragments_partial(n/m)" se uma
-    parte caiu no fallback por resíduo, "gfn_xtb_full" só se o xtb de fato
-    rodou e foi parseado, e "heuristic" em qualquer fallback total. Existe
-    para que o chamador grave em meta.json o que aconteceu de verdade, em
-    vez de ecoar cegamente config["site_qm_method"] mesmo quando o QM
-    falha e o cálculo cai para a heurística.
+    parte caiu no fallback por resíduo, e "heuristic" em qualquer fallback
+    total. Existe para que o chamador grave em meta.json o que aconteceu
+    de verdade, em vez de ecoar cegamente config["site_qm_method"] mesmo
+    quando o QM falha e o cálculo cai para a heurística.
     """
     method = config.get("site_qm_method", "rhf_sto3g_fragments")
     batch  = config.get("vox_batch", 500 if HAS_CUPY else 100)
@@ -1072,20 +1045,6 @@ def channel_site_orbital_field(
                 method_used = f"gfn_xtb_fragments_partial({n_qm_ok}/{len(fragments)})"
             return donor, acceptor, method_used
         # xtb ausente — cai para a heurística abaixo
-
-    if method == "gfn_xtb_full":
-        total_charge = int(round(sum(
-            Chem.GetFormalCharge(f["mol"]) for f in fragments if f["mol"] is not None
-        ))) if fragments else 0
-        result = _xtb_whole_site_weights(site_coords, site_elements, total_charge, config)
-        if result is not None:
-            donor_w, acceptor_w = result
-            donor, acceptor, _ = _voxelize_atoms(
-                grid_flat, site_coords, donor_w, acceptor_w, sigma, grid_shape,
-                batch=batch, compute_mep=False,
-            )
-            return donor, acceptor, "gfn_xtb_full"
-        # xtb indisponível/falhou — cai para a heurística abaixo
 
     donor, acceptor = channel_site_donor_acceptor(
         grid_flat, site_coords, site_elements, site_charges, sigma, grid_shape,
@@ -2120,7 +2079,7 @@ def process_pair(
         # Método que REALMENTE gerou os canais 3-4 (não o configurado —
         # ver channel_site_orbital_field). config_site_qm_method fica
         # como referência do que foi pedido, para detectar divergência
-        # (ex.: gfn_xtb_full pedido mas xtb ausente/falhou -> heuristic).
+        # (ex.: gfn_xtb_fragments pedido mas xtb ausente/falhou -> heuristic).
         "orbital_channels_source": orbital_method_used,
         "config_site_qm_method": config.get("site_qm_method", "rhf_sto3g_fragments"),
         "protonate_site":  bool(config.get("protonate_site", True)),
