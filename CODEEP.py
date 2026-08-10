@@ -1104,7 +1104,8 @@ class MainWindow(QMainWindow):
             ],
             "step4": ["cb_explore_phase"],
             "step5": [
-                "ed_vox_pair", "sp_vox_workers", "sp_grid", "sp_vox_pad", "sp_max_qm",
+                "ed_vox_pair", "sp_vox_workers", "chk_vox_parallel_pairs", "sp_grid",
+                "sp_vox_pad", "sp_max_qm",
                 "sp_vox_batch", "cb_qm_basis", "chk_ecfp4", "cb_vox_phase",
                 "chk_protonate_site", "dsb_site_ph", "cb_site_qm_method",
             ],
@@ -2569,8 +2570,15 @@ class MainWindow(QMainWindow):
         self.chk_cur_thread = QCheckBox("ThreadPoolExecutor")
         self.chk_cur_process = QCheckBox("ProcessPoolExecutor")
 
-        self.chk_cur_thread.setChecked(True)
-        self.chk_cur_process.setChecked(False)
+        # ProcessPoolExecutor como padrão: Bio.PDB.PDBParser (o trabalho
+        # que domina o tempo por par nesta etapa) é Python puro, sem
+        # extensão C — presa ao GIL, então ThreadPoolExecutor não
+        # paraleliza de verdade essa parte (só a E/S e a busca via
+        # cKDTree, que já liberam o GIL sozinhas). Validado nesta sessão:
+        # ~2,75 pares/s com 24 threads, bem abaixo do esperado se o
+        # gargalo fosse só E/S.
+        self.chk_cur_thread.setChecked(False)
+        self.chk_cur_process.setChecked(True)
 
         self.chk_cur_thread.toggled.connect(self._sync_cur_executor_checks)
         self.chk_cur_process.toggled.connect(self._sync_cur_executor_checks)
@@ -2690,6 +2698,16 @@ class MainWindow(QMainWindow):
         self.sp_vox_workers = QSpinBox()
         self.sp_vox_workers.setRange(0,16); self.sp_vox_workers.setValue(0)
         self._tr("s5_tooltip_vox_workers", self.sp_vox_workers.setToolTip)
+        # Desligado por padrão: o ganho é real mas modesto (~15-25%, ver
+        # tooltip) e ainda não validado em lote grande — o comportamento
+        # sequencial (1 par por vez) continua sendo o caminho testado e
+        # recomendado. Quando marcado, sp_vox_workers acima passa a valer
+        # de verdade (ver pipeline_voxelize.run: antes disso, um valor
+        # >1 ali só emitia um aviso no log e não mudava nada).
+        self.chk_vox_parallel_pairs = QCheckBox()
+        self._tr("s5_chk_parallel_pairs", self.chk_vox_parallel_pairs.setText)
+        self.chk_vox_parallel_pairs.setChecked(False)
+        self._tr("s5_tooltip_parallel_pairs", self.chk_vox_parallel_pairs.setToolTip)
         self.sp_grid = QSpinBox()
         self.sp_grid.setRange(16,64); self.sp_grid.setValue(32)
         self.sp_vox_pad = QDoubleSpinBox()
@@ -2729,16 +2747,18 @@ class MainWindow(QMainWindow):
         self.dsb_site_ph.setValue(7.4); self.dsb_site_ph.setSingleStep(0.5)
         self._tr("s5_tooltip_site_ph", self.dsb_site_ph.setToolTip)
         self.cb_site_qm_method = self._mk_combo_tr(
-            ["qm_method_rhf_fragments", "qm_method_gfn_xtb", "qm_method_heuristic"]
+            ["qm_method_rhf_fragments", "qm_method_gfn_xtb_fragments",
+             "qm_method_gfn_xtb", "qm_method_heuristic"]
         )
         self._tr("s5_tooltip_site_qm_method", self.cb_site_qm_method.setToolTip)
         self._SITE_QM_METHOD_VALUES = [
-            "rhf_sto3g_fragments", "gfn_xtb_full", "heuristic",
+            "rhf_sto3g_fragments", "gfn_xtb_fragments", "gfn_xtb_full", "heuristic",
         ]
 
         pf.addRow(self._trL("lbl_phase"), self.cb_vox_phase)
         pf.addRow(self._trL("s5_lbl_pair"),    self.ed_vox_pair)
         pf.addRow(self._trL("lbl_workers_auto"), self.sp_vox_workers)
+        pf.addRow("", self.chk_vox_parallel_pairs)
         pf.addRow(self._trL("s5_lbl_grid"),   self.sp_grid)
         pf.addRow(self._trL("s5_lbl_padding"),      self.sp_vox_pad)
         pf.addRow(self._trL("s5_lbl_max_qm"),     self.sp_max_qm)
@@ -2785,9 +2805,13 @@ class MainWindow(QMainWindow):
 
             config["log_dir"] = str(log_dir)
 
+            # workers só é repassado de verdade (viabilizando paralelismo
+            # entre pares) se o checkbox estiver marcado — desmarcado,
+            # sempre None (sequencial), independente do valor do spinbox.
             args_ns = types.SimpleNamespace(
                 pair=self.ed_vox_pair.text().strip() or None,
-                workers=self.sp_vox_workers.value() or None,
+                workers=(self.sp_vox_workers.value() or None)
+                        if self.chk_vox_parallel_pairs.isChecked() else None,
             )
 
             return m.run, (args_ns,), {
@@ -3089,11 +3113,12 @@ class MainWindow(QMainWindow):
         self.dsb_gen_ph.setDecimals(1); self.dsb_gen_ph.setRange(0.0, 14.0)
         self.dsb_gen_ph.setValue(7.4); self.dsb_gen_ph.setSingleStep(0.5)
         self.cb_gen_site_qm_method = self._mk_combo_tr(
-            ["qm_method_rhf_fragments", "qm_method_gfn_xtb", "qm_method_heuristic"]
+            ["qm_method_rhf_fragments", "qm_method_gfn_xtb_fragments",
+             "qm_method_gfn_xtb", "qm_method_heuristic"]
         )
         self._tr("s8_tooltip_gen_qm_method", self.cb_gen_site_qm_method.setToolTip)
         self._GEN_SITE_QM_METHOD_VALUES = [
-            "rhf_sto3g_fragments", "gfn_xtb_full", "heuristic",
+            "rhf_sto3g_fragments", "gfn_xtb_fragments", "gfn_xtb_full", "heuristic",
         ]
         # qm_basis (base do RHF/STO-3G por resíduo) — antes desta correção
         # não existia NENHUM controle equivalente na Etapa 8: a geração

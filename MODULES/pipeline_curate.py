@@ -108,12 +108,20 @@ class LigandSelect(Select):
         )
 
 class BindingSiteSelect(Select):
-    """Seleciona resíduos proteicos dentro de um raio do ligante."""
+    """Seleciona resíduos proteicos dentro de um raio do ligante.
+
+    site_residue_ids contém pares (chain_id, res_id) — NUNCA res_id sozinho:
+    numeração de resíduo se repete entre cadeias (ex.: toda cadeia de um
+    complexo com N cópias biológicas tendo resíduos 1..300), então um
+    conjunto sem a cadeia casaria residuos de cadeias inteiramente
+    diferentes que só compartilham o mesmo número — ver get_binding_site.
+    """
     def __init__(self, site_residue_ids: set):
         self.site_residue_ids = site_residue_ids
 
     def accept_residue(self, residue):
-        return residue.get_id() in self.site_residue_ids
+        chain_id = residue.get_parent().get_id()
+        return (chain_id, residue.get_id()) in self.site_residue_ids
 
 
 # ── Funções de análise ─────────────────────────────────────────────────────────
@@ -234,7 +242,13 @@ def get_ligands(structure, config: dict) -> list[dict]:
 
 
 def get_binding_site(structure, ligand_residue, cutoff: float) -> set:
-    """Retorna IDs dos resíduos proteicos dentro de `cutoff` Å do ligante.
+    """Retorna (chain_id, res_id) dos resíduos proteicos dentro de
+    `cutoff` Å do ligante — sempre restrito ao modelo 0 e à cadeia de cada
+    resíduo (ver BindingSiteSelect: numeração de resíduo se repete entre
+    cadeias, então retornar só res_id casaria resíduos de cadeias
+    inteiramente diferentes que só compartilham o número, o que já causou
+    binding_site.pdb com dezenas de milhares de átomos em complexos
+    multi-cadeia — ver BENCHMARK_CROSSDOCKED2020.md).
 
     Usa cKDTree para busca espacial O(n log n) — ~50-100x mais rápido que
     loops Python para proteínas grandes (>3.000 átomos).
@@ -245,15 +259,19 @@ def get_binding_site(structure, ligand_residue, cutoff: float) -> set:
     if len(lig_coords) == 0:
         return set()
 
-    # Coleta todos os átomos proteicos com seus IDs de resíduo
+    # Coleta todos os átomos proteicos com seus IDs (cadeia, resíduo) —
+    # sempre só do modelo 0 (estruturas de RMN têm vários MODELOS
+    # representando o mesmo conjunto de átomos em conformações diferentes;
+    # usar todos multiplicaria o sítio por N sem nenhum ganho).
     prot_coords  = []
     prot_res_ids = []
     model0 = structure[0]
     for chain in model0:
+        chain_id = chain.get_id()
         for residue in chain:
             if residue.get_id()[0] != " ":
                 continue
-            res_id = residue.get_id()
+            res_id = (chain_id, residue.get_id())
             for atom in residue.get_atoms():
                 prot_coords.append(atom.get_vector().get_array())
                 prot_res_ids.append(res_id)
@@ -301,9 +319,20 @@ def compute_ligand_properties(residue) -> dict:
 # ── Funções de salvamento ──────────────────────────────────────────────────────
 
 def save_pdb(structure, selector, out_path: Path):
-    """Salva uma estrutura ou seleção em formato PDB."""
+    """Salva uma estrutura ou seleção em formato PDB.
+
+    Restrito ao modelo 0: estruturas de RMN trazem vários MODELOS (mesmos
+    átomos, conformações diferentes) e o BioPython PDBIO grava todos por
+    padrão se receber a Structure inteira — sem essa restrição,
+    receptor.pdb/ligand.pdb/binding_site.pdb saem com N cópias
+    concatenadas (uma por modelo), o que já causou sítios com dezenas de
+    milhares de átomos e estourou memória na voxelização. Aceita tanto
+    Structure (tem .get_models(), pega o modelo 0) quanto um Model já
+    isolado (chamador já restringiu — usa como está).
+    """
+    model0 = structure[0] if hasattr(structure, "get_models") else structure
     io = PDBIO()
-    io.set_structure(structure)
+    io.set_structure(model0)
     io.save(str(out_path), selector)
 
 
@@ -321,20 +350,28 @@ def site_fingerprint(structure, site_residue_ids: set) -> str:
     """Gera uma assinatura do sítio de ligação baseada na sequência de resíduos.
 
     A assinatura é a sequência de aminoácidos do sítio em ordem canônica
-    (por número de resíduo). Sítios equivalentes em cadeias simétricas
-    produzem a mesma assinatura e serão deduplicados.
+    (por número de resíduo) — não leva a cadeia em conta NA STRING final
+    (só resname+resseq), então sítios equivalentes em cadeias simétricas
+    ainda produzem a mesma assinatura e continuam sendo deduplicados pelo
+    chamador (curate_structure: cada cópia simétrica do ligante gera seu
+    próprio site_residue_ids, corretamente restrito à SUA cadeia por
+    get_binding_site, mas o texto resultante coincide entre cópias
+    equivalentes). site_residue_ids em si é (chain_id, res_id) — ver
+    get_binding_site/BindingSiteSelect — daí o `residue.get_parent()`
+    abaixo para casar corretamente.
 
     Exemplo: sítio com ALA-5, GLY-8, PHE-12 → "AGF"
     """
     residues = []
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                if residue.get_id() in site_residue_ids:
-                    resname = residue.get_resname().strip()
-                    aa1     = _AA1.get(resname, "X")
-                    resseq  = residue.get_id()[1]
-                    residues.append((resseq, aa1))
+    model0 = structure[0]
+    for chain in model0:
+        chain_id = chain.get_id()
+        for residue in chain:
+            if (chain_id, residue.get_id()) in site_residue_ids:
+                resname = residue.get_resname().strip()
+                aa1     = _AA1.get(resname, "X")
+                resseq  = residue.get_id()[1]
+                residues.append((resseq, aa1))
 
     # Ordena por número de sequência e concatena
     residues.sort(key=lambda x: x[0])

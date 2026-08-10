@@ -359,8 +359,34 @@ _TEXTOS = {
     },
     "s5_ph_pair": {"en": "empty = process all pairs", "pt": "vazio = processa todos os pares"},
     "s5_tooltip_vox_workers": {
-        "en": "0 = automatic (recommended = 1 for CUDA)",
-        "pt": "0 = automático (recomendado = 1 para CUDA)",
+        "en": "Number of pairs processed simultaneously — only takes effect if "
+              "'Parallelize pairs' below is checked (0/1 = sequential either way).",
+        "pt": "Número de pares processados simultaneamente — só tem efeito se "
+              "'Paralelizar pares' abaixo estiver marcado (0/1 = sequencial de qualquer jeito).",
+    },
+    "s5_chk_parallel_pairs": {
+        "en": "Parallelize pairs (experimental)",
+        "pt": "Paralelizar pares (experimental)",
+    },
+    "s5_tooltip_parallel_pairs": {
+        "en": "Off (default) = today's validated behavior: one pair at a time. On = "
+              "processes several pairs at once (ThreadPoolExecutor, count set by the field "
+              "above), splitting CPU threads between them so GFN-xTB fragments per residue "
+              "don't oversubscribe the cores. Expected gain: modest (~15-25%, analysis-based, "
+              "not validated on a large batch) — the QM step (the slowest part) already uses "
+              "nearly all cores per pair on its own; parallelizing pairs only overlaps the "
+              "remaining ~25% (protonation + GPU voxelization) with other pairs' QM. Not "
+              "recommended together with 'GFN-xTB (whole site)' (already unstable on its own — "
+              "see its own tooltip).",
+        "pt": "Desligado (padrão) = comportamento validado de hoje: um par por vez. Ligado = "
+              "processa vários pares ao mesmo tempo (ThreadPoolExecutor, quantidade definida no "
+              "campo acima), dividindo as threads de CPU entre eles para o GFN-xTB fragmentado "
+              "por resíduo não disputar os núcleos sem controle. Ganho esperado: modesto "
+              "(~15-25%, baseado em análise, não validado em lote grande) — a etapa de QM (a "
+              "mais lenta) já usa quase todos os núcleos sozinha por par; paralelizar pares só "
+              "sobrepõe os ~25% restantes (protonação + voxelização GPU) com o QM de outros "
+              "pares. Não recomendado junto com 'GFN-xTB (sítio inteiro)' (já instável sozinho — "
+              "ver o tooltip dele).",
     },
     "s5_tooltip_max_qm": {
         "en": "Heavy-atom limit for full QM (RHF/STO-3G).\nUsed both for the ligand (not wired "
@@ -409,9 +435,13 @@ _TEXTOS = {
         "en": "RHF/STO-3G per residue (fragmented)",
         "pt": "RHF/STO-3G por resíduo (fragmentado)",
     },
+    "qm_method_gfn_xtb_fragments": {
+        "en": "GFN-xTB per residue, parallel (recommended, requires xtb binary)",
+        "pt": "GFN-xTB por resíduo, paralelo (recomendado, requer o binário xtb)",
+    },
     "qm_method_gfn_xtb": {
-        "en": "GFN-xTB (whole site, requires xtb binary)",
-        "pt": "GFN-xTB (sítio inteiro, requer o binário xtb)",
+        "en": "GFN-xTB (whole site, legacy/unstable, requires xtb binary)",
+        "pt": "GFN-xTB (sítio inteiro, legado/instável, requer o binário xtb)",
     },
     "qm_method_heuristic": {
         "en": "Heuristic (electronegativity, no QM)", "pt": "Heurística (eletronegatividade, sem QM)",
@@ -419,16 +449,29 @@ _TEXTOS = {
     "s5_tooltip_site_qm_method": {
         "en": "Level of theory for channels 3-4 (site donor/acceptor field):\n  RHF/STO-3G per "
               "residue — real QM, FMO-style fragmented (slower,\n    ~1s/residue; uses the "
-              "already-installed PySCF/GPU4PySCF).\n  GFN-xTB on the whole site — "
-              "semi-empirical, faster, requires the\n    `xtb` binary on PATH (not installed by "
-              "default).\n  Heuristic — electronegativity + charge, no QM (fastest,\n    also "
-              "the automatic fallback when the other two fail).",
+              "already-installed PySCF/GPU4PySCF).\n  GFN-xTB per residue, parallel — "
+              "RECOMMENDED if the `xtb` binary is\n    available: same fragmentation as RHF/"
+              "STO-3G, but semi-empirical\n    and dispatched across several parallel `xtb` "
+              "calls (thread pool,\n    threads per call capped so total threads stay near the "
+              "CPU\n    count) — validated at ~0.1-0.2s per whole site.\n  GFN-xTB on the whole "
+              "site — legacy, NOT recommended: validated to\n    segfault on real sites (xtb "
+              "detects the site as multiple\n    disconnected molecular fragments, since it's a "
+              "concatenation of\n    independently capped residues) and to take minutes to "
+              "converge\n    even when it doesn't crash.\n  Heuristic — electronegativity + "
+              "charge, no QM (fastest,\n    also the automatic fallback when the others fail).",
         "pt": "Nível de teoria para os canais 3-4 (campo doador/aceptor do sítio):\n  "
               "RHF/STO-3G por resíduo — QM real, fragmentado tipo FMO (mais lento,\n    "
-              "~1s/resíduo; usa PySCF/GPU4PySCF já instalado).\n  GFN-xTB no sítio inteiro — "
-              "semi-empírico, mais rápido, requer o\n    binário `xtb` no PATH (não instalado "
-              "por padrão).\n  Heurística — eletronegatividade + carga, sem QM (mais rápido,\n"
-              "    também o fallback automático quando os outros dois falham).",
+              "~1s/resíduo; usa PySCF/GPU4PySCF já instalado).\n  GFN-xTB por resíduo, paralelo "
+              "— RECOMENDADO se o binário `xtb`\n    estiver disponível: mesma fragmentação do "
+              "RHF/STO-3G, porém\n    semi-empírico e distribuído em várias chamadas paralelas "
+              "de `xtb`\n    (pool de threads, threads por chamada limitadas para o total ficar\n"
+              "    perto do número de CPUs) — validado em ~0,1-0,2s por sítio inteiro.\n  "
+              "GFN-xTB no sítio inteiro — legado, NÃO recomendado: validado que trava\n    com "
+              "segmentation fault em sítios reais (o xtb detecta o sítio como\n    múltiplos "
+              "fragmentos moleculares desconectados, já que é uma\n    concatenação de resíduos "
+              "capados independentemente) e demora\n    minutos para convergir mesmo quando não "
+              "crasha.\n  Heurística — eletronegatividade + carga, sem QM (mais rápido,\n"
+              "    também o fallback automático quando os outros falham).",
     },
     "s5_lbl_pair": {"en": "Specific pair:", "pt": "Par específico:"},
     "s5_lbl_grid": {"en": "Grid size (N³):", "pt": "Tamanho da grade (N³):"},

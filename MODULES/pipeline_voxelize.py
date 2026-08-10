@@ -47,21 +47,38 @@ Notas sobre os canais 2-4 do sítio:
       (channel_homo_lumo_qm/_homo_lumo_approx) foram mantidas no código
       mas não são mais usadas na construção do tensor.
     • Como o sítio é protonado por resíduo (ver protonate_residue, pH
-      configurável), há três níveis de teoria disponíveis para os canais
-      3-4 (config["site_qm_method"]), do mais rigoroso ao mais rápido:
+      configurável), há quatro níveis de teoria disponíveis para os canais
+      3-4 (config["site_qm_method"]):
         1. "rhf_sto3g_fragments" (padrão) — RHF/STO-3G real por RESÍDUO
            (fragmentação tipo FMO, cada fragmento protonado e capado com H
            nas bordas cortadas — sempre pequeno o bastante para caber sob
            max_qm_atoms, ao contrário de tentar o sítio inteiro de uma vez,
            que seria inviável). Densidade condensada por átomo via
-           população de Mulliken do HOMO/LUMO.
-        2. "gfn_xtb_full" — GFN-xTB (semi-empírico tight-binding, pacote
-           externo `xtb`) no sítio protonado INTEIRO, sem fragmentar —
-           usa os índices de Fukui condensados (f+/f-) como doador/aceptor.
-           Requer o binário `xtb` no PATH.
-        3. "heuristic" — aproximação por eletronegatividade de Pauling +
+           população de Mulliken do HOMO/LUMO. Mais rigoroso, porém lento
+           em escala (ordem de minutos por par).
+        2. "gfn_xtb_fragments" (RECOMENDADO se o binário `xtb` estiver
+           disponível) — GFN-xTB por RESÍDUO, em paralelo (várias chamadas
+           de xtb simultâneas via ThreadPoolExecutor, threads por chamada
+           limitadas para não estourar os núcleos — ver
+           _pick_fragment_parallelism). Usa os índices de Fukui condensados
+           (f+/f-) como doador/aceptor. Mesma unidade de fragmentação do
+           RHF/STO-3G — validado: ~0.1-0.2s por sítio inteiro (dezenas de
+           resíduos), robusto mesmo em sítios grandes/multi-cadeia.
+           Requer o binário `xtb` no PATH (`conda install -c conda-forge
+           xtb`, ou crie um env dedicado e link o binário em ~/.local/bin).
+        3. "gfn_xtb_full" — GFN-xTB no sítio protonado INTEIRO, sem
+           fragmentar. LEGADO/instável — validado nesta sessão que trava
+           com segmentation fault em sítios reais (o xtb detecta múltiplos
+           fragmentos moleculares desconectados, já que o sítio é uma
+           concatenação de resíduos capados independentemente, e crasha ao
+           tentar restringi-los com uma força de "constraining FC"), além
+           de convergência lenta (minutos) mesmo quando não crasha. Mantido
+           só por compatibilidade — prefira "gfn_xtb_fragments".
+        4. "heuristic" — aproximação por eletronegatividade de Pauling +
            carga parcial (mais rápida, sem QM) — também o fallback
-           automático das duas anteriores quando o cálculo real falha.
+           automático das demais quando o cálculo real falha (por
+           resíduo/fragmento nos métodos fragmentados, ou no sítio inteiro
+           em "gfn_xtb_full").
     • Para ligantes com > MAX_QM_ATOMS átomos pesados na etapa de QM do
       ligante (hoje não usada no tensor, ver acima), o cálculo cairia
       para a aproximação semi-empírica correspondente.
@@ -84,6 +101,7 @@ import warnings
 import tempfile
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 import pandas as pd
@@ -690,32 +708,10 @@ def _fragment_qm_weights(
         return None
 
 
-def _xtb_whole_site_weights(
-    site_coords: np.ndarray,
-    site_elements: list[str],
-    total_charge: int,
-    config: dict,
-) -> "tuple[np.ndarray, np.ndarray] | None":
-    """Roda GFN-xTB (semi-empírico tight-binding) no sítio protonado
-    INTEIRO de uma só vez (não fragmenta por resíduo — xTB escala bem para
-    centenas de átomos) via o binário `xtb` (CLI, chamado por subprocess —
-    não é um pacote Python). Extrai os índices de Fukui condensados por
-    átomo (`--vfukui`):
-        f(-) → suscetibilidade a ataque ELETROFÍLICO → caráter DOADOR (HOMO-like)
-        f(+) → suscetibilidade a ataque NUCLEOFÍLICO → caráter ACEPTOR (LUMO-like)
-
-    Requer o binário `xtb` no PATH — não é instalado por padrão neste
-    projeto. Instale com `conda install -c conda-forge xtb` ou veja
-    https://github.com/grimme-lab/xtb. Retorna None (→ fallback heurístico)
-    se o binário não existir, o cálculo falhar ou não convergir.
-
-    ATENÇÃO — parsing não validado em produção: este código foi escrito
-    sem um binário `xtb` disponível no ambiente de desenvolvimento; o
-    formato de fukui.txt assumido aqui (colunas [idx, símbolo, f+, f-, f0])
-    é o documentado pelo projeto xtb mas pode variar entre versões. Rode
-    manualmente uma vez (`xtb site.xyz --gfn 2 --chrg 0 --vfukui`) e
-    confira fukui.txt antes de usar isso em lote.
-    """
+def _xtb_bin() -> "str | None":
+    """Localiza o binário `xtb`, com aviso único (não um por chamada — este
+    dispatcher pode ser chamado dezenas de vezes por sítio no modo
+    fragmentado)."""
     xtb_bin = shutil.which("xtb")
     if xtb_bin is None:
         log.warning(
@@ -723,68 +719,227 @@ def _xtb_whole_site_weights(
             "'conda install -c conda-forge xtb' (ou compile de "
             "https://github.com/grimme-lab/xtb). Usando aproximação semi-empírica."
         )
-        return None
+    return xtb_bin
 
+
+def _run_xtb_vfukui(
+    elements: list[str],
+    coords: np.ndarray,
+    charge: int,
+    config: dict,
+    xtb_bin: str,
+    omp_threads: "int | None" = None,
+) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Núcleo compartilhado: escreve um .xyz, roda `xtb --vfukui` via
+    subprocess e extrai os índices de Fukui condensados por átomo:
+        f(-) → suscetibilidade a ataque ELETROFÍLICO → caráter DOADOR (HOMO-like)
+        f(+) → suscetibilidade a ataque NUCLEOFÍLICO → caráter ACEPTOR (LUMO-like)
+
+    Usado tanto por _xtb_whole_site_weights (sítio inteiro, legado — ver
+    ressalva de instabilidade lá) quanto por _xtb_fragment_weights (um
+    resíduo por vez, ver channel_site_orbital_field/"gfn_xtb_fragments").
+
+    omp_threads limita OMP_NUM_THREADS desta chamada — necessário quando
+    várias chamadas rodam em paralelo (modo fragmentado, via
+    ThreadPoolExecutor) para não estourar os núcleos disponíveis: o xtb
+    usa todos os threads da máquina por padrão em cada chamada.
+
+    Retorna None (→ chamador cai para a aproximação semi-empírica) se o
+    cálculo falhar, não convergir ou não puder ser interpretado.
+    """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             xyz_path = Path(tmpdir) / "site.xyz"
             with open(xyz_path, "w") as f:
-                f.write(f"{len(site_elements)}\n")
-                f.write("sitio protonado (CODEEP)\n")
-                for elem, xyz in zip(site_elements, site_coords):
+                f.write(f"{len(elements)}\n")
+                f.write("CODEEP\n")
+                for elem, xyz in zip(elements, coords):
                     f.write(f"{elem.capitalize():2s} {xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f}\n")
 
+            env = os.environ.copy()
+            if omp_threads is not None:
+                env["OMP_NUM_THREADS"] = str(max(1, int(omp_threads)))
+
+            # encoding/errors explícitos: a saída do xtb tem caracteres não-
+            # ASCII (Å etc.) e text=True sozinho usa a codificação preferida
+            # do locale do processo, que pode ser ASCII/C dependendo de como
+            # o pipeline é lançado (systemd, cron, subprocess sem ambiente
+            # herdado…) — decodificar sem isso derruba o cálculo inteiro com
+            # UnicodeDecodeError, silenciosamente capturado pelo except.
             result = subprocess.run(
                 [xtb_bin, str(xyz_path), "--gfn", "2",
-                 "--chrg", str(int(total_charge)), "--vfukui"],
+                 "--chrg", str(int(charge)), "--vfukui"],
                 cwd=tmpdir, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", env=env,
                 timeout=config.get("xtb_timeout_s", 600),
             )
-            fukui_path = Path(tmpdir) / "fukui.txt"
-            if result.returncode != 0 or not fukui_path.exists():
+            if result.returncode != 0:
                 log.debug(f"  xtb falhou (código {result.returncode}): "
                           f"{result.stderr[-500:] if result.stderr else '(sem stderr)'}")
                 return None
 
-            return _parse_xtb_fukui(fukui_path, len(site_elements))
+            # xtb >= 6.x (validado com 6.7.1) não grava mais fukui.txt em
+            # disco — os índices saem só no stdout, sob "Fukui functions:".
+            # Mantemos a leitura do arquivo como fallback para versões/
+            # configs que ainda o gravem.
+            fukui_path = Path(tmpdir) / "fukui.txt"
+            if fukui_path.exists():
+                parsed = _parse_xtb_fukui(
+                    fukui_path.read_text(encoding="utf-8", errors="replace"),
+                    len(elements),
+                )
+            else:
+                parsed = _parse_xtb_fukui(result.stdout, len(elements))
+            if parsed is None:
+                log.debug("  xtb: não foi possível extrair os índices de Fukui "
+                          "da saída (nem fukui.txt nem stdout)")
+            return parsed
     except Exception as e:
         log.debug(f"  xtb: {type(e).__name__}: {e}")
         return None
 
 
-def _parse_xtb_fukui(fukui_path: Path, n_atoms: int) -> "tuple[np.ndarray, np.ndarray] | None":
-    """Lê fukui.txt gerado por `xtb --vfukui`.
+def _xtb_whole_site_weights(
+    site_coords: np.ndarray,
+    site_elements: list[str],
+    total_charge: int,
+    config: dict,
+) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Roda GFN-xTB no sítio protonado INTEIRO de uma só vez (sem
+    fragmentar por resíduo). Modo LEGADO — mantido por compatibilidade,
+    mas não é mais o padrão recomendado.
 
-    Formato assumido (ver ressalva em _xtb_whole_site_weights):
-        #        f(+)     f(-)     f(0)
-        1O      0.1234   0.2345   0.1790
-        ...
+    INSTÁVEL para sítios reais: validado nesta sessão contra pares
+    curados reais — trava com *segmentation fault* quando o xtb detecta
+    o sítio como múltiplos fragmentos moleculares desconectados
+    ("molecular fragmentation" + "constraining FC" no stdout do xtb),
+    o que é o caso normal de um sítio construído por protonate_residue
+    residue a residue (dezenas de fragmentos capados, não uma molécula
+    covalentemente contínua). Mesmo quando não crasha, a convergência de
+    SCF para um sítio de centenas de átomos pode levar minutos.
+    Prefira "gfn_xtb_fragments" (ver channel_site_orbital_field), que
+    roda o xtb por resíduo — mesma unidade que já funciona de forma
+    robusta e rápida (validado: ~0.1-0.2s por fragmento de ~10-30 átomos)
+    e evita esse problema por construção.
+    """
+    xtb_bin = _xtb_bin()
+    if xtb_bin is None:
+        return None
+    return _run_xtb_vfukui(site_elements, site_coords, total_charge, config, xtb_bin)
+
+
+def _pick_fragment_parallelism(n_fragments: int, config: dict) -> tuple[int, int]:
+    """Decide quantos fragmentos rodar em paralelo (n_workers) e quantas
+    threads OpenMP por chamada de xtb (threads_per_call), de forma que
+    n_workers * threads_per_call fique perto do total de CPUs — sem isso,
+    cada chamada de xtb tentaria usar todos os núcleos sozinha e chamadas
+    concorrentes disputariam os mesmos núcleos (oversubscription), ficando
+    mais lento que rodar em série.
+
+    Fragmentos são pequenos (um resíduo, ~10-30 átomos) e escalam mal com
+    muitas threads (overhead de paralelizar uma álgebra linear pequena
+    supera o ganho) — por isso o critério prioriza mais fragmentos
+    concorrentes com poucas threads cada, em vez de poucos fragmentos com
+    muitas threads.
+    """
+    cpu_total = config.get("xtb_cpu_total") or os.cpu_count() or 1
+    max_workers = config.get("xtb_max_workers")  # override manual, opcional
+    n_workers = max(1, min(n_fragments, cpu_total, max_workers or cpu_total))
+    threads_per_call = max(1, cpu_total // n_workers)
+    return n_workers, threads_per_call
+
+
+def _xtb_fragment_weights(
+    mol: "Chem.Mol", config: dict, xtb_bin: str, omp_threads: int,
+) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Roda GFN-xTB num único fragmento residual protonado (mesma unidade
+    de _fragment_qm_weights, o equivalente em RHF/STO-3G) e retorna os
+    índices de Fukui condensados por átomo, prontos para _voxelize_atoms.
+
+    Cada fragmento é uma molécula única e covalentemente conectada
+    (resíduo protonado e capado nas bordas cortadas por protonate_residue)
+    — ao contrário do sítio inteiro concatenado, não dispara a detecção de
+    "múltiplos fragmentos desconectados" do xtb que causa o crash descrito
+    em _xtb_whole_site_weights. Retorna None se o fragmento exceder
+    config["max_qm_atoms"], se o cálculo falhar ou não convergir — o
+    chamador cai para a aproximação semi-empírica só nesse fragmento.
+    """
+    n_heavy = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() > 1)
+    if n_heavy > config.get("max_qm_atoms", 60):
+        return None
+    try:
+        conf = mol.GetConformer()
+        elements = [a.GetSymbol() for a in mol.GetAtoms()]
+        coords = np.array(
+            [list(conf.GetAtomPosition(a.GetIdx())) for a in mol.GetAtoms()],
+            dtype=np.float32,
+        )
+        charge = Chem.GetFormalCharge(mol)
+        return _run_xtb_vfukui(elements, coords, charge, config, xtb_bin, omp_threads)
+    except Exception as e:
+        log.debug(f"  xtb fragmento falhou: {type(e).__name__}: {e}")
+        return None
+
+
+def _parse_xtb_fukui(text: str, n_atoms: int) -> "tuple[np.ndarray, np.ndarray] | None":
+    """Extrai os índices de Fukui condensados de `xtb --vfukui`, a partir
+    do texto de fukui.txt (versões antigas) OU do stdout completo do xtb
+    (validado com xtb 6.7.1, que só imprime no terminal — ver
+    _xtb_whole_site_weights). Formato real, sob o cabeçalho
+    "Fukui functions:":
+
+        Fukui functions:
+             #        f(+)     f(-)     f(0)
+             1N       0.081    0.132    0.106
+             2C       0.018    0.011    0.015
+             ...
+
     f(+) → caráter aceptor (LUMO-like); f(-) → caráter doador (HOMO-like).
-    Ignora linhas que não comecem com um índice de átomo numérico.
+    Como o stdout do xtb tem várias outras tabelas numéricas (iterações de
+    SCF etc.) que colidiriam com um parsing ingênuo linha-a-linha do texto
+    inteiro, isolamos primeiro o bloco logo após "Fukui functions:" e
+    paramos no fim dele (linha em branco/separador ou índice fora de
+    sequência), em vez de escanear o arquivo/stdout inteiro.
     """
     try:
+        lines = text.splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if "Fukui functions:" in line:
+                start = i + 1
+                break
+        if start is None:
+            # fukui.txt de versões antigas pode não ter esse cabeçalho —
+            # cai para o comportamento antigo (escaneia tudo).
+            start = 0
+
+        while start < len(lines) and lines[start].strip().startswith("#"):
+            start += 1
+
         donor_w    = np.zeros(n_atoms, dtype=np.float32)
         acceptor_w = np.zeros(n_atoms, dtype=np.float32)
         idx = 0
-        with open(fukui_path) as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                head = parts[0]
-                if not (head[0].isdigit() or (head[0] == "-" and head[1:2].isdigit())):
-                    continue
-                try:
-                    fplus, fminus = float(parts[-3]), float(parts[-2])
-                except (ValueError, IndexError):
-                    continue
-                if idx >= n_atoms:
-                    break
-                acceptor_w[idx] = max(0.0, fplus)
-                donor_w[idx]    = max(0.0, fminus)
-                idx += 1
+        for line in lines[start:]:
+            parts = line.split()
+            if len(parts) < 4:
+                break
+            head = parts[0]
+            if not (head[0].isdigit() or (head[0] == "-" and head[1:2].isdigit())):
+                break
+            try:
+                fplus, fminus = float(parts[-3]), float(parts[-2])
+            except (ValueError, IndexError):
+                break
+            if idx >= n_atoms:
+                break
+            acceptor_w[idx] = max(0.0, fplus)
+            donor_w[idx]    = max(0.0, fminus)
+            idx += 1
         if idx == 0:
             return None
+        if idx != n_atoms:
+            log.debug(f"  xtb: bloco de Fukui tinha {idx} átomos, esperado "
+                      f"{n_atoms} — usando os {idx} primeiros.")
         return donor_w, acceptor_w
     except Exception:
         return None
@@ -799,21 +954,38 @@ def channel_site_orbital_field(
     sigma: float,
     grid_shape: tuple,
     config: dict,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, str]:
     """Dispatcher dos canais 3-4 — escolhe o nível de teoria conforme
     config["site_qm_method"]:
         "rhf_sto3g_fragments" — QM real por resíduo (ver _fragment_qm_weights),
             com fallback heurístico POR FRAGMENTO quando o QM falha só num
             resíduo (o resto do sítio continua com o valor real).
-        "gfn_xtb_full" — GFN-xTB no sítio protonado inteiro (ver
-            _xtb_whole_site_weights), fallback heurístico para o sítio
-            inteiro se o binário `xtb` não estiver disponível.
+        "gfn_xtb_fragments" — GFN-xTB por resíduo, em paralelo (ver
+            _xtb_fragment_weights/_pick_fragment_parallelism) — RECOMENDADO
+            em vez de "gfn_xtb_full": mesma unidade de fragmentação do
+            RHF/STO-3G, robusto (evita o crash de "sítio inteiro" descrito
+            em _xtb_whole_site_weights) e paraleliza várias chamadas de
+            xtb via ThreadPoolExecutor (thread, não processo — cada
+            chamada já é um subprocess do SO, não compete pelo GIL nem
+            toca CUDA, então não esbarra na restrição de workers=1 que
+            existe para a parte de voxelização em GPU).
+        "gfn_xtb_full" — GFN-xTB no sítio protonado inteiro de uma vez.
+            LEGADO/instável — ver ressalva em _xtb_whole_site_weights.
         "heuristic" (ou qualquer valor não reconhecido) — eletronegatividade
             + carga (channel_site_donor_acceptor), sem QM.
 
     Em todos os casos o resultado final é sempre um peso doador/aceptor
     por átomo espalhado na grade pela mesma _voxelize_atoms — unifica os
-    três níveis de teoria no mesmo formato de saída.
+    níveis de teoria no mesmo formato de saída.
+
+    Retorna (donor, acceptor, method_used) — o terceiro valor é o método
+    que REALMENTE gerou os canais (não o configurado): "*_fragments" só se
+    TODOS os resíduos tiveram QM real, "*_fragments_partial(n/m)" se uma
+    parte caiu no fallback por resíduo, "gfn_xtb_full" só se o xtb de fato
+    rodou e foi parseado, e "heuristic" em qualquer fallback total. Existe
+    para que o chamador grave em meta.json o que aconteceu de verdade, em
+    vez de ecoar cegamente config["site_qm_method"] mesmo quando o QM
+    falha e o cálculo cai para a heurística.
     """
     method = config.get("site_qm_method", "rhf_sto3g_fragments")
     batch  = config.get("vox_batch", 500 if HAS_CUPY else 100)
@@ -840,7 +1012,66 @@ def channel_site_orbital_field(
             grid_flat, site_coords, donor_w, acceptor_w, sigma, grid_shape,
             batch=batch, compute_mep=False,
         )
-        return donor, acceptor
+        if n_qm_ok == 0:
+            method_used = "heuristic"
+        elif n_qm_ok == len(fragments):
+            method_used = "rhf_sto3g_fragments"
+        else:
+            method_used = f"rhf_sto3g_fragments_partial({n_qm_ok}/{len(fragments)})"
+        return donor, acceptor, method_used
+
+    if method == "gfn_xtb_fragments" and fragments:
+        xtb_bin = _xtb_bin()
+        if xtb_bin is not None:
+            n_atoms = len(site_elements)
+            donor_w    = np.zeros(n_atoms, dtype=np.float32)
+            acceptor_w = np.zeros(n_atoms, dtype=np.float32)
+            qm_fragments = [f for f in fragments if f["mol"] is not None]
+            n_workers, threads_per_call = _pick_fragment_parallelism(
+                len(qm_fragments) or 1, config
+            )
+            results: dict[int, "tuple[np.ndarray, np.ndarray] | None"] = {}
+            if qm_fragments:
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    future_to_idx = {
+                        ex.submit(
+                            _xtb_fragment_weights, f["mol"], config, xtb_bin,
+                            threads_per_call,
+                        ): i
+                        for i, f in enumerate(qm_fragments)
+                    }
+                    for fut in as_completed(future_to_idx):
+                        results[future_to_idx[fut]] = fut.result()
+            n_qm_ok = 0
+            qi = 0
+            for frag in fragments:
+                start, end, mol = frag["start"], frag["end"], frag["mol"]
+                result = results.get(qi) if mol is not None else None
+                if mol is not None:
+                    qi += 1
+                if result is not None:
+                    donor_w[start:end], acceptor_w[start:end] = result
+                    n_qm_ok += 1
+                else:
+                    d, a = _electronegativity_donor_acceptor_weights(
+                        site_elements[start:end], site_charges[start:end]
+                    )
+                    donor_w[start:end], acceptor_w[start:end] = d, a
+            log.info(f"  QM fragmentado (GFN-xTB, {n_workers} paralelos x "
+                     f"{threads_per_call} threads): {n_qm_ok}/{len(fragments)} "
+                     f"resíduos com orbital real, resto por aproximação")
+            donor, acceptor, _ = _voxelize_atoms(
+                grid_flat, site_coords, donor_w, acceptor_w, sigma, grid_shape,
+                batch=batch, compute_mep=False,
+            )
+            if n_qm_ok == 0:
+                method_used = "heuristic"
+            elif n_qm_ok == len(fragments):
+                method_used = "gfn_xtb_fragments"
+            else:
+                method_used = f"gfn_xtb_fragments_partial({n_qm_ok}/{len(fragments)})"
+            return donor, acceptor, method_used
+        # xtb ausente — cai para a heurística abaixo
 
     if method == "gfn_xtb_full":
         total_charge = int(round(sum(
@@ -853,13 +1084,14 @@ def channel_site_orbital_field(
                 grid_flat, site_coords, donor_w, acceptor_w, sigma, grid_shape,
                 batch=batch, compute_mep=False,
             )
-            return donor, acceptor
+            return donor, acceptor, "gfn_xtb_full"
         # xtb indisponível/falhou — cai para a heurística abaixo
 
-    return channel_site_donor_acceptor(
+    donor, acceptor = channel_site_donor_acceptor(
         grid_flat, site_coords, site_elements, site_charges, sigma, grid_shape,
         batch=batch,
     )
+    return donor, acceptor, "heuristic"
 
 
 def channel_homo_lumo_qm(
@@ -1075,15 +1307,19 @@ def load_site_atoms(pdb_path: Path) -> tuple[np.ndarray, list[str], np.ndarray]:
     coords   = []
     elements = []
 
-    for model in struct:
-        for chain in model:
-            for residue in chain:
-                for atom in residue:
-                    elem = (atom.element or atom.get_name()[0]).strip().upper()
-                    if elem in ("H", "D", ""):
-                        continue
-                    coords.append(atom.get_vector().get_array())
-                    elements.append(elem)
+    # Restrito ao modelo 0: arquivos vindos de estruturas de RMN (vários
+    # MODELOS = mesmos átomos em conformações diferentes) duplicariam o
+    # sítio por N sem ganho nenhum se todos os modelos fossem lidos — ver
+    # a mesma correção em pipeline_curate.py (save_pdb) e em
+    # load_site_atoms_protonated logo abaixo.
+    for chain in struct[0]:
+        for residue in chain:
+            for atom in residue:
+                elem = (atom.element or atom.get_name()[0]).strip().upper()
+                if elem in ("H", "D", ""):
+                    continue
+                coords.append(atom.get_vector().get_array())
+                elements.append(elem)
 
     coords_arr = np.array(coords, dtype=np.float32)
     charges = np.array([_ELEM_CHARGE_APPROX.get(e, 0.0) for e in elements],
@@ -1443,10 +1679,16 @@ def load_site_atoms_protonated(
     onde binding_site.pdb já contém exatamente os resíduos do bolso
     (selecionados por pipeline_curate.get_binding_site, que sempre inclui
     o resíduo inteiro, nunca átomos parciais).
+
+    Restrito ao modelo 0 (struct[0]) — defesa equivalente à de
+    pipeline_curate.py::save_pdb: arquivos curados antes dessa correção
+    (estruturas de RMN com vários MODELOS) ainda têm N cópias
+    concatenadas em disco até serem re-curados; ler todos os modelos aqui
+    multiplicaria o sítio de novo mesmo já tendo corrigido a curadoria.
     """
     parser = PDBParser(QUIET=True)
     struct = parser.get_structure("site", str(pdb_path))
-    residues = [r for model in struct for chain in model for r in chain]
+    residues = [r for chain in struct[0] for r in chain]
     return protonate_site_residues(residues, ph)
 
 
@@ -1801,7 +2043,7 @@ def process_pair(
     # `mol`. Nível de teoria conforme config["site_qm_method"] — ver
     # channel_site_orbital_field.
     sigma_da = max(config["gaussian_sigma"] * 1.5, voxel_size)
-    ch3, ch4 = channel_site_orbital_field(
+    ch3, ch4, orbital_method_used = channel_site_orbital_field(
         gf, site_coords, site_elements, site_charges, site_fragments,
         sigma_da, (n, n, n), config,
     )
@@ -1875,7 +2117,12 @@ def process_pair(
         "n_site_atoms":    int(len(site_coords)),
         "n_ligand_atoms":  int(mol.GetNumAtoms()) if mol else 0,
         "ligand_smiles":   Chem.MolToSmiles(mol) if mol else "",
-        "orbital_channels_source": config.get("site_qm_method", "rhf_sto3g_fragments"),
+        # Método que REALMENTE gerou os canais 3-4 (não o configurado —
+        # ver channel_site_orbital_field). config_site_qm_method fica
+        # como referência do que foi pedido, para detectar divergência
+        # (ex.: gfn_xtb_full pedido mas xtb ausente/falhou -> heuristic).
+        "orbital_channels_source": orbital_method_used,
+        "config_site_qm_method": config.get("site_qm_method", "rhf_sto3g_fragments"),
         "protonate_site":  bool(config.get("protonate_site", True)),
         "site_ph":         float(config.get("ph", 7.4)),
         "vox_backend": "CuPy" if HAS_CUPY else "NumPy",
@@ -2036,22 +2283,58 @@ def run(
         log.info(f"  Workers  : {effective_workers} (definido pelo usuário)")
 
     if effective_workers > 1:
+        # Paraleliza PARES (ThreadPoolExecutor, não ProcessPoolExecutor —
+        # ver detect_optimal_workers: CUDA não suporta múltiplos contextos
+        # de processo de forma proveitosa aqui, e a etapa que domina o
+        # tempo por par (GFN-xTB fragmentado, ver channel_site_orbital_field)
+        # já é subprocess-based, não presa ao GIL). O ganho real não vem de
+        # rodar o QM mais rápido (ele já usa quase todos os núcleos por
+        # par) — vem de sobrepor os ~25% restantes do tempo (protonação +
+        # voxelização GPU, que hoje rodam 100% em série) com o QM de OUTROS
+        # pares simultâneos. Ganho esperado: modesto (validado ~15-25% em
+        # análise, não testado em lote grande) — por isso fica atrás de
+        # config["parallel_pairs"], desligado por padrão.
+        #
+        # Divide o orçamento de threads do xtb fragmentado (ver
+        # _pick_fragment_parallelism) por effective_workers, para pares
+        # simultâneos não disputarem os mesmos núcleos SEM controle
+        # (oversubscription) — cada par simultâneo fica com uma fração
+        # dos núcleos totais em vez de tentar usar todos sozinho.
+        cpu_total = os.cpu_count() or 1
+        VOXEL_CONFIG["xtb_cpu_total"] = max(1, cpu_total // effective_workers)
         log.info(
-            f"  ℹ workers={effective_workers} definido manualmente. "
-            "Benchmark indica que workers=1 é o ponto ótimo para este pipeline "
-            "(GIL bloqueia ThreadPoolExecutor; CUDA não suporta ProcessPool)."
+            f"  ℹ Paralelizando {effective_workers} pares simultâneos "
+            f"(cada um com até {VOXEL_CONFIG['xtb_cpu_total']} threads para o "
+            f"GFN-xTB fragmentado, de {cpu_total} núcleos totais)."
         )
-
-    for d in tqdm(pair_dirs, desc="Voxelizando"):
-        r = process_pair(d, tensor_dir=tensor_dir, config=VOXEL_CONFIG)
-        results.append(r)
-        if r["status"] == "ok":
-            ok += 1
-        elif "skip" in r["status"]:
-            skipped += 1
-        else:
-            fail += 1
-            log.warning(f"  ✗ {r['pair_id']}: {r.get('msg', r['status'])}")
+        with ThreadPoolExecutor(max_workers=effective_workers) as ex:
+            futures = {
+                ex.submit(process_pair, d, tensor_dir, VOXEL_CONFIG): d
+                for d in pair_dirs
+            }
+            with tqdm(total=len(pair_dirs), desc="Voxelizando") as pbar:
+                for fut in as_completed(futures):
+                    r = fut.result()
+                    results.append(r)
+                    if r["status"] == "ok":
+                        ok += 1
+                    elif "skip" in r["status"]:
+                        skipped += 1
+                    else:
+                        fail += 1
+                        log.warning(f"  ✗ {r['pair_id']}: {r.get('msg', r['status'])}")
+                    pbar.update(1)
+    else:
+        for d in tqdm(pair_dirs, desc="Voxelizando"):
+            r = process_pair(d, tensor_dir=tensor_dir, config=VOXEL_CONFIG)
+            results.append(r)
+            if r["status"] == "ok":
+                ok += 1
+            elif "skip" in r["status"]:
+                skipped += 1
+            else:
+                fail += 1
+                log.warning(f"  ✗ {r['pair_id']}: {r.get('msg', r['status'])}")
 
     df = pd.DataFrame(results)
     df.to_csv(tensor_dir / "tensor_index.csv", index=False)

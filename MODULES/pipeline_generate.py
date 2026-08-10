@@ -466,10 +466,22 @@ def pdb_to_site_tensor(
     # conforme config["site_qm_method"]), calculado apenas a partir dos
     # átomos do sítio. Não depende de nenhum ligante de referência.
     sigma_da = max(config["gaussian_sigma"] * 1.5, voxel_size)
-    ch3, ch4 = vox.channel_site_orbital_field(
+    ch3, ch4, orbital_method_used = vox.channel_site_orbital_field(
         gf, site_coords, site_elements, site_charges, site_fragments,
         sigma_da, (n, n, n), config,
     )
+    configured_method = config.get("site_qm_method", "rhf_sto3g_fragments")
+    if orbital_method_used != configured_method:
+        log.warning(
+            f"  Canais 3-4: pedido site_qm_method={configured_method!r} mas "
+            f"o cálculo real caiu para {orbital_method_used!r} (ver logs de "
+            f"debug para o motivo). Se o modelo foi treinado com um método "
+            f"diferente deste, os canais 3-4 desta inferência ficam "
+            f"fora da distribuição vista no treino — ver "
+            f"MODULES/pipeline_voxelize.py::channel_site_orbital_field."
+        )
+    else:
+        log.info(f"  Canais 3-4 (doador/aceptor): {orbital_method_used}")
 
     # Monta e normaliza tensor
     tensor = np.stack([ch0, ch1, ch2, ch3, ch4], axis=-1)  # (n,n,n,5)
@@ -1817,6 +1829,102 @@ def compute_tanimoto(mol, ref_mol) -> float | None:
         return None
 
 
+def export_benchmark_candidates(
+    candidates: list[dict],
+    ranked_df: pd.DataFrame,
+    out_path: Path,
+    target_id: str,
+    run_seed: int,
+    method_name: str = "CODEEP",
+    n_generated: int | None = None,
+    generation_time_s: float | None = None,
+    novelty_reference_smiles: "set[str] | list[str] | None" = None,
+) -> pd.DataFrame:
+    """Exporta um CSV em schema padrao para benchmark.
+
+    O arquivo cobre todas as tentativas da rodada. Candidatos inválidos ou
+    descartados antes do ranking aparecem com `valid=False`; candidatos
+    válidos porém duplicados aparecem com `unique=False`.
+    """
+    if n_generated is None:
+        n_generated = max([c.get("idx", -1) for c in candidates] + [-1]) + 1
+
+    novelty_canon = None
+    if novelty_reference_smiles:
+        novelty_canon = set()
+        for smi in novelty_reference_smiles:
+            if not smi:
+                continue
+            try:
+                mol = Chem.MolFromSmiles(str(smi))
+                if mol is not None:
+                    novelty_canon.add(Chem.MolToSmiles(mol))
+            except Exception:
+                continue
+
+    by_idx = {int(c.get("idx", -1)): c for c in candidates if "idx" in c}
+    ranked_rows = {}
+    if not ranked_df.empty and "raw_index" in ranked_df.columns:
+        for rank, row in ranked_df.iterrows():
+            raw_idx = row.get("raw_index")
+            if pd.isna(raw_idx):
+                continue
+            payload = row.to_dict()
+            payload["rank"] = int(rank)
+            ranked_rows[int(raw_idx)] = payload
+
+    avg_time_ms = None
+    if generation_time_s is not None and n_generated:
+        avg_time_ms = round((generation_time_s / max(n_generated, 1)) * 1000.0, 3)
+
+    records = []
+    for raw_index in range(max(int(n_generated), 0)):
+        cand = by_idx.get(raw_index)
+        ranked = ranked_rows.get(raw_index, {})
+        valid = cand is not None
+        smiles = cand.get("smiles") if valid else None
+        unique = bool(ranked)
+        novel = None
+        if valid and smiles and novelty_canon is not None:
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    novel = Chem.MolToSmiles(mol) not in novelty_canon
+            except Exception:
+                novel = None
+
+        records.append({
+            "target_id": target_id,
+            "run_seed": int(run_seed),
+            "method_name": method_name,
+            "raw_index": raw_index,
+            "rank": ranked.get("rank"),
+            "smiles": smiles,
+            "valid": valid,
+            "unique": unique,
+            "novel": novel,
+            "score": ranked.get("score", cand.get("qed") if valid else None),
+            "qed": ranked.get("qed", cand.get("qed") if valid else None),
+            "sa_score": ranked.get("sa_score", cand.get("sa_score") if valid else None),
+            "mw": ranked.get("mw", cand.get("mw") if valid else None),
+            "logp": ranked.get("logp", cand.get("logp") if valid else None),
+            "lipinski": ranked.get("lipinski", cand.get("lipinski") if valid else None),
+            "veber": ranked.get("veber", cand.get("veber") if valid else None),
+            "tanimoto_ref": ranked.get("tanimoto_ref"),
+            "has_pocket_clash": ranked.get("has_pocket_clash", cand.get("has_pocket_clash") if valid else None),
+            "n_pocket_clashes": ranked.get("n_pocket_clashes", cand.get("n_pocket_clashes") if valid else None),
+            "vina_score": ranked.get("vina_score"),
+            "gnina_score": ranked.get("gnina_score"),
+            "cnn_affinity": ranked.get("cnn_affinity"),
+            "generation_time_ms": avg_time_ms,
+        })
+
+    bench_df = pd.DataFrame(records)
+    bench_df.to_csv(out_path, index=False)
+    log.info(f"  Benchmark CSV: {out_path}")
+    return bench_df
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BLOCO 5 — FILTRAGEM E RANKING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1877,6 +1985,7 @@ def rank_candidates(
                  + (0.10 * tanimoto if tanimoto else 0.0))
 
         rows.append({
+            "raw_index": c.get("idx"),
             "smiles":    c["smiles"],
             "score":     round(score, 4),
             "qed":       c["qed"],
@@ -2230,6 +2339,18 @@ Exemplos:
     df_csv = df.drop(columns=["_mol"], errors="ignore")
     df_csv.to_csv(out_dir / "candidates.csv")
     log.info(f"  CSV completo: {out_dir / 'candidates.csv'}")
+
+    export_benchmark_candidates(
+        candidates=candidates,
+        ranked_df=df,
+        out_path=out_dir / "benchmark_candidates.csv",
+        target_id=pdb_path.stem,
+        run_seed=0,
+        method_name="CODEEP",
+        n_generated=args.n_samples,
+        generation_time_s=gen_time,
+        novelty_reference_smiles=None,
+    )
 
     # SDF top N
     save_sdf(df, out_dir / f"top{args.top_n}_candidates.sdf", args.top_n)
