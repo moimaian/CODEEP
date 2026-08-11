@@ -1138,6 +1138,80 @@ class MainWindow(QMainWindow):
         if current_min < required_width:
             button.setMinimumWidth(required_width)
 
+    # ── Fechamento da janela ───────────────────────────────────────────────
+    def closeEvent(self, event):
+        """Trata o fechamento da janela com pipeline em execução.
+
+        Sem isto o fechamento era ambíguo nos dois sentidos. A janela era
+        destruída mas o processo filho continuava: um treinamento de dois
+        dias seguia consumindo a GPU sem nenhuma interface para acompanhá-lo
+        ou interrompê-lo, e sem forma de reexibir a janela. Ao mesmo tempo,
+        quem fechasse esperando cancelar não cancelava nada.
+
+        As três saídas ficam explícitas. Em segundo plano, o encerramento
+        automático do processo é religado ao fim do último worker, para que
+        o programa não fique residente para sempre depois que o trabalho
+        terminar.
+        """
+        ativos = [k for k, w in self._workers.items()
+                  if w is not None and w.isRunning()]
+        if not ativos:
+            event.accept()
+            return
+
+        nomes = ", ".join(i18n.t(f"worker_{k}", self._idioma) for k in ativos)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(i18n.t("close_title", self._idioma))
+        box.setText(i18n.t("close_text", self._idioma, etapas=nomes))
+        box.setInformativeText(i18n.t("close_info", self._idioma))
+        b_bg     = box.addButton(i18n.t("close_btn_background", self._idioma),
+                                 QMessageBox.AcceptRole)
+        b_stop   = box.addButton(i18n.t("close_btn_stop", self._idioma),
+                                 QMessageBox.DestructiveRole)
+        b_cancel = box.addButton(i18n.t("close_btn_cancel", self._idioma),
+                                 QMessageBox.RejectRole)
+        box.setDefaultButton(b_cancel)
+        box.exec_()
+        clicado = box.clickedButton()
+
+        if clicado is b_cancel:
+            event.ignore()
+            return
+
+        if clicado is b_stop:
+            for k in ativos:
+                try:
+                    self._workers[k].request_stop()
+                except Exception as exc:
+                    log.warning(f"Falha ao interromper '{k}': {exc}")
+            event.accept()
+            return
+
+        # Segundo plano: a janela fecha, o filho continua. O processo só
+        # encerra quando o último worker terminar (ver _quit_se_ocioso) —
+        # do contrário ficaria residente indefinidamente.
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
+        for k in ativos:
+            try:
+                self._workers[k].finished.connect(self._quit_se_ocioso)
+            except Exception:
+                pass
+        log.info("Janela fechada; pipeline segue em segundo plano. "
+                 "Acompanhe pelo arquivo de log da etapa.")
+        event.accept()
+
+    def _quit_se_ocioso(self):
+        """Encerra o programa quando nenhum worker estiver mais rodando."""
+        if any(w is not None and w.isRunning() for w in self._workers.values()):
+            return
+        app = QApplication.instance()
+        if app is not None:
+            log.info("Pipeline concluído em segundo plano; encerrando o CODEEP.")
+            app.quit()
+
     def _init_tab_state_specs(self):
         self._tab_state_specs = {
             "step1": [

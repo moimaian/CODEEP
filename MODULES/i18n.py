@@ -560,6 +560,45 @@ _TEXTOS = {
     "s8_lbl_top_n": {"en": "Top N report:", "pt": "Relatório Top N:"},
     "s8_lbl_min_atoms": {"en": "Min. site atoms:", "pt": "Átomos mín. do sítio:"},
 
+    # -------------------------------------------- Fechamento com pipeline ativo
+    "worker_collect":  {"en": "Collection",   "pt": "Coleta"},
+    "worker_curate":   {"en": "Curation",     "pt": "Curadoria"},
+    "worker_explore":  {"en": "Exploration",  "pt": "Exploração"},
+    "worker_voxelize": {"en": "Voxelization", "pt": "Voxelização"},
+    "worker_train":    {"en": "Training",     "pt": "Treinamento"},
+    "worker_evaluate": {"en": "Evaluation",   "pt": "Avaliação"},
+    "worker_generate": {"en": "Generation",   "pt": "Geração"},
+    "close_title": {
+        "en": "Pipeline still running",
+        "pt": "Pipeline ainda em execução",
+    },
+    "close_text": {
+        "en": "The following step is still running: {etapas}.",
+        "pt": "A seguinte etapa ainda está em execução: {etapas}.",
+    },
+    "close_info": {
+        "en": "Leaving it in the background keeps the process running, but the "
+              "window cannot be reopened — follow the step's log file instead. "
+              "For training, that is training.log inside the checkpoint folder. "
+              "CODEEP will exit on its own once the step finishes.",
+        "pt": "Deixar em segundo plano mantém o processo rodando, mas a janela "
+              "não poderá ser reaberta — acompanhe pelo arquivo de log da etapa. "
+              "No treinamento, é o training.log dentro da pasta do checkpoint. "
+              "O CODEEP encerra sozinho quando a etapa terminar.",
+    },
+    "close_btn_background": {
+        "en": "Leave running in background",
+        "pt": "Deixar rodando em segundo plano",
+    },
+    "close_btn_stop": {
+        "en": "Stop and exit",
+        "pt": "Interromper e sair",
+    },
+    "close_btn_cancel": {
+        "en": "Cancel",
+        "pt": "Cancelar",
+    },
+
     # ------------------------------------------- Definição do sítio sem ligante
     "s8_chk_use_site_center": {
         "en": "Define site by center coordinates",
