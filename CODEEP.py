@@ -886,11 +886,35 @@ def _pipeline_collect(dataset, moad_dir, phase1_max,
             target_list={})
     m.show_status(job_dir=job_dir)
 
+def _ckpt_pos_frame(ckpt_dir):
+    """Lê do checkpoint o referencial em que a cabeça de posições foi treinada.
+
+    Devolve None para checkpoints anteriores à correção do referencial, que
+    é o que generate_candidates interpreta como legado (ver a nota lá).
+    """
+    import torch as _t
+    try:
+        ck = _t.load(ckpt_dir / "best_model.pt", map_location="cpu",
+                     weights_only=False)
+        return (ck.get("config") or {}).get("pos_frame")
+    except Exception:
+        return None
+
+
 def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
                        cutoff, min_atoms, top_n, out, ligand_ref, site_pdb,
                        site_config_overrides=None, final_ff="mmff_uff",
-                       induced_fit=False):
-    """Função de módulo (pickle-safe) que executa a geração no processo filho."""
+                       induced_fit=False, site_center=None, site_radius=10.0,
+                       heuristic_search=False, pocket_rank=1):
+    """Função de módulo (pickle-safe) que executa a geração no processo filho.
+
+    Definição do sítio, em ordem de precedência:
+      site_pdb          → arquivo com os resíduos do bolso;
+      heuristic_search  → P2Rank escolhe o bolso (pocket_rank na ordem de
+                          score) e devolve o centro;
+      site_center       → centro informado pelo usuário;
+      nenhum            → detecção pelo ligante co-cristalizado do PDB.
+    """
     import MODULES.pipeline_generate as m
     from pathlib import Path as _P
     import numpy as np
@@ -905,6 +929,27 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     site_pdb_path = _P(site_pdb) if site_pdb else None
+
+    # Busca heurística: o P2Rank determina o centro, então ele substitui
+    # qualquer site_center que tenha vindo da interface (os dois campos são
+    # mutuamente exclusivos na Etapa 8, mas a checagem aqui protege o uso
+    # programático). O ranking completo fica gravado ao lado dos resultados,
+    # para que a escolha do bolso seja auditável depois.
+    if heuristic_search and not site_pdb_path:
+        import json as _json
+        bolsos = m.detect_pockets_p2rank(pdb_path)
+        if pocket_rank < 1 or pocket_rank > len(bolsos):
+            raise ValueError(
+                f"Bolso #{pocket_rank} indisponível: o P2Rank encontrou "
+                f"{len(bolsos)} bolso(s) nesta estrutura.")
+        escolhido = bolsos[pocket_rank - 1]
+        site_center = escolhido["center"]
+        with open(out_dir / "pockets_p2rank.json", "w", encoding="utf-8") as f:
+            _json.dump({"selected_rank": escolhido["rank"],
+                        "radius_A": site_radius,
+                        "pockets": bolsos}, f, indent=2)
+
+    site_center = tuple(site_center) if site_center else None
 
     # Modelo carregado ANTES do sítio — precisa da voxel_config gravada no
     # checkpoint (ver pipeline_generate.load_model) para resolver com que
@@ -924,7 +969,8 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
         pdb_path, cutoff, min_atoms, site_pdb=site_pdb_path,
         project_dir=_P(root),           # ver Problema 3
         config_overrides=m.resolve_site_config_overrides(
-            ckpt_voxel_config, site_config_overrides))
+            ckpt_voxel_config, site_config_overrides),
+        site_center=site_center, site_radius_A=site_radius)
     np.savez_compressed(
         out_dir / "site_tensor.npz",
         tensor=site_tensor, origin=origin,
@@ -944,7 +990,11 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
         ref_mol=ref_mol,               # ← voxel_size retornado por pdb_to_site_tensor
         site_coords=site_coords, site_elements=site_elements,
         site_mol=site_mol, site_is_backbone=site_is_backbone,
-        final_ff=final_ff, induced_fit=induced_fit)
+        final_ff=final_ff, induced_fit=induced_fit,
+        # Referencial das posições: o modelo prediz relativo à origem da
+        # grade, que precisa ser somada de volta (ver generate_candidates).
+        origin=origin,
+        pos_frame=_ckpt_pos_frame(ckpt_dir))
     if not candidates:
         raise RuntimeError("Nenhum candidato válido gerado.")
 
@@ -1121,7 +1171,8 @@ class MainWindow(QMainWindow):
                 "ed_gen_out", "ed_ligand_ref", "sp_n_samples", "dsb_temp",
                 "sp_cutoff_gen", "sp_top_n", "sp_min_atoms_gen", "chk_gen_protonate_site",
                 "dsb_gen_ph", "cb_gen_site_qm_method", "cb_gen_qm_basis", "cb_final_ff",
-                "chk_induced_fit",
+                "chk_induced_fit", "chk_use_site_center", "dsb_site_x", "dsb_site_y",
+                "dsb_site_z", "dsb_site_radius", "chk_heuristic_search", "sp_pocket_rank",
             ],
         }
 
@@ -1803,6 +1854,49 @@ class MainWindow(QMainWindow):
                 rows.append((display, ver))
             except ImportError:
                 rows.append((display, "not installed"))
+
+        # ── Ferramentas externas (binários, não pacotes pip) ──────────────
+        # xtb: níveis de teoria semi-empíricos da voxelização (Etapa 5).
+        # Java + P2Rank: busca heurística de sítio da Etapa 8. O P2Rank
+        # exige Java 17+, então a versão do Java é informada junto — um
+        # Java 11 com P2Rank instalado falha na execução, e o usuário
+        # precisa conseguir ver isso aqui.
+        _xtb = _sh.which("xtb")
+        rows.append(("xtb", "installed" if _xtb else "not installed"))
+
+        _java = _sh.which("java")
+        if _java:
+            try:
+                _out = _sp.run([_java, "-version"], capture_output=True,
+                               text=True, timeout=5)
+                _txt = (_out.stderr or _out.stdout or "").splitlines()
+                _jv = _txt[0].split('"')[1] if _txt and '"' in _txt[0] else "installed"
+            except Exception:
+                _jv = "installed"
+            try:
+                _major = int(_jv.split(".")[0])
+                if _major < 17:
+                    _jv += "  (P2Rank exige 17+)"
+            except (ValueError, IndexError):
+                pass
+            rows.append(("Java (JRE)", _jv))
+        else:
+            rows.append(("Java (JRE)", "not installed"))
+
+        try:
+            import MODULES.pipeline_generate as _pg
+            _prank = _pg._p2rank_bin()
+        except Exception:
+            _prank = _sh.which("prank")
+        if _prank:
+            _pv = "installed"
+            for _part in Path(_prank).resolve().parts:
+                if _part.lower().startswith("p2rank"):
+                    _pv = _part.replace("p2rank_", "").replace("p2rank-", "") or "installed"
+                    break
+            rows.append(("P2Rank", _pv))
+        else:
+            rows.append(("P2Rank", "not installed"))
 
         # CUDA via torch
         if _TORCH_OK:
@@ -2848,7 +2942,7 @@ class MainWindow(QMainWindow):
         self.sp_hidden     = QSpinBox(); self.sp_hidden.setRange(16,4096);self.sp_hidden.setValue(256)
         self.sp_gnn_layers = QSpinBox(); self.sp_gnn_layers.setRange(1,12);self.sp_gnn_layers.setValue(4)
         self.dsb_lr        = QDoubleSpinBox()
-        self.dsb_lr.setDecimals(6); self.dsb_lr.setRange(1e-6,1.0); self.dsb_lr.setValue(3e-4)
+        self.dsb_lr.setDecimals(6); self.dsb_lr.setRange(1e-6,1.0); self.dsb_lr.setValue(4e-4)
         self.dsb_beta      = QDoubleSpinBox()
         self.dsb_beta.setDecimals(3); self.dsb_beta.setRange(0,10); self.dsb_beta.setValue(0.5)
         self.sp_warmup     = QSpinBox(); self.sp_warmup.setRange(1,500); self.sp_warmup.setValue(30)
@@ -3101,6 +3195,60 @@ class MainWindow(QMainWindow):
         self.sp_top_n      = QSpinBox(); self.sp_top_n.setRange(1,200); self.sp_top_n.setValue(20)
         self.sp_min_atoms_gen = QSpinBox(); self.sp_min_atoms_gen.setRange(1,30); self.sp_min_atoms_gen.setValue(5)
 
+        # ── Definição do sítio sem ligante co-cristalizado ──────────────────
+        # Quando a proteína não tem HETATM, extract_site_from_pdb recorreria
+        # ao centro geométrico da proteína, que raramente é o bolso real.
+        # Os dois caminhos abaixo cobrem esse caso: coordenadas informadas
+        # pelo usuário, ou busca heurística pelo P2Rank. São mutuamente
+        # exclusivos — marcar a busca desabilita os campos de coordenada.
+        self.dsb_site_x = QDoubleSpinBox(); self.dsb_site_y = QDoubleSpinBox()
+        self.dsb_site_z = QDoubleSpinBox()
+        for _sp in (self.dsb_site_x, self.dsb_site_y, self.dsb_site_z):
+            _sp.setDecimals(3); _sp.setRange(-9999.0, 9999.0); _sp.setValue(0.0)
+            _sp.setSingleStep(0.5)
+
+        self.chk_use_site_center = QCheckBox()
+        self._tr("s8_chk_use_site_center", self.chk_use_site_center.setText)
+        self._tr("s8_tooltip_site_center", self.chk_use_site_center.setToolTip)
+        self.chk_use_site_center.setChecked(False)
+
+        center_row = QWidget()
+        crl = QHBoxLayout(center_row); crl.setContentsMargins(0,0,0,0)
+        for _lbl, _sp in (("X:", self.dsb_site_x), ("Y:", self.dsb_site_y),
+                          ("Z:", self.dsb_site_z)):
+            crl.addWidget(QLabel(_lbl)); crl.addWidget(_sp)
+
+        self.dsb_site_radius = QDoubleSpinBox()
+        self.dsb_site_radius.setDecimals(1); self.dsb_site_radius.setRange(4.0, 25.0)
+        self.dsb_site_radius.setValue(10.0); self.dsb_site_radius.setSingleStep(0.5)
+        self._tr("s8_tooltip_site_radius", self.dsb_site_radius.setToolTip)
+
+        self.chk_heuristic_search = QCheckBox()
+        self._tr("s8_chk_heuristic_search", self.chk_heuristic_search.setText)
+        self._tr("s8_tooltip_heuristic_search", self.chk_heuristic_search.setToolTip)
+        self.chk_heuristic_search.setChecked(False)
+
+        self.sp_pocket_rank = QSpinBox()
+        self.sp_pocket_rank.setRange(1, 20); self.sp_pocket_rank.setValue(1)
+        self._tr("s8_tooltip_pocket_rank", self.sp_pocket_rank.setToolTip)
+
+        def _sync_site_mode():
+            """Mantém os três modos de definição de sítio mutuamente exclusivos."""
+            heur = self.chk_heuristic_search.isChecked()
+            manual = self.chk_use_site_center.isChecked() and not heur
+            self.chk_use_site_center.setEnabled(not heur)
+            for _w in (self.dsb_site_x, self.dsb_site_y, self.dsb_site_z):
+                _w.setEnabled(manual)
+            self.sp_pocket_rank.setEnabled(heur)
+            # O raio vale para os dois caminhos: o P2Rank devolve um centro,
+            # não um conjunto de resíduos, então o recorte é feito aqui.
+            self.dsb_site_radius.setEnabled(manual or heur)
+
+        self.chk_heuristic_search.toggled.connect(lambda _: _sync_site_mode())
+        self.chk_use_site_center.toggled.connect(lambda _: _sync_site_mode())
+        self._sync_site_mode = _sync_site_mode
+        _sync_site_mode()
+
         # ── Protonação do sítio + método QM — DEVE bater com o que foi usado
         # para gerar os tensores de treino da fase escolhida, senão o tensor
         # de inferência não tem a mesma distribuição do treino (ver nota em
@@ -3163,6 +3311,11 @@ class MainWindow(QMainWindow):
             ("s8_lbl_cutoff",        self.sp_cutoff_gen),
             ("s8_lbl_top_n",         self.sp_top_n),
             ("s8_lbl_min_atoms",     self.sp_min_atoms_gen),
+            (None,                   self.chk_use_site_center),
+            ("s8_lbl_site_center",   center_row),
+            ("s8_lbl_site_radius",   self.dsb_site_radius),
+            (None,                   self.chk_heuristic_search),
+            ("s8_lbl_pocket_rank",   self.sp_pocket_rank),
             (None,                   self.chk_gen_protonate_site),
             ("s5_lbl_site_ph",       self.dsb_gen_ph),
             ("s5_lbl_site_qm_method", self.cb_gen_site_qm_method),
@@ -3179,6 +3332,17 @@ class MainWindow(QMainWindow):
             site_pdb = self.ed_gen_site_pdb.text().strip() or None
             if site_pdb and not os.path.isfile(site_pdb):
                 raise ValueError(i18n.t("s8_err_invalid_site_pdb", self._idioma))
+
+            heur = self.chk_heuristic_search.isChecked()
+            usa_centro = self.chk_use_site_center.isChecked() and not heur
+            # site_pdb já delimita o bolso; centro ou busca seriam ignorados
+            # silenciosamente, então avisa em vez de deixar passar.
+            if site_pdb and (heur or usa_centro):
+                raise ValueError(i18n.t("s8_err_site_conflict", self._idioma))
+            centro = ((self.dsb_site_x.value(), self.dsb_site_y.value(),
+                       self.dsb_site_z.value()) if usa_centro else None)
+            if usa_centro and centro == (0.0, 0.0, 0.0):
+                raise ValueError(i18n.t("s8_err_center_zero", self._idioma))
             root   = self.ed_root.text().strip()
             phase = self.cb_gen_phase.currentText()
             if phase == "1":
@@ -3217,6 +3381,10 @@ class MainWindow(QMainWindow):
                 ),
                 final_ff = self._FINAL_FF_VALUES[self.cb_final_ff.currentIndex()],
                 induced_fit = self.chk_induced_fit.isChecked(),
+                site_center      = centro,
+                site_radius      = self.dsb_site_radius.value(),
+                heuristic_search = heur,
+                pocket_rank      = self.sp_pocket_rank.value(),
             )
 
         return self._build_pipeline_tab(

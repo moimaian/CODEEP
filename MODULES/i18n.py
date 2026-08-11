@@ -559,6 +559,61 @@ _TEXTOS = {
     "s8_lbl_cutoff": {"en": "Site cutoff (Å):", "pt": "Cutoff do sítio (Å):"},
     "s8_lbl_top_n": {"en": "Top N report:", "pt": "Relatório Top N:"},
     "s8_lbl_min_atoms": {"en": "Min. site atoms:", "pt": "Átomos mín. do sítio:"},
+
+    # ------------------------------------------- Definição do sítio sem ligante
+    "s8_chk_use_site_center": {
+        "en": "Define site by center coordinates",
+        "pt": "Definir sítio por coordenadas do centro",
+    },
+    "s8_lbl_site_center": {"en": "Site center:", "pt": "Centro do sítio:"},
+    "s8_lbl_site_radius": {"en": "Site radius (Å):", "pt": "Raio do sítio (Å):"},
+    "s8_chk_heuristic_search": {
+        "en": "Heuristic search (P2Rank)",
+        "pt": "Busca heurística (P2Rank)",
+    },
+    "s8_lbl_pocket_rank": {"en": "Pocket to use:", "pt": "Bolso a usar:"},
+    "s8_tooltip_site_center": {
+        "en": "Use when the protein has no co-crystallized ligand. Residues with at "
+              "least one atom within the radius of this point define the site. The "
+              "coordinates must be in the same frame as the supplied PDB.",
+        "pt": "Use quando a proteína não tem ligante co-cristalizado. Os resíduos com "
+              "ao menos um átomo dentro do raio em torno deste ponto definem o sítio. "
+              "As coordenadas devem estar no mesmo referencial do PDB fornecido.",
+    },
+    "s8_tooltip_site_radius": {
+        "en": "Default 10 Å. Larger than the 6 Å used when a ligand is present: there "
+              "the distance starts at the ligand atoms, which already fill the cavity, "
+              "whereas here it starts at a single central point.",
+        "pt": "Padrão 10 Å. Maior que os 6 Å usados quando há ligante: naquele caso a "
+              "distância parte dos átomos do ligante, que já preenchem a cavidade, "
+              "enquanto aqui parte de um único ponto central.",
+    },
+    "s8_tooltip_heuristic_search": {
+        "en": "Predicts binding pockets with P2Rank (Krivák & Hoksza, 2018) and uses "
+              "the chosen one, ranked by ligandability. Disables the manual "
+              "coordinates. Requires P2Rank installed and Java 17+; the full ranking "
+              "is written to pockets_p2rank.json in the output folder.",
+        "pt": "Prediz bolsos com o P2Rank (Krivák & Hoksza, 2018) e usa o bolso "
+              "escolhido, na ordem de ligandability. Desabilita as coordenadas "
+              "manuais. Exige P2Rank instalado e Java 17+; o ranking completo é "
+              "gravado em pockets_p2rank.json na pasta de saída.",
+    },
+    "s8_tooltip_pocket_rank": {
+        "en": "Which pocket to use from the P2Rank ranking (1 = highest score). Check "
+              "pockets_p2rank.json from a previous run to pick another one.",
+        "pt": "Qual bolso usar no ranking do P2Rank (1 = maior score). Consulte o "
+              "pockets_p2rank.json de uma execução anterior para escolher outro.",
+    },
+    "s8_err_site_conflict": {
+        "en": "The site PDB already delimits the pocket. Clear it before using center "
+              "coordinates or heuristic search.",
+        "pt": "O PDB do sítio já delimita o bolso. Remova-o antes de usar coordenadas "
+              "do centro ou busca heurística.",
+    },
+    "s8_err_center_zero": {
+        "en": "Set the site center coordinates (they are all zero).",
+        "pt": "Informe as coordenadas do centro do sítio (estão todas em zero).",
+    },
     "s8_chk_protonate_site": {
         "en": "Protonate site residues (pH-based)", "pt": "Protonar resíduos do sítio (baseado em pH)",
     },

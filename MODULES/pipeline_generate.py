@@ -272,6 +272,225 @@ def extract_site_from_pdb(
     return site_coords, site_elems, charges, residues
 
 
+def extract_site_from_center(
+    pdb_path: Path,
+    center: "tuple[float, float, float]",
+    radius_A: float = 10.0,
+    min_site_residues: int = 5,
+) -> tuple[np.ndarray, list[str], np.ndarray, list]:
+    """Extrai o sítio a partir de um ponto informado pelo usuário.
+
+    Usado quando a proteína não tem ligante co-cristalizado e o usuário
+    conhece — ou obteve por busca heurística — as coordenadas do centro do
+    bolso. Seleciona os resíduos com ao menos um átomo a ≤ radius_A do
+    ponto e devolve o resíduo INTEIRO, exatamente como
+    extract_site_from_pdb: a protonação e o capeamento com hidrogênios
+    dependem de resíduos completos.
+
+    O raio padrão é 10 Å, e não os 6 Å usados quando há ligante. Os 6 Å são
+    medidos a partir dos átomos do ligante, que já preenche a cavidade,
+    enquanto aqui a medida parte de um único ponto central; um raio de 6 Å
+    em torno do centro selecionaria pouco mais que o miolo do bolso.
+
+    Returns: mesma tupla de extract_site_from_pdb.
+    """
+    from scipy.spatial import cKDTree
+
+    ELEM_CHARGE = {
+        "C": -0.05, "N": -0.30, "O": -0.35, "S": -0.15,
+        "P": +0.40, "FE": +0.30, "ZN": +0.40, "MG": +0.50,
+    }
+
+    parser = PDBParser(QUIET=True)
+    struct = parser.get_structure("query", str(pdb_path))
+
+    prot_coords, prot_elems, prot_residues = [], [], []
+    for model in struct:
+        for chain in model:
+            for residue in chain:
+                if residue.get_id()[0] != " ":
+                    continue
+                for atom in residue.get_atoms():
+                    e = _infer_element(atom)
+                    if e not in ("H", "D", "X"):
+                        prot_coords.append(atom.get_vector().get_array())
+                        prot_elems.append(e)
+                        prot_residues.append(residue)
+
+    if not prot_coords:
+        raise ValueError(f"Nenhum átomo proteico encontrado em {pdb_path}")
+
+    prot_arr   = np.array(prot_coords, dtype=np.float32)
+    center_arr = np.array(center, dtype=np.float32).reshape(3)
+
+    tree     = cKDTree(prot_arr)
+    atom_idx = sorted(tree.query_ball_point(center_arr, r=radius_A))
+    if not atom_idx:
+        dist_min = float(np.linalg.norm(prot_arr - center_arr, axis=1).min())
+        raise ValueError(
+            f"Nenhum átomo proteico a {radius_A} Å de "
+            f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}). "
+            f"O átomo mais próximo está a {dist_min:.1f} Å — verifique se as "
+            f"coordenadas correspondem a esta estrutura."
+        )
+
+    site_residue_ids = {id(prot_residues[i]) for i in atom_idx}
+    if len(site_residue_ids) < min_site_residues:
+        raise ValueError(
+            f"Sítio muito pequeno ({len(site_residue_ids)} resíduos) em torno de "
+            f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}). "
+            f"Aumente o raio (atual: {radius_A} Å)."
+        )
+
+    seen = set()
+    residues, site_coords, site_elems = [], [], []
+    for coord, elem, residue in zip(prot_coords, prot_elems, prot_residues):
+        if id(residue) not in site_residue_ids:
+            continue
+        site_coords.append(coord)
+        site_elems.append(elem)
+        if id(residue) not in seen:
+            seen.add(id(residue))
+            residues.append(residue)
+
+    site_coords = np.array(site_coords, dtype=np.float32)
+    charges = np.array([ELEM_CHARGE.get(e, 0.0) for e in site_elems],
+                       dtype=np.float32)
+
+    log.info(f"  Sítio extraído do centro "
+             f"({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}), raio {radius_A} Å: "
+             f"{len(site_coords)} átomos pesados ({len(residues)} resíduos completos)")
+    return site_coords, site_elems, charges, residues
+
+
+# ── Busca heurística de sítio (P2Rank) ────────────────────────────────────────
+
+def _p2rank_bin() -> "str | None":
+    """Localiza o executável `prank` do P2Rank.
+
+    Busca, nesta ordem: P2RANK_HOME, PATH e os diretórios de instalação
+    usuais. Mesmo padrão de _xtb_bin() em pipeline_voxelize.
+    """
+    env_home = os.environ.get("P2RANK_HOME")
+    if env_home:
+        cand = Path(env_home) / "prank"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+
+    found = shutil.which("prank")
+    if found:
+        return found
+
+    for base in (PROJECT_DIR / "tools", Path.home(), Path("/opt")):
+        if not base.is_dir():
+            continue
+        try:
+            for cand in sorted(base.glob("p2rank*/prank")):
+                if cand.is_file() and os.access(cand, os.X_OK):
+                    return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+P2RANK_INSTALL_HINT = (
+    "P2Rank não encontrado. Para instalar:\n"
+    "  sudo apt install openjdk-17-jre-headless\n"
+    "  wget https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz\n"
+    "  tar -xzf p2rank_2.5.1.tar.gz -C ~/\n"
+    "Depois exporte P2RANK_HOME=~/p2rank_2.5.1 ou acrescente-o ao PATH.\n"
+    "P2Rank exige Java 17 ou superior."
+)
+
+
+def detect_pockets_p2rank(
+    pdb_path: Path,
+    out_dir: "Path | None" = None,
+    max_pockets: int = 10,
+) -> list[dict]:
+    """Prediz bolsos de ligação com o P2Rank, ordenados por score.
+
+    O P2Rank (Krivák & Hoksza, 2018; licença MIT) pontua pontos da
+    superfície acessível ao solvente quanto à ligandability e agrupa os de
+    maior pontuação em bolsos. Não depende de ligante co-cristalizado nem
+    de estrutura homóloga.
+
+    Se o binário não for encontrado, levanta RuntimeError com as instruções
+    de instalação — deliberadamente, em vez de recorrer em silêncio a um
+    método pior: um sítio escolhido por um critério que o usuário não sabe
+    qual é produz um erro que só aparece no fim do estudo.
+
+    Returns:
+        [{"rank", "name", "score", "probability", "center", "n_residues"}]
+    """
+    prank = _p2rank_bin()
+    if prank is None:
+        raise RuntimeError(P2RANK_INSTALL_HINT)
+
+    usa_tmp = out_dir is None
+    tmp_out = Path(tempfile.mkdtemp(prefix="p2rank_")) if usa_tmp else Path(out_dir)
+    tmp_out.mkdir(parents=True, exist_ok=True)
+
+    cmd = [prank, "predict", "-f", str(pdb_path), "-o", str(tmp_out)]
+    log.info(f"  Executando P2Rank: {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            cauda = (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
+            raise RuntimeError(
+                "P2Rank falhou (código {}):\n{}\n\nSe o erro mencionar versão de "
+                "class file ou UnsupportedClassVersionError, o Java instalado é "
+                "anterior ao 17.".format(proc.returncode, "\n".join(cauda)))
+
+        candidatos = sorted(tmp_out.glob("*_predictions.csv"))
+        if not candidatos:
+            raise RuntimeError(
+                f"P2Rank terminou sem gerar *_predictions.csv em {tmp_out}. "
+                "Verifique se o arquivo tem cadeia proteica legível.")
+
+        import csv as _csv
+        bolsos = []
+        with open(candidatos[0], newline="", encoding="utf-8") as f:
+            for linha in _csv.DictReader(f):
+                # O cabeçalho do P2Rank traz espaços à esquerda nos nomes
+                reg = {(k or "").strip(): (v or "").strip()
+                       for k, v in linha.items()}
+                try:
+                    prob = reg.get("probability")
+                    bolsos.append({
+                        "rank":  int(reg.get("rank") or len(bolsos) + 1),
+                        "name":  reg.get("name") or f"pocket{len(bolsos) + 1}",
+                        "score": float(reg["score"]),
+                        "probability": float(prob) if prob else None,
+                        "center": (float(reg["center_x"]),
+                                   float(reg["center_y"]),
+                                   float(reg["center_z"])),
+                        "n_residues": len(
+                            [r for r in (reg.get("residue_ids") or "").split() if r]),
+                    })
+                except (KeyError, ValueError) as exc:
+                    log.warning(f"  Linha de predição ignorada ({exc}): {reg}")
+    finally:
+        if usa_tmp:
+            shutil.rmtree(tmp_out, ignore_errors=True)
+
+    if not bolsos:
+        raise RuntimeError(
+            "P2Rank não encontrou nenhum bolso nesta estrutura. "
+            "Informe as coordenadas do centro manualmente.")
+
+    bolsos.sort(key=lambda b: b["rank"])
+    bolsos = bolsos[:max_pockets]
+    log.info(f"  P2Rank encontrou {len(bolsos)} bolso(s); "
+             f"melhor score = {bolsos[0]['score']:.2f}")
+    for b in bolsos:
+        prob = f", prob {b['probability']:.2f}" if b["probability"] is not None else ""
+        log.info(f"    #{b['rank']} {b['name']}: score {b['score']:.2f}{prob}, "
+                 f"centro ({b['center'][0]:.2f}, {b['center'][1]:.2f}, "
+                 f"{b['center'][2]:.2f}), {b['n_residues']} resíduos")
+    return bolsos
+
+
 def load_site_from_residues_pdb(
     site_pdb: Path,
 ) -> tuple:
@@ -373,12 +592,23 @@ def pdb_to_site_tensor(
     site_pdb: "Path | None" = None,
     project_dir: "Path | None" = None,
     config_overrides: "dict | None" = None,
+    site_center: "tuple[float, float, float] | None" = None,
+    site_radius_A: float = 10.0,
 ) -> np.ndarray:
     """Pipeline completo: PDB → tensor do sítio (5, 32, 32, 32).
 
-    Se site_pdb for fornecido, carrega o sítio diretamente desse arquivo
-    (sem detecção automática). Caso contrário, extrai automaticamente a
-    partir do ligante co-cristalizado em pdb_path.
+    O sítio pode ser definido de três formas, nesta ordem de precedência:
+
+      1. site_pdb      — arquivo contendo apenas os resíduos do bolso;
+      2. site_center   — coordenadas (x, y, z) do centro, informadas pelo
+                         usuário ou obtidas por busca heurística
+                         (detect_pockets_p2rank), com raio site_radius_A;
+      3. automática    — a partir do ligante co-cristalizado em pdb_path.
+
+    A terceira só funciona se houver HETATM orgânico no arquivo; sem ele,
+    extract_site_from_pdb recorre ao centro geométrico da proteína, que
+    raramente é o sítio real. É justamente para evitar esse caso que
+    existem as duas primeiras formas.
 
     config_overrides permite sobrescrever ph/protonate_site/site_qm_method
     (mesmas chaves de pipeline_voxelize.VOXEL_CONFIG) — por padrão usa os
@@ -413,6 +643,10 @@ def pdb_to_site_tensor(
     if site_pdb is not None:
         site_coords, site_elements, site_charges, site_residues = \
             load_site_from_residues_pdb(site_pdb)
+    elif site_center is not None:
+        site_coords, site_elements, site_charges, site_residues = \
+            extract_site_from_center(pdb_path, site_center, site_radius_A,
+                                     min_site_residues)
     else:
         site_coords, site_elements, site_charges, site_residues = \
             extract_site_from_pdb(pdb_path, cutoff_A, min_site_residues)
@@ -1636,6 +1870,8 @@ def generate_candidates(
     final_ff: str = "mmff_uff",
     induced_fit: bool = False,
     ligand_charge_method: str = "gas",
+    origin: "np.ndarray | None" = None,
+    pos_frame: "str | None" = None,
 ) -> list[dict]:
     """Gera N candidatos a partir do tensor do sítio — construção
     SEQUENCIAL autorregressiva (um átomo por vez), com TODOS os n_samples
@@ -1664,6 +1900,34 @@ def generate_candidates(
             tensor, n_samples=n_samples, temperature=temperature,
             voxel_sizes=voxel_sizes_gen, max_atoms=max_atoms,
         )
+
+    # ── Referencial das posições geradas ──────────────────────────────────
+    # O modelo prediz no MESMO referencial em que foi treinado. Desde a
+    # correção do vazamento de escala (ver SiteLigandDataset.__getitem__ em
+    # pipeline_train.py), isso é "Å relativos à origem da grade" — aqui a
+    # origem é somada de volta para que o ligante caia sobre o sítio, cujas
+    # coordenadas são absolutas.
+    #
+    # Checkpoints anteriores à correção não têm a chave e foram treinados
+    # contra coordenadas absolutas. Eles não geram nada aproveitável (0% de
+    # moléculas válidas, por construção), então o aviso é explícito em vez
+    # de deixar o usuário concluir que o alvo é que era difícil.
+    if pos_frame == "grid_origin_angstrom":
+        if origin is None:
+            raise ValueError(
+                "checkpoint treinado em coordenadas relativas à grade, mas a "
+                "origem não foi passada para generate_candidates.")
+        desloc = torch.as_tensor(np.asarray(origin, dtype=np.float32),
+                                 device=samples[0]["positions"].device
+                                 if samples else None)
+        for s in samples:
+            s["positions"] = s["positions"] + desloc
+    elif pos_frame is None:
+        log.warning(
+            "  Checkpoint sem 'pos_frame': treinado com coordenadas "
+            "cristalográficas absolutas, que não são aprendíveis a partir da "
+            "grade local do sítio. Espera-se 0% de moléculas válidas. "
+            "Retreine com a versão corrigida do pipeline_train.")
 
     candidates = []
     failed     = 0
@@ -2213,6 +2477,20 @@ Exemplos:
                         help="SDF do ligante de referência para cálculo de Tanimoto")
     parser.add_argument("--tensor-dir",  default=None,
                         help="Diretório de tensores da fase usada para obter o template graph")
+    parser.add_argument("--site-center", nargs=3, type=float, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="Coordenadas do centro do sítio. Use quando a "
+                             "proteína não tem ligante co-cristalizado.")
+    parser.add_argument("--site-radius", type=float, default=10.0,
+                        help="Raio em Å ao redor de --site-center ou do centro "
+                             "encontrado por --heuristic-search (default: 10.0)")
+    parser.add_argument("--heuristic-search", action="store_true",
+                        help="Detecta o sítio automaticamente com o P2Rank e usa "
+                             "o bolso mais bem pontuado. Incompatível com "
+                             "--site-center.")
+    parser.add_argument("--pocket-rank", type=int, default=1,
+                        help="Com --heuristic-search, qual bolso usar na ordem de "
+                             "score (1 = melhor; default: 1)")
     parser.add_argument("--site-pdb",    default=None,
                         help="PDB contendo apenas os resíduos do sítio de ligação")
     parser.add_argument("--final-ff",    default="mmff_uff", choices=list(FINAL_FF_METHODS),
@@ -2272,11 +2550,45 @@ Exemplos:
 
     # ── 2. Extrai e voxeliza o sítio ──────────────────────────────────────────
     log.info("\n[2/5] Extraindo sítio de ligação...")
+    site_center = tuple(args.site_center) if args.site_center else None
+
+    if args.heuristic_search and site_center is not None:
+        log.error("--heuristic-search e --site-center são mutuamente exclusivos: "
+                  "a busca heurística determina o próprio centro.")
+        sys.exit(1)
+
+    if args.heuristic_search:
+        if site_pdb_path:
+            log.error("--heuristic-search e --site-pdb são mutuamente exclusivos.")
+            sys.exit(1)
+        log.info("  Modo: busca heurística de sítio (P2Rank)")
+        try:
+            bolsos = detect_pockets_p2rank(pdb_path)
+        except RuntimeError as exc:
+            log.error(str(exc))
+            sys.exit(1)
+        if args.pocket_rank < 1 or args.pocket_rank > len(bolsos):
+            log.error(f"--pocket-rank {args.pocket_rank} fora da faixa: o P2Rank "
+                      f"encontrou {len(bolsos)} bolso(s).")
+            sys.exit(1)
+        escolhido = bolsos[args.pocket_rank - 1]
+        site_center = escolhido["center"]
+        log.info(f"  Bolso escolhido: #{escolhido['rank']} ({escolhido['name']}), "
+                 f"score {escolhido['score']:.2f}")
+        with open(out_dir / "pockets_p2rank.json", "w", encoding="utf-8") as f:
+            json.dump({"selected_rank": escolhido["rank"],
+                       "radius_A": args.site_radius,
+                       "pockets": bolsos}, f, indent=2)
+
     if site_pdb_path:
         if not site_pdb_path.exists():
             log.error(f"--site-pdb não encontrado: {site_pdb_path}")
             sys.exit(1)
         log.info(f"  Modo: sítio fornecido ({site_pdb_path.name})")
+    elif site_center is not None:
+        log.info(f"  Modo: centro informado "
+                 f"({site_center[0]:.2f}, {site_center[1]:.2f}, {site_center[2]:.2f}), "
+                 f"raio {args.site_radius} Å")
     else:
         log.info("  Modo: detecção automática via ligante co-cristalizado")
 
@@ -2284,6 +2596,8 @@ Exemplos:
      site_mol, site_is_backbone) = pdb_to_site_tensor(
         pdb_path, args.cutoff, args.min_atoms,
         site_pdb=site_pdb_path,
+        site_center=site_center,
+        site_radius_A=args.site_radius,
         config_overrides=resolve_site_config_overrides(ckpt_voxel_config),
     )
     np.savez_compressed(
@@ -2320,6 +2634,8 @@ Exemplos:
         site_mol=site_mol, site_is_backbone=site_is_backbone,
         final_ff=args.final_ff, induced_fit=args.induced_fit,
         ligand_charge_method=args.ligand_charge_method,
+        origin=origin,
+        pos_frame=(ckpt_info.get("config") or {}).get("pos_frame"),
     )
     gen_time = time.perf_counter() - t_gen
 

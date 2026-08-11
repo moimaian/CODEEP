@@ -543,36 +543,167 @@ QPushButton:pressed { background: #C0392B; color: #FFF; }
 """
 
 
+# ==========================================================================
+# ─── FERRAMENTAS EXTERNAS (binários, fora do pip) ─────────────────────────
+# ==========================================================================
+#
+# Nem toda dependência do CODEEP é um pacote Python. A busca heurística de
+# sítio da Etapa 8 usa o P2Rank, que é um programa Java distribuído como
+# tarball. Aqui ele é tratado como cidadão de primeira classe do instalador,
+# em vez de exigir que o usuário siga instruções de linha de comando — que é
+# exatamente a barreira que o CODEEP existe para remover.
+#
+# O P2Rank é instalado dentro de <projeto>/tools/, sem privilégio de root.
+# O Java NÃO é instalado automaticamente: exige apt/sudo, e um instalador
+# gráfico que pede senha de root para mexer em pacotes do sistema é um risco
+# desproporcional. Ele é detectado e, se ausente ou anterior ao 17, a linha
+# de comando é exibida para o usuário executar.
+
+P2RANK_VERSION = "2.5.1"
+P2RANK_URL_TMPL = ("https://github.com/rdk/p2rank/releases/download/"
+                   "{v}/p2rank_{v}.tar.gz")
+JAVA_MIN_MAJOR = 17
+JAVA_INSTALL_HINT = "sudo apt install openjdk-17-jre-headless"
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+TOOLS_DIR = _PROJECT_ROOT / "tools"
+
+
+def detect_java() -> dict:
+    """Versão do Java disponível e se atende ao mínimo exigido pelo P2Rank."""
+    java = shutil.which("java")
+    if not java:
+        return {"found": False, "version": None, "major": None, "ok": False}
+    try:
+        out = subprocess.run([java, "-version"], capture_output=True,
+                             text=True, timeout=5)
+        txt = (out.stderr or out.stdout or "").splitlines()
+        ver = txt[0].split('"')[1] if txt and '"' in txt[0] else "?"
+    except Exception:
+        ver = "?"
+    try:
+        major = int(ver.split(".")[0])
+    except (ValueError, IndexError):
+        major = None
+    return {"found": True, "version": ver, "major": major,
+            "ok": major is not None and major >= JAVA_MIN_MAJOR}
+
+
+def detect_p2rank() -> Optional[str]:
+    """Caminho do executável `prank`, se instalado.
+
+    Mesma ordem de busca de pipeline_generate._p2rank_bin, para que o que o
+    instalador mostra seja o que o pipeline vai encontrar.
+    """
+    env_home = os.environ.get("P2RANK_HOME")
+    if env_home:
+        cand = Path(env_home) / "prank"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    found = shutil.which("prank")
+    if found:
+        return found
+    for base in (TOOLS_DIR, Path.home(), Path("/opt")):
+        if not base.is_dir():
+            continue
+        try:
+            for cand in sorted(base.glob("p2rank*/prank")):
+                if cand.is_file() and os.access(cand, os.X_OK):
+                    return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def install_p2rank(version: str = P2RANK_VERSION, log=print) -> bool:
+    """Baixa e extrai o P2Rank em <projeto>/tools/. Não requer root."""
+    import tarfile
+    import urllib.request
+
+    url = P2RANK_URL_TMPL.format(v=version)
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    tarball = TOOLS_DIR / f"p2rank_{version}.tar.gz"
+    try:
+        log(f"$ download {url}")
+        urllib.request.urlretrieve(url, tarball)
+        log(f"$ tar -xzf {tarball.name} -C {TOOLS_DIR}")
+        with tarfile.open(tarball, "r:gz") as tf:
+            tf.extractall(TOOLS_DIR)
+        tarball.unlink(missing_ok=True)
+    except Exception as exc:
+        log(f"FAILED  P2Rank download/extract: {exc}")
+        return False
+
+    prank = detect_p2rank()
+    if not prank:
+        log("FAILED  P2Rank extracted but 'prank' not found in tools/")
+        return False
+    try:
+        os.chmod(prank, 0o755)
+    except OSError:
+        pass
+
+    java = detect_java()
+    if not java["ok"]:
+        atual = java["version"] or "ausente"
+        log(f"WARNING  P2Rank instalado em {prank}, mas o Java disponível é "
+            f"{atual} e ele exige {JAVA_MIN_MAJOR}+.")
+        log(f"         Instale com: {JAVA_INSTALL_HINT}")
+    else:
+        log(f"OK  P2Rank {version} installed at {prank}")
+    return True
+
+
+# (display, key, default_spec, description, auto_installable)
+EXTERNAL_TOOLS: list[tuple] = [
+    ("P2Rank", "__p2rank__", P2RANK_VERSION,
+     "Heuristic binding-site search (Step 8). Java program, installed into "
+     "tools/. Requires Java 17+.", True),
+    ("Java (JRE)", "__java__", JAVA_INSTALL_HINT,
+     f"Required by P2Rank (version {JAVA_MIN_MAJOR} or newer). Needs root: "
+     "run the command shown in a terminal.", False),
+]
+
+
 class _InstallWorker(QThread):
     """Executa a instalação em thread separada, emitindo sinais de log/progresso."""
     log_signal      = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
     done_signal     = pyqtSignal(bool)   # True = sucesso total
 
-    def __init__(self, python_bin: str, tasks: list[tuple[str, str]], parent=None):
+    def __init__(self, python_bin: str, tasks: list[tuple], parent=None):
         """
-        tasks: lista de (display_name, pip_spec)
+        tasks: lista de (display_name, spec, kind), com kind em {"pip", "p2rank"}.
+        Tuplas de 2 elementos são aceitas e tratadas como "pip", para não
+        quebrar chamadas anteriores a esta classe.
         """
         super().__init__(parent)
         self.python_bin = python_bin
-        self.tasks      = tasks
+        self.tasks      = [t if len(t) == 3 else (t[0], t[1], "pip") for t in tasks]
 
     def run(self):
         total   = len(self.tasks)
         success = True
-        for i, (name, spec) in enumerate(self.tasks):
+        for i, (name, spec, kind) in enumerate(self.tasks):
             self.log_signal.emit(f"\n--- Installing {name} ---")
-            self.log_signal.emit(f"$ pip install {spec}")
-            res = _run([self.python_bin, "-m", "pip", "install"] + spec.split())
-            if res.returncode == 0:
-                self.log_signal.emit(f"OK  {name} installed.")
+
+            if kind == "p2rank":
+                ok = install_p2rank(spec or P2RANK_VERSION,
+                                    log=self.log_signal.emit)
+                success = success and ok
             else:
-                lines = [l for l in res.stdout.splitlines()
-                         if any(kw in l for kw in ("ERROR", "error", "Failed", "Could not"))]
-                self.log_signal.emit(f"FAILED  {name} — installation error:")
-                for l in lines[:6]:
-                    self.log_signal.emit(f"   {l}")
-                success = False
+                self.log_signal.emit(f"$ pip install {spec}")
+                res = _run([self.python_bin, "-m", "pip", "install"] + spec.split())
+                if res.returncode == 0:
+                    self.log_signal.emit(f"OK  {name} installed.")
+                else:
+                    lines = [l for l in res.stdout.splitlines()
+                             if any(kw in l for kw in ("ERROR", "error", "Failed", "Could not"))]
+                    self.log_signal.emit(f"FAILED  {name} — installation error:")
+                    for l in lines[:6]:
+                        self.log_signal.emit(f"   {l}")
+                    success = False
+
             pct = int((i + 1) / total * 100)
             self.progress_signal.emit(pct)
         self.done_signal.emit(success)
@@ -693,6 +824,48 @@ class RequirementsInstaller(QWidget):
             lbl_desc.setWordWrap(True)
             pkg_lay.addWidget(lbl_desc, row_i, 4)
 
+        # ── Ferramentas externas (não-pip) ──────────────────────────────────
+        base_row = len(PACKAGES_CATALOG) + 2
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("color: #D0D7E3;")
+        pkg_lay.addWidget(sep2, base_row, 0, 1, 5)
+
+        for off, (display, key, default_spec, description, auto) in \
+                enumerate(EXTERNAL_TOOLS, start=base_row + 1):
+            chk = QCheckBox()
+            chk.setChecked(auto)
+            # Java exige root: o instalador não o executa, só reporta.
+            chk.setEnabled(auto)
+            if not auto:
+                chk.setToolTip("Requires root — run the command in a terminal.")
+            self._checks[key] = chk
+            pkg_lay.addWidget(chk, off, 0, Qt.AlignCenter)
+
+            lbl_status = QLabel("…")
+            lbl_status.setFixedWidth(26)
+            lbl_status.setAlignment(Qt.AlignCenter)
+            lbl_status.setStyleSheet("font-size: 12pt;")
+            self._status[key] = lbl_status
+            pkg_lay.addWidget(lbl_status, off, 1)
+
+            lbl_name = QLabel(display)
+            lbl_name.setFixedWidth(148)
+            lbl_name.setStyleSheet("font-weight: bold; color: #C9D1D9;")
+            pkg_lay.addWidget(lbl_name, off, 2)
+
+            ed = QLineEdit(default_spec)
+            ed.setFixedWidth(228)
+            ed.setReadOnly(not auto)
+            ed.setToolTip(f"Version of {display}." if auto
+                          else "Command to run in a terminal.")
+            self._edits[key] = ed
+            pkg_lay.addWidget(ed, off, 3)
+
+            lbl_desc = QLabel(description)
+            lbl_desc.setStyleSheet("font-size: 9pt; color: #6E8CA8;")
+            lbl_desc.setWordWrap(True)
+            pkg_lay.addWidget(lbl_desc, off, 4)
+
         # Scroll area — encapsula o grid de pacotes
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -795,6 +968,33 @@ class RequirementsInstaller(QWidget):
                 lbl.setToolTip("Not found in current Python environment")
                 chk.setChecked(True)
 
+        # Ferramentas externas
+        prank = detect_p2rank()
+        java  = detect_java()
+
+        lbl, chk = self._status["__p2rank__"], self._checks["__p2rank__"]
+        if prank:
+            lbl.setText("✅"); lbl.setToolTip(f"Installed at {prank}")
+            chk.setChecked(False)
+        else:
+            lbl.setText("⚠️"); lbl.setToolTip("Not found — Step 8 heuristic search unavailable")
+            chk.setChecked(True)
+
+        lbl = self._status["__java__"]
+        if java["ok"]:
+            lbl.setText("✅"); lbl.setToolTip(f"Java {java['version']}")
+        elif java["found"]:
+            lbl.setText("⚠️")
+            lbl.setToolTip(f"Java {java['version']} is older than "
+                           f"{JAVA_MIN_MAJOR} — P2Rank will not run")
+        else:
+            lbl.setText("⚠️"); lbl.setToolTip("Not installed — required by P2Rank")
+
+        if prank and not java["ok"]:
+            self._log(f"WARNING  P2Rank is installed but Java "
+                      f"{java['version'] or 'is missing'}; it requires "
+                      f"{JAVA_MIN_MAJOR}+. Run: {JAVA_INSTALL_HINT}")
+
         self._log(f"Check complete. Python: {sys.executable}")
 
     # ── Helpers de seleção ─────────────────────────────────────────────────
@@ -804,6 +1004,11 @@ class RequirementsInstaller(QWidget):
 
     def _select_only_missing(self):
         for import_name, chk in self._checks.items():
+            if import_name == "__p2rank__":
+                chk.setChecked(detect_p2rank() is None)
+                continue
+            if import_name == "__java__":
+                continue          # não instalável por aqui (exige root)
             installed = _pkg_installed(import_name)
             chk.setChecked(not installed)
 
@@ -825,9 +1030,15 @@ class RequirementsInstaller(QWidget):
                     f"{spec} torchvision torchaudio "
                     f"--index-url {index} --no-cache-dir"
                 )
-                tasks.append((display, spec_full))
+                tasks.append((display, spec_full, "pip"))
             else:
-                tasks.append((display, spec))
+                tasks.append((display, spec, "pip"))
+
+        # Ferramentas externas selecionadas
+        if self._checks["__p2rank__"].isChecked():
+            tasks.append(("P2Rank",
+                          self._edits["__p2rank__"].text().strip() or P2RANK_VERSION,
+                          "p2rank"))
 
         if not tasks:
             QMessageBox.information(self, "No packages selected",

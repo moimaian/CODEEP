@@ -68,6 +68,14 @@ PROJECT_ROOT = Path(globals().get("_CODEEP_ROOT", Path(__file__).resolve().paren
 BASE_DIR = PROJECT_ROOT / "data"
 TENSOR_DIR = BASE_DIR / "tensors"
 
+# Referencial das posições do ligante usado no treino. Gravado no checkpoint
+# e lido pela geração, que precisa desfazer a transformação. Ver a nota em
+# SiteLigandDataset.__getitem__ sobre por que coordenadas absolutas não são
+# aprendíveis a partir de uma grade local ao bolso.
+#   "grid_origin_angstrom" → Å relativos à origem da grade do sítio
+#   ausente/None           → legado: coordenadas cristalográficas absolutas
+POS_FRAME = "grid_origin_angstrom"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATASET
@@ -189,8 +197,13 @@ class SiteLigandDataset(Dataset):
         return len(self.records)
 
     @staticmethod
-    def _random_rotate90(arr: np.ndarray) -> np.ndarray:
+    def _random_rotate90(arr: np.ndarray) -> tuple:
         """Rotação aleatória de 90° em torno de um dos 3 eixos espaciais.
+
+        Devolve (tensor_rotacionado, eixos, k) — os dois últimos para que a
+        MESMA rotação seja aplicada às posições do ligante em
+        _rotate_positions. Girar só o condicionamento destruiria a
+        correspondência espacial que o modelo precisa aprender.
 
         O tensor tem shape (C, X, Y, Z). Rotacionamos apenas os eixos
         espaciais (1,2,3), preservando a ordem dos canais.
@@ -200,7 +213,35 @@ class SiteLigandDataset(Dataset):
         axis_pairs = [(1,2), (1,3), (2,3)]  # pares de eixos espaciais
         ax = axis_pairs[np.random.randint(3)]
         k  = np.random.randint(4)           # 0, 90, 180 ou 270 graus
-        return np.rot90(arr, k=k, axes=ax).copy()
+        return np.rot90(arr, k=k, axes=ax).copy(), ax, k
+
+    @staticmethod
+    def _rotate_positions(pos: "torch.Tensor", ax: tuple, k: int,
+                          box_A: float) -> "torch.Tensor":
+        """Aplica ao ligante a MESMA rotação sofrida pela grade do sítio.
+
+        Sem isto a augmentation ensina geometria errada: o bolso gira, o
+        ligante fica onde estava, e a correspondência espacial entre
+        condicionamento e alvo — que é exatamente o que o modelo precisa
+        aprender — é destruída em 3 de cada 4 amostras.
+
+        A transformação vem da convenção do np.rot90 e foi conferida contra
+        ela nos 9 casos (3 planos × 3 ângulos): para cada quarto de volta no
+        plano (a, b), (u_a, u_b) → (L − u_b, u_a), com L o lado da caixa.
+        É a versão contínua de (i, j) → (N−1−j, i).
+
+        pos entra e sai em Å relativos à origem da grade.
+        """
+        if k == 0:
+            return pos
+        a, b = ax[0] - 1, ax[1] - 1     # eixo 0 do tensor é o canal
+        out = pos.clone()
+        for _ in range(k):
+            ua = out[:, a].clone()
+            ub = out[:, b].clone()
+            out[:, a] = box_A - ub
+            out[:, b] = ua
+        return out
 
     def __getitem__(self, idx: int) -> Optional[dict]:
         row     = self.records.iloc[idx]
@@ -213,11 +254,19 @@ class SiteLigandDataset(Dataset):
         arr  = npz["tensor"]                         # (X, Y, Z, C)
         arr  = np.transpose(arr, (3, 0, 1, 2))       # → (C, X, Y, Z)
 
+        # Origem e passo da grade — necessários para trazer o ligante ao
+        # referencial LOCAL do sítio (ver bloco de normalização abaixo).
+        origin = np.asarray(npz["origin"], dtype=np.float32)
+        voxel_size = float(np.asarray(npz["voxel_size"]).reshape(-1)[0]) \
+            if "voxel_size" in npz else float(row.get("voxel_size_A", 1.0))
+        box_A = arr.shape[1] * voxel_size          # lado da caixa em Å
+
         # Data augmentation: rotações aleatórias de 90° nos 3 eixos (apenas treino)
         # Multiplica o dataset efetivo por até 24x sem custo de armazenamento.
         # As rotações preservam a geometria vdW e o MEP do sítio.
+        rot_ax, rot_k = None, 0
         if self.split == "train":
-            arr = self._random_rotate90(arr)
+            arr, rot_ax, rot_k = self._random_rotate90(arr)
 
         site = torch.tensor(arr, dtype=torch.float32)
 
@@ -239,12 +288,44 @@ class SiteLigandDataset(Dataset):
                 graph.x = torch.nan_to_num(graph.x, nan=0.0,
                                            posinf=0.0, neginf=0.0)
 
+        # ── Referencial das posições do ligante ──────────────────────────────
+        # As coordenadas gravadas no grafo são CRISTALOGRÁFICAS ABSOLUTAS:
+        # cada ligante fica onde o depositante do PDB o colocou, com desvio
+        # de ~50 Å por eixo entre pares e valores de −72 a +346 Å. O tensor
+        # do sítio, por construção, é uma grade local ao bolso. Regredir a
+        # coordenada absoluta a partir dela é pedir informação que não está
+        # na entrada, e o modelo responde da única forma possível: prevendo
+        # a média global. Foi o que aconteceu no treino anterior — erro
+        # mediano de 35 Å, MSE normalizada ≈ 1.0 (variância explicada zero)
+        # e, em consequência, 0% de moléculas válidas na geração.
+        #
+        # Aqui as posições passam para Å RELATIVOS À ORIGEM DA GRADE, que é
+        # o mesmo referencial do tensor de entrada. A geração desfaz a
+        # transformação somando a origem de volta (ver pipeline_generate.
+        # generate_candidates) — a chave "pos_frame" gravada no checkpoint
+        # é o que mantém os dois lados sincronizados.
+        if graph is not None and getattr(graph, "pos", None) is not None:
+            pos_rel = graph.pos - torch.tensor(origin, dtype=graph.pos.dtype)
+
+            # Par cujo ligante não cabe na própria grade é dado corrompido
+            # (na amostragem de 400 pares foi 1, com 172 Å de excesso).
+            # Deixá-lo passar contamina a escala do termo de posição.
+            folga = 2.0
+            if bool(((pos_rel < -folga) | (pos_rel > box_A + folga)).any()):
+                return None
+
+            if rot_k:
+                pos_rel = self._rotate_positions(pos_rel, rot_ax, rot_k, box_A)
+            graph.pos = pos_rel
+
         return {
             "tensor":     site,
             "graph":      graph,
             "pair_id":    pair_id,
             "smiles":     row.get("ligand_smiles", ""),
             "voxel_size": float(row.get("voxel_size_A", 1.0)),
+            "origin":     torch.tensor(origin, dtype=torch.float32),
+            "box_A":      box_A,
         }
 
     @staticmethod
@@ -1124,7 +1205,10 @@ def cvae_loss(
                 um par não-ligado).
 
     KL divergence:
-      L_KL = -0.5 · Σ (1 + logvar - mean² - exp(logvar))
+      L_KL = -0.5 · média(1 + logvar - mean² - exp(logvar))
+      Média sobre todos os elementos (batch × latent_dim), não soma por
+      amostra — por construção, a magnitude de L_KL não escala com
+      latent_dim (mudar latent_dim não exige reajustar beta_max).
 
     O hiperparâmetro beta controla o trade-off reconstrução vs. regularização.
     beta=1 → VAE padrão; beta<1 → mais ênfase em reconstrução.
@@ -1140,8 +1224,23 @@ def cvae_loss(
                 if preds["charges"].shape[0] > 0 else zero)
 
     if preds["positions"].shape[0] > 0:
-        pos_scale = preds["pos_targets"].std() + 1e-6
-        L_pos = F.mse_loss(preds["positions"] / pos_scale, preds["pos_targets"] / pos_scale)
+        # Huber (smooth L1) em Å, com beta = 1 Å: quadrático dentro de 1 Å,
+        # linear além disso.
+        #
+        # A versão anterior normalizava pelo desvio-padrão do BATCH, o que
+        # tinha dois defeitos. Primeiro, a escala mudava a cada batch, então
+        # o mesmo erro em Å produzia perdas diferentes conforme os alvos
+        # sorteados. Segundo, e mais grave, com alvos absolutos esse desvio
+        # era de ~28 Å, de modo que errar 1 Å custava (1/28)² ≈ 0,001 —
+        # ruído perto do termo de tipo atômico (~0,5). O otimizador não
+        # tinha incentivo algum para acertar geometria.
+        #
+        # Com alvos no referencial local (poucas dezenas de Å) e escala
+        # fixa, a perda passa a ser legível em Å: 1 Å de erro custa ~0,5 e
+        # 3 Å custam ~2,5, comparáveis ao termo de tipo atômico. O Huber
+        # evita que os erros grandes das primeiras épocas dominem o
+        # gradiente, como aconteceria com MSE puro.
+        L_pos = F.smooth_l1_loss(preds["positions"], preds["pos_targets"], beta=1.0)
     else:
         L_pos = zero
 
@@ -1193,7 +1292,7 @@ def train_epoch(
     grad_clip: float = 0.5,   # reduzido de 1.0 para prevenir explosão
 ) -> dict:
     model.train()
-    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","kl"]}
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
     n_batches = 0
 
     for batch in tqdm(loader, desc="  Train", leave=False):
@@ -1245,7 +1344,7 @@ def eval_epoch(
     beta:   float,
 ) -> dict:
     model.eval()
-    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","kl"]}
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
     n_batches = 0
 
     for batch in tqdm(loader, desc="  Eval ", leave=False):
@@ -1277,7 +1376,7 @@ def train(
     n_gnn_layers:  int   = 4,
     batch_size:    int   = 32,
     epochs:        int   = 150,   # máximo — early stopping interrompe antes
-    lr:            float = 3e-4,
+    lr:            float = 4e-4,  # ajustado para batch_size=32 (era 3e-4/batch=8)
     beta_max:      float = 0.5,
     beta_warmup:   int   = 30,
     dropout:       float = 0.20,
@@ -1466,10 +1565,17 @@ def train(
         val_losses   = eval_epoch (model, val_loader,              device, beta)
         scheduler.step()
 
-        log.info(f"  Train → total={train_losses['total']:.4f}  "
-                 f"recon={train_losses['recon']:.4f}  kl={train_losses['kl']:.4f}")
-        log.info(f"  Val   → total={val_losses['total']:.4f}  "
-                 f"recon={val_losses['recon']:.4f}  kl={val_losses['kl']:.4f}")
+        # Termos separados no log. Só `recon` e `kl` agregados escondiam o
+        # que estava acontecendo no treino anterior: o termo de posição
+        # ficou travado em ~1,0 (variância explicada zero) por 111 épocas
+        # sem que isso aparecesse em lugar nenhum. `pos` está em Å.
+        def _linha(rot, L):
+            return (f"  {rot} → total={L['total']:.4f}  recon={L['recon']:.4f}  "
+                    f"kl={L['kl']:.4f}  |  atom={L['atom']:.4f}  pos={L['pos']:.4f}Å  "
+                    f"exist={L['exist']:.4f}  bond={L['bond']:.4f}  "
+                    f"stop={L['stop']:.4f}  charge={L['charge']:.4f}")
+        log.info(_linha("Train", train_losses))
+        log.info(_linha("Val  ", val_losses))
 
         row = {"epoch": epoch, "beta": beta}
         row.update({f"train_{k}": v for k, v in train_losses.items()})
@@ -1486,18 +1592,38 @@ def train(
                 "val_loss":      best_val,
                 "resumed_from":  str(resume) if resume else None,
                 "freeze_encoder": freeze_encoder,
+                # Histórico completo junto do checkpoint: sem ele, diagnosticar
+                # um treino ruim depois exige remedir tudo do zero.
+                "history":       history,
                 "config": {
                     "latent_dim":   latent_dim,
                     "hidden_dim":   hidden_dim,
                     "n_gnn_layers": n_gnn_layers,
                     "voxel_config": voxel_config_snapshot,
+                    # Referencial em que a cabeça de posições foi treinada.
+                    # A geração consulta esta chave para saber se deve somar
+                    # a origem da grade de volta. Checkpoints anteriores a
+                    # esta correção não a têm, e são tratados como legado
+                    # (coordenadas absolutas) com aviso — ver
+                    # pipeline_generate.generate_candidates.
+                    "pos_frame":    POS_FRAME,
                 },
             }, ckpt_dir / "best_model.pt")
             log.info(f"  ★ Melhor modelo salvo (val_loss={best_val:.4f})")
             patience_count = 0
-        else:
+        elif epoch > beta_warmup:
+            # Só conta paciência DEPOIS que o beta terminou de subir (ver
+            # "KL annealing" acima). Durante o warmup, beta·L_KL cresce a
+            # cada epoch mesmo com o modelo melhorando de verdade —
+            # contar isso como "sem melhora" faria o early stopping
+            # disparar por causa do annealing em si, não por estagnação
+            # real (ex.: patience=15 < beta_warmup=30 pararia o treino no
+            # meio do warmup, antes de beta sequer atingir beta_max).
             patience_count += 1
             log.info(f"  Sem melhora: {patience_count}/{patience} epochs")
+        else:
+            log.info(f"  Sem melhora, mas dentro do warmup do beta "
+                      f"(epoch {epoch}/{beta_warmup}) — não conta para paciência.")
 
         # Checkpoint periódico
         if epoch % 10 == 0:
@@ -1547,7 +1673,7 @@ Exemplos de uso:
     parser.add_argument("--batch",          type=int,   default=32)
     parser.add_argument("--latent",         type=int,   default=256)
     parser.add_argument("--hidden",         type=int,   default=256)
-    parser.add_argument("--lr",             type=float, default=3e-4)
+    parser.add_argument("--lr",             type=float, default=4e-4)
     parser.add_argument("--gnn-layers",     type=int,   default=4)
     parser.add_argument("--dropout",        type=float, default=0.20)
     parser.add_argument("--beta",           type=float, default=0.5)
