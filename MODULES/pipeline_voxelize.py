@@ -1726,8 +1726,23 @@ def atom_features(atom) -> list[float]:
 
 
 def bond_features(bond) -> list[float]:
-    """Vetor de features de uma ligação RDKit (dimensão = 7)."""
-    feat = one_hot(bond.GetBondType(), BOND_TYPES[:-1])  # 5 elementos
+    """Vetor de features de uma ligação RDKit (dimensão = 7).
+
+    Layout: one-hot de 5 posições — [SINGLE, DOUBLE, TRIPLE, AROMATIC,
+    other] — seguido de conjugada e em-anel.
+
+    A versão anterior passava BOND_TYPES[:-1], excluindo AROMATIC da lista
+    de escolhas: ligações aromáticas caíam na posição "other" e o vetor
+    tinha 6 posições, divergindo dos 7 dos dados já gravados. A exclusão só
+    fazia sentido quando BOND_TYPES terminava num marcador genérico, o que
+    não é mais o caso.
+
+    pipeline_train._build_adjacency lê as BOND_TYPE_DIM (=4) primeiras
+    posições, obtendo a classe entre os quatro tipos reais. Uma ligação
+    exótica marcada em "other" tem essas quatro zeradas e acaba lida como
+    SINGLE — aceitável, por ser rara em ligantes de estruturas depositadas.
+    """
+    feat = one_hot(bond.GetBondType(), BOND_TYPES)   # 5 posições (4 + other)
     feat.append(float(bond.GetIsConjugated()))
     feat.append(float(bond.IsInRing()))
     return feat  # dimensão 7
@@ -1903,9 +1918,113 @@ def compute_site_anchored_atom_order(
     return np.array(order, dtype=np.int64)
 
 
-def load_ligand_mol(pdb_path: Path) -> Optional[object]:
-    """Lê o ligand.pdb com RDKit. Tenta inferir ligações se necessário."""
-    # Tenta leitura direta
+CCD_CACHE_DIR = BASE_DIR / "ccd_templates"
+CCD_URL_TMPL  = "https://files.rcsb.org/ligands/download/{code}_ideal.sdf"
+
+
+def ccd_template(code: str, cache_dir: "Path | None" = None) -> Optional[object]:
+    """Template do Chemical Component Dictionary do RCSB para um código de 3
+    letras, com cache local.
+
+    O CCD é a fonte canônica da estrutura química de cada ligante depositado
+    no PDB: traz as ordens de ligação e a aromaticidade que o formato PDB
+    não carrega. O download é feito uma vez por código e reaproveitado.
+
+    Devolve None se o código não existir no CCD ou se não houver rede — o
+    chamador decide o que fazer, e nunca há substituição silenciosa por uma
+    molécula errada.
+    """
+    if not code:
+        return None
+    code = code.strip().upper()
+    cache = Path(cache_dir) if cache_dir else CCD_CACHE_DIR
+    cache.mkdir(parents=True, exist_ok=True)
+    sdf = cache / f"{code}_ideal.sdf"
+
+    if not sdf.exists():
+        import urllib.error
+        import urllib.request
+        try:
+            with urllib.request.urlopen(CCD_URL_TMPL.format(code=code),
+                                        timeout=30) as r:
+                sdf.write_bytes(r.read())
+        except (urllib.error.URLError, OSError) as exc:
+            log.warning(f"  Template CCD indisponível para {code}: {exc}")
+            return None
+
+    try:
+        tmpl = next(iter(Chem.SDMolSupplier(str(sdf), sanitize=True)), None)
+        return Chem.RemoveHs(tmpl) if tmpl is not None else None
+    except Exception as exc:
+        log.warning(f"  Falha ao ler template CCD de {code}: {exc}")
+        return None
+
+
+def _transfere_ordens_parcial(tmpl, lig):
+    """Copia as ordens de ligação do template para um ligante INCOMPLETO.
+
+    AssignBondOrdersFromTemplate exige que o ligante contenha o template
+    inteiro como subestrutura. Isso falha sempre que a estrutura depositada
+    tem átomos não resolvidos — situação comum, e responsável por 22% dos
+    pares desta base. Aqui o casamento é feito na direção inversa: o
+    ligante, com as ordens apagadas, é procurado DENTRO do template, e as
+    ordens são copiadas par a par.
+
+    Devolve None se não houver casamento.
+    """
+    q = Chem.Mol(lig)
+    for b in q.GetBonds():
+        b.SetBondType(Chem.BondType.SINGLE)
+        b.SetIsAromatic(False)
+    for a in q.GetAtoms():
+        a.SetIsAromatic(False)
+        a.SetNoImplicit(True)
+        a.SetNumExplicitHs(0)
+
+    params = Chem.AdjustQueryParameters.NoAdjustments()
+    params.makeBondsGeneric = True
+    params.makeDummiesQueries = True
+    match = tmpl.GetSubstructMatch(Chem.AdjustQueryProperties(q, params))
+    if not match:
+        return None
+
+    out = Chem.RWMol(lig)
+    for b in out.GetBonds():
+        tb = tmpl.GetBondBetweenAtoms(match[b.GetBeginAtomIdx()],
+                                      match[b.GetEndAtomIdx()])
+        if tb is not None:
+            b.SetBondType(tb.GetBondType())
+            b.SetIsAromatic(tb.GetIsAromatic())
+    for a in out.GetAtoms():
+        a.SetNoImplicit(False)
+        a.SetNumExplicitHs(0)
+
+    mol = out.GetMol()
+    Chem.SanitizeMol(mol)
+    return mol
+
+
+def load_ligand_mol(pdb_path: Path,
+                    ccd_code: "str | None" = None,
+                    cache_dir: "Path | None" = None) -> Optional[object]:
+    """Lê o ligand.pdb com RDKit, recuperando as ordens de ligação.
+
+    O formato PDB não armazena ordem de ligação nem aromaticidade. Lido
+    diretamente, o RDKit infere a conectividade por distância e marca TODAS
+    as ligações como simples — foi o que produziu um conjunto de treino com
+    zero ligações duplas em 33.090 ligantes, tornando constante o alvo da
+    cabeça de tipo de ligação e impedindo que o modelo pudesse gerar anéis
+    aromáticos.
+
+    A correção usa o template do CCD (ver ccd_template) com
+    AssignBondOrdersFromTemplate, que transfere as ordens preservando as
+    coordenadas cristalográficas do arquivo.
+
+    Se o código não for informado, é inferido do nome do resíduo no próprio
+    PDB. Falhando a recuperação, a molécula é devolvida como estava, com
+    aviso explícito — perder o par seria pior que treinar com ele, mas o
+    usuário precisa saber quantos ficaram assim.
+    """
     mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=True, sanitize=True)
     if mol is None:
         mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=True, sanitize=False)
@@ -1919,7 +2038,33 @@ def load_ligand_mol(pdb_path: Path) -> Optional[object]:
         log.warning(f"  Não foi possível ler {pdb_path.name} com RDKit")
         return None
 
-    # Garante que há conformador 3D
+    # Código do componente: o informado ou o resName do primeiro átomo
+    if not ccd_code:
+        info = mol.GetAtomWithIdx(0).GetPDBResidueInfo()
+        ccd_code = info.GetResidueName().strip() if info else None
+
+    tmpl = ccd_template(ccd_code, cache_dir) if ccd_code else None
+    if tmpl is not None:
+        try:
+            mol = AllChem.AssignBondOrdersFromTemplate(tmpl, mol)
+        except Exception:
+            # Ligante incompleto: tenta o casamento parcial, que cobre 54 de
+            # cada 55 desses casos (ver _transfere_ordens_parcial).
+            try:
+                parcial = _transfere_ordens_parcial(tmpl, mol)
+            except Exception:
+                parcial = None
+            if parcial is not None:
+                mol = parcial
+            else:
+                log.warning(f"  {pdb_path.parent.name}: template {ccd_code} não "
+                            "casou nem parcialmente; ordens de ligação "
+                            "permanecem como lidas do PDB (todas simples)")
+    else:
+        log.warning(f"  {pdb_path.parent.name}: sem template CCD para "
+                    f"{ccd_code!r}; ordens de ligação permanecem como lidas "
+                    "do PDB (todas simples)")
+
     if mol.GetNumConformers() == 0:
         AllChem.EmbedMolecule(mol, randomSeed=42)
 
@@ -1982,7 +2127,11 @@ def process_pair(
     n = config["grid_size"]
 
     # ── 3. Carrega ligante ────────────────────────────────────────────────────
-    mol = load_ligand_mol(lig_pdb)
+    # Código do componente vindo do pair_id (<pdb>_<lig>_<cadeia><resseq>) —
+    # mais confiável que o resName do arquivo, que pode vir truncado.
+    _partes = pair_id.split("_")
+    mol = load_ligand_mol(lig_pdb,
+                          ccd_code=_partes[1] if len(_partes) > 1 else None)
 
     # ── 4. Calcula canais 0-2 (vetorizado, GPU se CuPy disponível) ───────────
     sigma = max(config["gaussian_sigma"], voxel_size * 1.0)

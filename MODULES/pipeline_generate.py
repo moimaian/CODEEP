@@ -1632,17 +1632,50 @@ def _relax_generated_geometry(
     if mol is None or mol.GetNumConformers() == 0 or mol.GetNumBonds() == 0:
         return mol
 
+    # ── Hidrogênios explícitos para a minimização ─────────────────────────
+    # MMFF94s e UFF precisam dos hidrogênios como partículas: sem eles
+    # faltam os termos de estiramento X–H, os ângulos em torno de carbonos
+    # saturados ficam subdeterminados e a repulsão estérica contra o sítio é
+    # subestimada. Minimizar o esqueleto pesado sozinho produz comprimentos e
+    # ângulos de ligação distorcidos.
+    #
+    # AddHs anexa os hidrogênios DEPOIS dos átomos pesados, de modo que os
+    # índices 0..n_heavy-1 são preservados — é o que mantém válidos o
+    # mapeamento de volta, o n_lig do complexo e o alinhamento de
+    # site_is_backbone com a parte do sítio.
+    #
+    # O molécula devolvida continua sendo a de átomos pesados, com as
+    # coordenadas melhoradas: o restante do pipeline (métricas, SMILES,
+    # SDF) espera esse formato.
+    n_heavy = mol.GetNumAtoms()
+    try:
+        mol_h = Chem.AddHs(mol, addCoords=True)
+        tem_h = mol_h.GetNumAtoms() > n_heavy
+    except Exception as exc:
+        log.debug(f"  AddHs falhou ({type(exc).__name__}: {exc}); "
+                  "minimizando sem hidrogênios explícitos")
+        mol_h, tem_h = mol, False
+
+    def _devolve_coords():
+        """Traz as posições dos átomos pesados de mol_h de volta para mol."""
+        if not tem_h:
+            return
+        cf, cm = mol_h.GetConformer(), mol.GetConformer()
+        for i in range(n_heavy):
+            cm.SetAtomPosition(i, cf.GetAtomPosition(i))
+
     have_site = site_coords is not None and site_elements is not None and len(site_elements) > 0
     have_site_mol = site_mol is not None and site_is_backbone is not None
 
     if not have_site:
         try:
-            if AllChem.MMFFHasAllMoleculeParams(mol):
-                AllChem.MMFFOptimizeMolecule(mol, mmffVariant="MMFF94s", maxIters=200)
+            if AllChem.MMFFHasAllMoleculeParams(mol_h):
+                AllChem.MMFFOptimizeMolecule(mol_h, mmffVariant="MMFF94s", maxIters=200)
             else:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+                AllChem.UFFOptimizeMolecule(mol_h, maxIters=200)
         except Exception:
             pass
+        _devolve_coords()
         return mol
 
     if induced_fit and not have_site_mol:
@@ -1672,8 +1705,11 @@ def _relax_generated_geometry(
     minimized = False
     if final_ff in ("amber_ff14sb", "charmm36"):
         if HAS_GROMACS and HAS_ACPYPE and gromacs_site_topology is not None and have_site_mol:
+            # Também recebe o ligante com H explícitos: o antechamber precisa
+            # deles para a tipagem GAFF. Caminho não exercitado nesta máquina
+            # (acpype ausente), mas passar o esqueleto pesado seria errado.
             minimized, updated = _minimize_complex_gromacs(
-                mol, gromacs_site_topology, induced_fit, ligand_charge_method,
+                mol_h, gromacs_site_topology, induced_fit, ligand_charge_method,
             )
             if updated is not None:
                 effective_site_coords = updated
@@ -1694,16 +1730,19 @@ def _relax_generated_geometry(
             )
     if not minimized and have_site_mol:
         try:
-            combined, n_lig = _build_ligand_site_complex(mol, site_mol)
+            # n_lig passa a contar também os hidrogênios do ligante, o que
+            # mantém o deslocamento correto para a parte do sítio e, com ela,
+            # o alinhamento de site_is_backbone.
+            combined, n_lig = _build_ligand_site_complex(mol_h, site_mol)
             minimized, updated = _minimize_complex_rdkit(
                 combined, n_lig, site_is_backbone, induced_fit
             )
             if minimized:
                 combined_conf = combined.GetConformer()
-                mol_conf = mol.GetConformer()
+                molh_conf = mol_h.GetConformer()
                 for i in range(n_lig):
                     p = combined_conf.GetAtomPosition(i)
-                    mol_conf.SetAtomPosition(i, p)
+                    molh_conf.SetAtomPosition(i, p)
                 if updated is not None:
                     effective_site_coords = updated
         except Exception as e:
@@ -1714,13 +1753,19 @@ def _relax_generated_geometry(
         # Nenhum campo de força pôde ser construído para o complexo —
         # cai para a relaxação isolada (melhor que geometria não relaxada).
         try:
-            if AllChem.MMFFHasAllMoleculeParams(mol):
-                AllChem.MMFFOptimizeMolecule(mol, mmffVariant="MMFF94s", maxIters=200)
+            if AllChem.MMFFHasAllMoleculeParams(mol_h):
+                AllChem.MMFFOptimizeMolecule(mol_h, mmffVariant="MMFF94s", maxIters=200)
             else:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+                AllChem.UFFOptimizeMolecule(mol_h, maxIters=200)
         except Exception:
             pass
 
+    _devolve_coords()
+
+    # A checagem de colisão segue sobre os átomos pesados, como antes: os
+    # raios de van der Waals usados em _check_pocket_clashes são calibrados
+    # para essa comparação. Os hidrogênios já cumpriram seu papel ao entrar
+    # no campo de força, que é onde a repulsão foi de fato resolvida.
     clash = _check_pocket_clashes(mol, effective_site_coords, effective_site_elements)
     mol.SetBoolProp("has_pocket_clash", bool(clash["has_clash"]))
     mol.SetIntProp("n_pocket_clashes", int(clash["n_clashes"]))
