@@ -1290,6 +1290,8 @@ def train_epoch(
     device:    torch.device,
     beta:      float,
     grad_clip: float = 0.5,   # reduzido de 1.0 para prevenir explosão
+    pos_weight:  float = 2.0,
+    stop_weight: float = 1.0,
 ) -> dict:
     model.train()
     totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
@@ -1304,7 +1306,8 @@ def train_epoch(
 
         optimizer.zero_grad()
         preds  = model(site, graphs, voxel_sizes)
-        losses = cvae_loss(preds, beta=beta)
+        losses = cvae_loss(preds, beta=beta,
+                           pos_weight=pos_weight, stop_weight=stop_weight)
 
         # Pula batch se a loss for NaN/Inf (tensor corrompido escapou do filtro)
         if not torch.isfinite(losses["total"]):
@@ -1342,6 +1345,8 @@ def eval_epoch(
     loader: DataLoader,
     device: torch.device,
     beta:   float,
+    pos_weight:  float = 2.0,
+    stop_weight: float = 1.0,
 ) -> dict:
     model.eval()
     totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
@@ -1354,7 +1359,8 @@ def eval_epoch(
         graphs      = [g.to(device) for g in batch["graphs"]]
         voxel_sizes = batch["voxel_sizes"].to(device)
         preds       = model(site, graphs, voxel_sizes)
-        losses = cvae_loss(preds, beta=beta)
+        losses = cvae_loss(preds, beta=beta,
+                           pos_weight=pos_weight, stop_weight=stop_weight)
         # Pula batch com loss NaN (modelo corrompido ou dado degenerado)
         if not torch.isfinite(losses["total"]):
             continue
@@ -1387,6 +1393,21 @@ def train(
     patience:      int   = 15,    # epochs sem melhora antes de parar
     min_delta:     float = 1e-4,  # melhora mínima considerada significativa
     device:     str   = "auto",    # "auto" | "cuda" | "cpu" | "cuda:0" | "cuda:1"
+    # Pesos relativos das cabeças da loss (ver cvae_loss). Expostos aqui para
+    # que a Etapa 6 (otimização de hiperparâmetros) possa buscá-los — antes
+    # ficavam presos nos defaults de cvae_loss, inalcançáveis pela interface.
+    pos_weight:    float = 2.0,
+    stop_weight:   float = 1.0,
+    # Regularização/estabilidade: também estavam presos no corpo de train()
+    # (AdamW) e no default de train_epoch. Expostos pelo mesmo motivo.
+    weight_decay:  float = 1e-4,
+    grad_clip:     float = 0.5,
+    # Callback opcional chamado ao fim de cada epoch com
+    # (epoch, train_losses, val_losses). Usado pelo pipeline_optimize para
+    # reportar métricas intermediárias ao Optuna e podar trials ruins — uma
+    # exceção levantada aqui dentro (ex.: optuna.TrialPruned) propaga e
+    # interrompe o treino, que é exatamente o comportamento desejado.
+    epoch_callback=None,
 ):
     """Função principal de treino com suporte a fine-tuning em fases.
 
@@ -1446,7 +1467,7 @@ def train(
     # Retrato da config de voxelização que gerou ESSES tensores (ver
     # pipeline_voxelize.save_voxel_config_snapshot) — embutido no checkpoint
     # salvo abaixo (best_model.pt["config"]["voxel_config"]) para que a
-    # geração (Etapa 8) possa reconstruir o tensor de um sítio novo com a
+    # geração (Etapa 9) possa reconstruir o tensor de um sítio novo com a
     # MESMA config usada aqui, sem depender do usuário reproduzi-la
     # manualmente na interface (risco de mismatch treino↔inferência nos
     # canais 3-4, ver pipeline_generate.load_model). Ausente (dict vazio)
@@ -1465,7 +1486,7 @@ def train(
             f"  {_vc_path} não encontrado — o checkpoint salvo NÃO terá a config de "
             "voxelização embutida (tensores gerados antes desta funcionalidade existir, "
             "ou tensor_dir não é o mesmo usado na Etapa 5). A geração cairá para a "
-            "config manual da interface (Etapa 8)."
+            "config manual da interface (Etapa 9)."
         )
 
     # pipeline_train.py, linhas 840–845
@@ -1545,7 +1566,7 @@ def train(
     # ── Otimizador e scheduler ────────────────────────────────────────────────
     # Otimiza apenas parâmetros não congelados
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=lr / 100
     )
@@ -1561,8 +1582,11 @@ def train(
 
         log.info(f"\nEpoch {epoch}/{epochs}  β={beta:.3f}  lr={scheduler.get_last_lr()[0]:.2e}")
 
-        train_losses = train_epoch(model, train_loader, optimizer, device, beta)
-        val_losses   = eval_epoch (model, val_loader,              device, beta)
+        train_losses = train_epoch(model, train_loader, optimizer, device, beta,
+                                   grad_clip=grad_clip,
+                                   pos_weight=pos_weight, stop_weight=stop_weight)
+        val_losses   = eval_epoch (model, val_loader,              device, beta,
+                                   pos_weight=pos_weight, stop_weight=stop_weight)
         scheduler.step()
 
         # Termos separados no log. Só `recon` e `kl` agregados escondiam o
@@ -1581,6 +1605,12 @@ def train(
         row.update({f"train_{k}": v for k, v in train_losses.items()})
         row.update({f"val_{k}":   v for k, v in val_losses.items()})
         history.append(row)
+
+        # Callback de epoch — chamado ANTES de gravar checkpoints: se ele
+        # abortar o treino (poda do Optuna), não faz sentido ter escrito
+        # ~30 MB de checkpoint para um trial que será descartado.
+        if epoch_callback is not None:
+            epoch_callback(epoch, train_losses, val_losses)
 
         # Salva melhor modelo
         if val_losses["total"] < best_val:
@@ -1638,7 +1668,12 @@ def train(
     # Salva histórico
     pd.DataFrame(history).to_csv(ckpt_dir / "training_history.csv", index=False)
     log.info(f"\nTreino concluído. Melhor val_loss: {best_val:.4f}")
-    return model
+    # Retorna também o melhor val_loss: sem isso, quem chama train() por
+    # dentro (pipeline_optimize) teria de reabrir best_model.pt só para ler
+    # um número. Chamadas antigas que usam só o modelo continuam válidas via
+    # desempacotamento (`model, _ = train(...)`); a interface descarta o
+    # retorno inteiro, então nada quebra ali.
+    return model, best_val
 
 
 if __name__ == "__main__":
@@ -1678,6 +1713,14 @@ Exemplos de uso:
     parser.add_argument("--dropout",        type=float, default=0.20)
     parser.add_argument("--beta",           type=float, default=0.5)
     parser.add_argument("--beta-warmup",    type=int,   default=30)
+    parser.add_argument("--pos-weight",     type=float, default=2.0,
+                        help="Peso do termo de posição na recon loss (default: 2.0)")
+    parser.add_argument("--stop-weight",    type=float, default=1.0,
+                        help="Peso do termo de parada na recon loss (default: 1.0)")
+    parser.add_argument("--weight-decay",   type=float, default=1e-4,
+                        help="Weight decay do AdamW (default: 1e-4)")
+    parser.add_argument("--grad-clip",      type=float, default=0.5,
+                        help="Norma máxima do gradiente (default: 0.5)")
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
@@ -1712,6 +1755,10 @@ Exemplos de uso:
         beta_max=args.beta,
         beta_warmup=args.beta_warmup,
         dropout=args.dropout,
+        pos_weight=args.pos_weight,
+        stop_weight=args.stop_weight,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
         checkpoint_dir=args.checkpoint_dir,
         tensor_dir=args.tensor_dir,
         resume=args.resume,

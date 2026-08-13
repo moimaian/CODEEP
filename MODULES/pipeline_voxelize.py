@@ -321,7 +321,7 @@ VOXEL_CONFIG = {
 
 # Chaves de VOXEL_CONFIG que realmente mudam os VALORES do tensor do sítio
 # (grade/canais 0-4) — únicas que precisam ser reproduzidas EXATAMENTE na
-# geração (Etapa 8) para que o encoder treinado receba um tensor da mesma
+# geração (Etapa 9) para que o encoder treinado receba um tensor da mesma
 # distribuição do treino (ver process_pair/pdb_to_site_tensor). Ficam de
 # fora de propósito: "vox_batch" (só afeta velocidade, não o resultado),
 # "n_site_channels" (constante arquitetural, não é escolha do usuário) e
@@ -342,7 +342,7 @@ def save_voxel_config_snapshot(tensor_dir: "Path | str", config: "dict | None" =
     volta do checkpoint) — fecha o elo que faltava entre "com que config o
     tensor de treino foi construído" e "com que config o tensor de um sítio
     novo precisa ser construído na geração", sem depender do usuário lembrar
-    e repetir manualmente os mesmos valores na Etapa 8 da interface.
+    e repetir manualmente os mesmos valores na Etapa 9 da interface.
     """
     cfg = config if config is not None else VOXEL_CONFIG
     snapshot = {k: cfg[k] for k in VOXEL_CONFIG_TENSOR_KEYS if k in cfg}

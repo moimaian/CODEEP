@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Pipeline - Etapa 6: Diagnóstico e Avaliação do Modelo Treinado
+Pipeline - Etapa 8: Diagnóstico e Avaliação do Modelo Treinado
 ==============================================================
 Verifica a saúde do treinamento e avalia o modelo nos dados de teste.
 

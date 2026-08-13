@@ -371,6 +371,9 @@ PACKAGES_CATALOG: list[tuple] = [
      "Statistical data visualization.",                              False),
     ("scikit-learn",         "sklearn",          "scikit-learn>=1.4",
      "ML metrics and auxiliary models.",                             True),
+    ("Optuna",               "optuna",           "optuna>=3.6",
+     "Hyperparameter optimization (Step 6). Optional: only Step 6 "
+     "needs it.",                                                   False),
     ("RDKit",                "rdkit",            "rdkit",
      "Cheminformatics: SMILES, descriptors, filters.",               True),
     ("BioPython",            "Bio",              "biopython>=1.80",
@@ -548,7 +551,7 @@ QPushButton:pressed { background: #C0392B; color: #FFF; }
 # ==========================================================================
 #
 # Nem toda dependência do CODEEP é um pacote Python. A busca heurística de
-# sítio da Etapa 8 usa o P2Rank, que é um programa Java distribuído como
+# sítio da Etapa 9 usa o P2Rank, que é um programa Java distribuído como
 # tarball. Aqui ele é tratado como cidadão de primeira classe do instalador,
 # em vez de exigir que o usuário siga instruções de linha de comando — que é
 # exatamente a barreira que o CODEEP existe para remover.
@@ -657,7 +660,7 @@ def install_p2rank(version: str = P2RANK_VERSION, log=print) -> bool:
 # (display, key, default_spec, description, auto_installable)
 EXTERNAL_TOOLS: list[tuple] = [
     ("P2Rank", "__p2rank__", P2RANK_VERSION,
-     "Heuristic binding-site search (Step 8). Java program, installed into "
+     "Heuristic binding-site search (Step 9). Java program, installed into "
      "tools/. Requires Java 17+.", True),
     ("Java (JRE)", "__java__", JAVA_INSTALL_HINT,
      f"Required by P2Rank (version {JAVA_MIN_MAJOR} or newer). Needs root: "
@@ -977,7 +980,7 @@ class RequirementsInstaller(QWidget):
             lbl.setText("✅"); lbl.setToolTip(f"Installed at {prank}")
             chk.setChecked(False)
         else:
-            lbl.setText("⚠️"); lbl.setToolTip("Not found — Step 8 heuristic search unavailable")
+            lbl.setText("⚠️"); lbl.setToolTip("Not found — Step 9 heuristic search unavailable")
             chk.setChecked(True)
 
         lbl = self._status["__java__"]

@@ -932,7 +932,7 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
 
     # Busca heurística: o P2Rank determina o centro, então ele substitui
     # qualquer site_center que tenha vindo da interface (os dois campos são
-    # mutuamente exclusivos na Etapa 8, mas a checagem aqui protege o uso
+    # mutuamente exclusivos na Etapa 9, mas a checagem aqui protege o uso
     # programático). O ranking completo fica gravado ao lado dos resultados,
     # para que a escolha do bolso seja auditável depois.
     if heuristic_search and not site_pdb_path:
@@ -954,7 +954,7 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
     # Modelo carregado ANTES do sítio — precisa da voxel_config gravada no
     # checkpoint (ver pipeline_generate.load_model) para resolver com que
     # config REVOXELIZAR esse sítio novo. protonate_site/ph/site_qm_method
-    # (site_config_overrides, vindos da Etapa 8 da interface) só valem
+    # (site_config_overrides, vindos da Etapa 9 da interface) só valem
     # como FALLBACK — para as chaves ausentes do checkpoint, ou quando ele
     # foi treinado antes desta funcionalidade existir; quando o checkpoint
     # tem um valor gravado, ele sempre vence (ver
@@ -1213,6 +1213,11 @@ class MainWindow(QMainWindow):
             app.quit()
 
     def _init_tab_state_specs(self):
+        # Nomes dos hiperparâmetros da Etapa 6 — vêm da mesma fonte que
+        # constrói os widgets (ver _tab_step6), para não haver duas listas
+        # para manter em sincronia.
+        _opt_param_names = sorted(getattr(self, "_opt_param_widgets", {}))
+
         self._tab_state_specs = {
             "step1": [
                 "ed_root", "rb_job_new", "rb_job_load", "cb_prev_job",
@@ -1233,14 +1238,28 @@ class MainWindow(QMainWindow):
                 "sp_vox_batch", "cb_qm_basis", "chk_ecfp4", "cb_vox_phase",
                 "chk_protonate_site", "dsb_site_ph", "cb_site_qm_method",
             ],
+            # Etapa 6: os controles do espaço de busca são gerados a partir de
+            # pipeline_optimize.SEARCH_SPACE_SPEC, então a lista de atributos
+            # também é derivada dele — acrescentar um hiperparâmetro lá passa
+            # a ser salvo/restaurado aqui sem edição manual.
             "step6": [
+                "cb_opt_phase", "sp_opt_trials", "sp_opt_epochs", "dsb_opt_subset",
+                "sp_opt_seed", "sp_opt_min_resource", "sp_opt_reduction",
+                "cb_opt_device", "ed_opt_study", "ed_opt_resume",
+                "chk_opt_freeze_enc", "chk_opt_keep_ckpts", "ed_opt_out",
+            ] + [
+                f"{prefix}_opt_{name}"
+                for name in _opt_param_names
+                for prefix in ("chk", "ed")
+            ],
+            "step7": [
                 "cb_train_phase", "sp_epochs", "sp_batch", "sp_latent", "sp_hidden",
                 "sp_gnn_layers", "dsb_lr", "dsb_beta", "sp_warmup", "dsb_dropout",
                 "sp_patience", "cb_train_device", "ed_resume", "chk_freeze_enc",
                 "ed_ckpt_out",
             ],
-            "step7": ["ed_eval_ckpt", "chk_do_generate", "cb_eval_phase"],
-            "step8": [
+            "step8": ["ed_eval_ckpt", "chk_do_generate", "cb_eval_phase"],
+            "step9": [
                 "cb_gen_phase", "ed_gen_pdb", "ed_gen_site_pdb", "ed_gen_ckpt",
                 "ed_gen_out", "ed_ligand_ref", "sp_n_samples", "dsb_temp",
                 "sp_cutoff_gen", "sp_top_n", "sp_min_atoms_gen", "chk_gen_protonate_site",
@@ -1443,7 +1462,31 @@ class MainWindow(QMainWindow):
         for step_key in self._tab_state_specs:
             self._save_tab_state(step_key)
 
+    @staticmethod
+    def _migrate_tab_state_files(job_dir: str):
+        """Renomeia stepN.json de jobs criados antes da Etapa 6 existir.
+
+        A inserção da otimização de hiperparâmetros empurrou treino/avaliação/
+        geração de 6/7/8 para 7/8/9. Sem esta migração, um job antigo abriria
+        essas três abas com os defaults de fábrica — as configurações não se
+        perderiam (os arquivos continuariam lá), mas sumiriam da interface,
+        o que o usuário leria como perda de dados.
+
+        Renomeia do maior para o menor para não sobrescrever nada, e só
+        quando o destino ainda não existe (jobs já migrados ficam intactos).
+        """
+        for n in (8, 7, 6):
+            src = os.path.join(job_dir, f"step{n}.json")
+            dst = os.path.join(job_dir, f"step{n + 1}.json")
+            if os.path.isfile(src) and not os.path.exists(dst):
+                try:
+                    os.rename(src, dst)
+                    log.info(f"Job migrado: step{n}.json → step{n + 1}.json")
+                except OSError:
+                    pass
+
     def _load_job_state_into_ui(self, job_dir: str):
+        self._migrate_tab_state_files(job_dir)
         self._applying_job_state = True
         try:
             for step_key in self._tab_state_specs:
@@ -1528,7 +1571,7 @@ class MainWindow(QMainWindow):
             "menu_step2", "menu_step3",
             "menu_step4", "menu_step5",
             "menu_step6", "menu_step7",
-            "menu_step8",
+            "menu_step8", "menu_step9",
         ]
         for i, chave in enumerate(menu_keys):
             act = QAction(self)
@@ -1667,6 +1710,7 @@ class MainWindow(QMainWindow):
             (self._tab_step6(), "tab_step6"),
             (self._tab_step7(), "tab_step7"),
             (self._tab_step8(), "tab_step8"),
+            (self._tab_step9(), "tab_step9"),
         ]
         for idx, (page, chave) in enumerate(pages_keys):
             self.tabs.addTab(page, "")
@@ -1931,7 +1975,7 @@ class MainWindow(QMainWindow):
 
         # ── Ferramentas externas (binários, não pacotes pip) ──────────────
         # xtb: níveis de teoria semi-empíricos da voxelização (Etapa 5).
-        # Java + P2Rank: busca heurística de sítio da Etapa 8. O P2Rank
+        # Java + P2Rank: busca heurística de sítio da Etapa 9. O P2Rank
         # exige Java 17+, então a versão do Java é informada junto — um
         # Java 11 com P2Rank instalado falha na execução, e o usuário
         # precisa conseguir ver isso aqui.
@@ -2101,6 +2145,7 @@ class MainWindow(QMainWindow):
             ("home_step6_name", "home_step6_desc"),
             ("home_step7_name", "home_step7_desc"),
             ("home_step8_name", "home_step8_desc"),
+            ("home_step9_name", "home_step9_desc"),
         ]
         for i, (name_key, desc_key) in enumerate(step_keys):
             name_lbl = QLabel()
@@ -2512,7 +2557,7 @@ class MainWindow(QMainWindow):
         _job_p  = _P(job_dir) if job_dir else _root_p
 
         for mod_name in ["pipeline_collect","pipeline_curate","pipeline_explore",
-                         "pipeline_voxelize","pipeline_train",
+                         "pipeline_voxelize","pipeline_optimize","pipeline_train",
                          "pipeline_evaluate","pipeline_generate"]:
             try:
                 mod = importlib.import_module(f"MODULES.{mod_name}")
@@ -2597,9 +2642,15 @@ class MainWindow(QMainWindow):
                     i18n.t("msg_please_start_job", self._idioma))
                 return
             try:
-                fn, args, kwargs = run_fn_getter()
+                spec = run_fn_getter()
             except Exception as e:
                 QMessageBox.critical(w, i18n.t("msg_config_error_title", self._idioma), str(e)); return
+            # run_fn pode retornar None para dizer "o usuário cancelou" — usado
+            # pela Etapa 6, que pergunta antes de rodar quando a estimativa de
+            # disco não fecha. Cancelar não é erro; não abre diálogo nenhum.
+            if spec is None:
+                return
+            fn, args, kwargs = spec
             log_box.clear(); prog.setValue(0)
             btn_run.setEnabled(False); btn_stop.setEnabled(True)
             worker = PipelineWorker(fn, args, kwargs)
@@ -2993,9 +3044,372 @@ class MainWindow(QMainWindow):
         )
 
     # ══════════════════════════════════════════════════════════════════════
-    # TAB 6 — STEP 6: TREINAMENTO
+    # TAB 6 — STEP 6: OTIMIZAÇÃO DE HIPERPARÂMETROS
     # ══════════════════════════════════════════════════════════════════════
     def _tab_step6(self):
+        """Busca de hiperparâmetros (Optuna) — ver MODULES/pipeline_optimize.py.
+
+        O espaço de busca não é escrito à mão aqui: vem de
+        pipeline_optimize.SEARCH_SPACE_SPEC, que é a mesma fonte usada pela
+        linha de comando. Acrescentar um hiperparâmetro lá faz a linha
+        aparecer aqui sozinha, sem tocar na interface.
+        """
+        import MODULES.pipeline_optimize as opt
+
+        params = QWidget()
+        outer  = QVBoxLayout(params); outer.setSpacing(10)
+
+        # ── Orçamento da busca ────────────────────────────────────────────
+        grp_budget = QGroupBox(); grp_budget.setStyleSheet(_SS_GROUPBOX_NO_BG)
+        self._tr("s6_grp_budget", grp_budget.setTitle)
+        bv = QVBoxLayout(grp_budget); bv.setSpacing(8)
+
+        self.cb_opt_phase = QComboBox(); self.cb_opt_phase.addItems(["1", "2", "3"])
+
+        self.sp_opt_trials = QSpinBox()
+        self.sp_opt_trials.setRange(2, 10000); self.sp_opt_trials.setValue(40)
+        self.sp_opt_epochs = QSpinBox()
+        self.sp_opt_epochs.setRange(1, 500);   self.sp_opt_epochs.setValue(15)
+        self.dsb_opt_subset = QDoubleSpinBox()
+        self.dsb_opt_subset.setDecimals(2); self.dsb_opt_subset.setRange(0.01, 1.0)
+        self.dsb_opt_subset.setSingleStep(0.05); self.dsb_opt_subset.setValue(0.20)
+        self.sp_opt_seed = QSpinBox()
+        self.sp_opt_seed.setRange(0, 10 ** 6); self.sp_opt_seed.setValue(42)
+        self.sp_opt_min_resource = QSpinBox()
+        self.sp_opt_min_resource.setRange(1, 100); self.sp_opt_min_resource.setValue(3)
+        self.sp_opt_reduction = QSpinBox()
+        self.sp_opt_reduction.setRange(2, 10); self.sp_opt_reduction.setValue(3)
+        self.cb_opt_device = QComboBox()
+        self.cb_opt_device.addItems(["cuda", "cpu", "cuda:0", "cuda:1"])
+        self.cb_opt_device.setCurrentText(_DEVICE_DEFAULT)
+        self.ed_opt_study = QLineEdit("codeep_hpo")
+
+        self.ed_opt_resume = QLineEdit(); self.ed_opt_resume.setReadOnly(True)
+        self._tr("s6_ph_resume", self.ed_opt_resume.setPlaceholderText)
+        btn_opt_resume = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
+        btn_opt_resume.clicked.connect(self._browse_opt_resume)
+        row_resume = QWidget(); rr = QHBoxLayout(row_resume); rr.setContentsMargins(0,0,0,0)
+        rr.addWidget(self.ed_opt_resume); rr.addWidget(btn_opt_resume)
+
+        self.chk_opt_freeze_enc = QCheckBox()
+        self._tr("s6_chk_freeze_enc", self.chk_opt_freeze_enc.setText)
+        self.chk_opt_keep_ckpts = QCheckBox()
+        self._tr("s6_chk_keep_ckpts", self.chk_opt_keep_ckpts.setText)
+
+        self.ed_opt_out = QLineEdit(); self.ed_opt_out.setReadOnly(True)
+        self.ed_opt_out.setPlaceholderText("hpo/")
+        btn_opt_out = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
+        btn_opt_out.clicked.connect(self._browse_opt_out)
+        row_out = QWidget(); ro = QHBoxLayout(row_out); ro.setContentsMargins(0,0,0,0)
+        ro.addWidget(self.ed_opt_out); ro.addWidget(btn_opt_out)
+
+        # Os nove campos escalares em três colunas lado a lado, preenchidas
+        # por coluna: quantidade da busca | dados e poda | reprodutibilidade
+        # e execução. Os campos largos (retomar de / pasta de saída) e os
+        # checkboxes seguem em linhas de largura total abaixo — espremê-los
+        # numa coluna de um terço deixaria o caminho ilegível.
+        cols_budget = QWidget()
+        bl = QHBoxLayout(cols_budget)
+        bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(22)
+
+        for grupo in (
+            [("s6_lbl_phase",        self.cb_opt_phase),
+             ("s6_lbl_n_trials",     self.sp_opt_trials),
+             ("s6_lbl_trial_epochs", self.sp_opt_epochs)],
+            [("s6_lbl_subset",       self.dsb_opt_subset),
+             ("s6_lbl_min_resource", self.sp_opt_min_resource),
+             ("s6_lbl_reduction",    self.sp_opt_reduction)],
+            [("s6_lbl_seed",         self.sp_opt_seed),
+             ("s6_lbl_device",       self.cb_opt_device),
+             ("s6_lbl_study",        self.ed_opt_study)],
+        ):
+            col_w = QWidget()
+            cf = QFormLayout(col_w)
+            cf.setContentsMargins(0, 0, 0, 0); cf.setSpacing(8)
+            cf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+            for label_key, widget in grupo:
+                widget.setMinimumWidth(105)
+                cf.addRow(self._trL(label_key), widget)
+            bl.addWidget(col_w, 1)
+
+        bv.addWidget(cols_budget)
+
+        bf = QFormLayout(); bf.setSpacing(8)
+        for label_key, widget in [
+            ("s6_lbl_resume",  row_resume),
+            (None,             self.chk_opt_freeze_enc),
+            (None,             self.chk_opt_keep_ckpts),
+            ("s6_lbl_out_dir", row_out),
+        ]:
+            bf.addRow(self._trL(label_key) if label_key else "", widget)
+        bv.addLayout(bf)
+        outer.addWidget(grp_budget)
+
+        # ── Espaço de busca ───────────────────────────────────────────────
+        grp_space = QGroupBox(); grp_space.setStyleSheet(_SS_GROUPBOX_NO_BG)
+        self._tr("s6_grp_space", grp_space.setTitle)
+        sv = QVBoxLayout(grp_space); sv.setSpacing(6)
+
+        note = self._trL("s6_note_space")
+        note.setWordWrap(True); note.setStyleSheet("color:#6E8CA8;font-size:9pt;")
+        sv.addWidget(note)
+
+        #: {nome do hiperparâmetro: (checkbox, caixa de texto)} — consumido
+        #: por run_fn e pelos botões de seleção em massa.
+        self._opt_param_widgets: dict = {}
+
+        # Três colunas lado a lado, uma por prioridade. Os grupos têm 4
+        # hiperparâmetros cada, então as colunas ficam do mesmo tamanho e a
+        # prioridade — que decide o que vem marcado por padrão — passa a ser
+        # lida na horizontal, sem rolagem.
+        cols_row = QWidget()
+        cl = QHBoxLayout(cols_row)
+        cl.setContentsMargins(0, 4, 0, 0); cl.setSpacing(22)
+
+        for prio, prio_key in (("high",   "s6_prio_high"),
+                               ("medium", "s6_prio_medium"),
+                               ("low",    "s6_prio_low")):
+            col_w = QWidget()
+            cv = QVBoxLayout(col_w)
+            cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(4)
+
+            hdr = self._trL(prio_key)
+            hdr.setStyleSheet("font-weight:bold;font-size:9pt;color:#C9D1D9;")
+            cv.addWidget(hdr)
+
+            hdr_row = QWidget()
+            hl = QHBoxLayout(hdr_row); hl.setContentsMargins(0,0,0,0); hl.setSpacing(8)
+            for hdr_key, stretch in (("s6_hdr_param", 1), ("s6_hdr_range", 1)):
+                h = self._trL(hdr_key)
+                h.setStyleSheet("font-size:8pt;color:#6E8CA8;")
+                hl.addWidget(h, stretch)
+            cv.addWidget(hdr_row)
+
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(8); grid.setVerticalSpacing(4)
+            grid.setColumnStretch(1, 1)
+            r = 0
+            for spec in opt.SEARCH_SPACE_SPEC:
+                if spec["priority"] != prio:
+                    continue
+                name = spec["name"]
+                chk = QCheckBox(name)
+                chk.setToolTip(spec["help"])
+                chk.setChecked(name in opt.DEFAULT_SELECTED)
+
+                ed = QLineEdit(opt.format_default(name))
+                ed.setToolTip(spec["help"])
+                ed.setEnabled(chk.isChecked())
+                # Caixa estreita: com três colunas lado a lado, deixá-la
+                # crescer livremente espremeria as colunas vizinhas.
+                ed.setMinimumWidth(105)
+                # A caixa só é editável com o checkbox marcado: um valor
+                # digitado num parâmetro não selecionado seria ignorado
+                # silenciosamente, que é pior do que não deixar digitar.
+                chk.toggled.connect(ed.setEnabled)
+
+                setattr(self, f"chk_opt_{name}", chk)
+                setattr(self, f"ed_opt_{name}",  ed)
+                self._opt_param_widgets[name] = (chk, ed)
+
+                grid.addWidget(chk, r, 0)
+                grid.addWidget(ed,  r, 1)
+                r += 1
+
+            cv.addLayout(grid)
+            cv.addStretch()
+            cl.addWidget(col_w, 1)
+
+        sv.addWidget(cols_row)
+
+        sel_row = QWidget(); sl = QHBoxLayout(sel_row); sl.setContentsMargins(0,6,0,0)
+        btn_all  = self._mk_btn_tr("s6_btn_select_all",     _SS_BTN_SECONDARY, 130)
+        btn_def  = self._mk_btn_tr("s6_btn_select_default", _SS_BTN_SECONDARY, 150)
+        btn_none = self._mk_btn_tr("s6_btn_select_none",    _SS_BTN_SECONDARY, 130)
+        btn_all.clicked.connect(lambda: self._opt_select("all"))
+        btn_def.clicked.connect(lambda: self._opt_select("default"))
+        btn_none.clicked.connect(lambda: self._opt_select("none"))
+        sl.addWidget(btn_all); sl.addWidget(btn_def); sl.addWidget(btn_none)
+        sl.addStretch()
+        btn_disk = self._mk_btn_tr("s6_btn_check_disk", _SS_BTN_SECONDARY, 190)
+        btn_disk.clicked.connect(self._opt_check_disk)
+        sl.addWidget(btn_disk)
+        sv.addWidget(sel_row)
+
+        lbl_obj = self._trL("s6_note_objective")
+        lbl_obj.setWordWrap(True)
+        lbl_obj.setStyleSheet("color:#6E8CA8;font-size:9pt;margin-top:4px;")
+        sv.addWidget(lbl_obj)
+
+        # Aviso de fidelidade: NÃO é fixo. Com fração do dataset e épocas por
+        # trial altas o bastante, cada trial vira um treino completo e a busca
+        # deixa de ser um proxy — dizer "triagem barata" ali seria falso.
+        self.lbl_opt_fidelity = QLabel()
+        self.lbl_opt_fidelity.setWordWrap(True)
+        sv.addWidget(self.lbl_opt_fidelity)
+        self.dsb_opt_subset.valueChanged.connect(self._opt_update_fidelity_note)
+        self.sp_opt_epochs.valueChanged.connect(self._opt_update_fidelity_note)
+        # Refaz o texto também numa troca de idioma.
+        self._tr("s6_note_screen", lambda _t: self._opt_update_fidelity_note())
+        self._opt_update_fidelity_note()
+
+        outer.addWidget(grp_space)
+
+        def run_fn():
+            import MODULES.pipeline_optimize as m
+
+            # O Optuna é opcional no catálogo de dependências — sem esta
+            # checagem o erro só apareceria como ImportError no meio do log
+            # do processo filho, depois de o usuário já ter clicado em Rodar.
+            if importlib.util.find_spec("optuna") is None:
+                raise ValueError(i18n.t("s6_err_optuna_missing", self._idioma))
+
+            root = Path(self.ed_root.text().strip())
+            job  = Path(self.job_dir) if self.job_dir else root
+            phase = self.cb_opt_phase.currentText()
+
+            if phase == "1":
+                tensor_dir = root / "data" / "tensors"
+                default_out = root / "hpo" / "phase1"
+            elif phase == "2":
+                tensor_dir = job / "data" / "tensors" / "phase2"
+                default_out = job / "hpo" / "phase2"
+            else:
+                tensor_dir = job / "data" / "tensors" / "phase3"
+                default_out = job / "hpo" / "phase3"
+
+            if not (tensor_dir / "tensor_index.csv").exists():
+                raise ValueError(i18n.t(
+                    "s6_err_tensor_not_found", self._idioma,
+                    phase=phase, tensor_dir=tensor_dir))
+
+            selected = self._opt_selected_texts()
+            if not selected:
+                # Mensagem traduzida: build_search_space também barra o caso,
+                # mas a exceção dele é só em português (é módulo de pipeline).
+                raise ValueError(i18n.t("s6_err_no_params", self._idioma))
+            space = m.build_search_space(selected)
+            out_dir = Path(self.ed_opt_out.text().strip() or default_out)
+
+            # Estimativa de disco ANTES de gastar horas de GPU. Se não couber,
+            # o usuário decide: seguir mesmo assim ou cancelar.
+            disk = m.check_disk_space(
+                out_dir, space,
+                self.sp_opt_trials.value(), self.sp_opt_epochs.value(),
+                self.chk_opt_keep_ckpts.isChecked(),
+            )
+            if not disk["ok"]:
+                resp = QMessageBox.warning(
+                    self, i18n.t("s6_dlg_disk_title", self._idioma),
+                    disk["message"] + i18n.t("s6_dlg_disk_question", self._idioma),
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if resp != QMessageBox.Yes:
+                    return None      # cancelado — _build_pipeline_tab entende
+
+            return m.optimize, (), dict(
+                tensor_dir=str(tensor_dir),
+                out_dir=str(out_dir),
+                search_space=space,
+                n_trials=self.sp_opt_trials.value(),
+                trial_epochs=self.sp_opt_epochs.value(),
+                subset_frac=self.dsb_opt_subset.value(),
+                seed=self.sp_opt_seed.value(),
+                pruner_min_resource=self.sp_opt_min_resource.value(),
+                pruner_reduction_factor=self.sp_opt_reduction.value(),
+                study_name=self.ed_opt_study.text().strip() or "codeep_hpo",
+                device=self.cb_opt_device.currentText(),
+                keep_all_checkpoints=self.chk_opt_keep_ckpts.isChecked(),
+                resume=self.ed_opt_resume.text().strip() or None,
+                freeze_encoder=self.chk_opt_freeze_enc.isChecked(),
+                skip_disk_check=True,    # já verificado (e confirmado) acima
+            )
+
+        return self._build_pipeline_tab(
+            "title_step6",
+            params, run_fn, "optimize", 5, 7, log_height=300
+        )
+
+    # ── Auxiliares da Etapa 6 ─────────────────────────────────────────────
+    def _opt_selected_texts(self) -> dict:
+        """{nome: texto da faixa} apenas dos hiperparâmetros marcados."""
+        return {name: ed.text().strip()
+                for name, (chk, ed) in self._opt_param_widgets.items()
+                if chk.isChecked()}
+
+    def _opt_select(self, mode: str):
+        """Marca todos / restaura o padrão (alta+média) / desmarca todos."""
+        import MODULES.pipeline_optimize as opt
+        for name, (chk, ed) in self._opt_param_widgets.items():
+            if mode == "all":
+                chk.setChecked(True)
+            elif mode == "none":
+                chk.setChecked(False)
+            else:
+                chk.setChecked(name in opt.DEFAULT_SELECTED)
+                ed.setText(opt.format_default(name))
+
+    def _opt_update_fidelity_note(self):
+        """Troca o aviso da Etapa 6 conforme o orçamento escolhido.
+
+        A classificação vive em pipeline_optimize.fidelity_report(), a mesma
+        que o log da busca usa — interface e log nunca discordam.
+        """
+        lbl = getattr(self, "lbl_opt_fidelity", None)
+        if lbl is None:
+            return
+        import MODULES.pipeline_optimize as opt
+        level = opt.fidelity_report(self.dsb_opt_subset.value(),
+                                    self.sp_opt_epochs.value())["level"]
+        key = {"screen":    "s6_note_screen",
+               "near_full": "s6_note_near_full",
+               "full":      "s6_note_full"}[level]
+        lbl.setText(i18n.t(key, self._idioma))
+        # Orçamento total merece destaque: é o caso em que o usuário pode
+        # gastar semanas de GPU sem perceber.
+        lbl.setStyleSheet(
+            "color:#E3B341;font-size:9pt;margin-top:4px;" if level == "full"
+            else "color:#6E8CA8;font-size:9pt;margin-top:4px;"
+        )
+
+    def _opt_check_disk(self):
+        """Mostra a estimativa de espaço sem iniciar a busca."""
+        import MODULES.pipeline_optimize as opt
+        try:
+            space = opt.build_search_space(self._opt_selected_texts())
+        except ValueError as e:
+            QMessageBox.critical(
+                self, i18n.t("msg_config_error_title", self._idioma), str(e))
+            return
+
+        root = Path(self.ed_root.text().strip() or self.dp_dir)
+        out_dir = Path(self.ed_opt_out.text().strip() or root / "hpo")
+        disk = opt.check_disk_space(
+            out_dir, space,
+            self.sp_opt_trials.value(), self.sp_opt_epochs.value(),
+            self.chk_opt_keep_ckpts.isChecked(),
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle(i18n.t("s6_dlg_disk_title", self._idioma))
+        box.setIcon(QMessageBox.Information if disk["ok"] else QMessageBox.Warning)
+        box.setText(disk["message"])
+        box.exec_()
+
+    def _browse_opt_resume(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, i18n.t("s7_dlg_select_best_model", self._idioma),
+            self.ed_root.text(), "PyTorch (*.pt)")
+        if p: self.ed_opt_resume.setText(p)
+
+    def _browse_opt_out(self):
+        d = QFileDialog.getExistingDirectory(
+            self, i18n.t("s6_dlg_out_dir", self._idioma), self.ed_root.text())
+        if d: self.ed_opt_out.setText(d)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TAB 7 — STEP 7: TREINAMENTO
+    # ══════════════════════════════════════════════════════════════════════
+    def _tab_step7(self):
         params = QWidget(); pf = QFormLayout(params); pf.setSpacing(8)
 
         self.cb_train_phase = QComboBox()
@@ -3028,13 +3442,13 @@ class MainWindow(QMainWindow):
         self.cb_train_device.setCurrentText(_DEVICE_DEFAULT)
 
         # Campo para retomada de treino / fine-tuning
-        self.ed_resume = QLineEdit(); self._tr("s6_ph_resume", self.ed_resume.setPlaceholderText)
+        self.ed_resume = QLineEdit(); self._tr("s7_ph_resume", self.ed_resume.setPlaceholderText)
         self.ed_resume.setReadOnly(True)
         btn_resume = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         resume_row = QWidget(); rl = QHBoxLayout(resume_row); rl.setContentsMargins(0,0,0,0)
         rl.addWidget(self.ed_resume); rl.addWidget(btn_resume)
         btn_resume.clicked.connect(self._browse_resume)
-        self.chk_freeze_enc = QCheckBox(); self._tr("s6_chk_freeze_enc", self.chk_freeze_enc.setText)
+        self.chk_freeze_enc = QCheckBox(); self._tr("s7_chk_freeze_enc", self.chk_freeze_enc.setText)
 
         self.ed_ckpt_out = QLineEdit(); self.ed_ckpt_out.setPlaceholderText("checkpoints/")
         self.ed_ckpt_out.setReadOnly(True)
@@ -3045,20 +3459,20 @@ class MainWindow(QMainWindow):
 
         for label_key, widget in [
             ("lbl_phase",          self.cb_train_phase),
-            ("s6_lbl_epochs",      self.sp_epochs),
-            ("s6_lbl_batch",       self.sp_batch),
-            ("s6_lbl_latent",      self.sp_latent),
-            ("s6_lbl_hidden",      self.sp_hidden),
-            ("s6_lbl_gnn_layers",  self.sp_gnn_layers),
-            ("s6_lbl_lr",          self.dsb_lr),
-            ("s6_lbl_beta_max",    self.dsb_beta),
-            ("s6_lbl_beta_warmup", self.sp_warmup),
-            ("s6_lbl_dropout",     self.dsb_dropout),
-            ("s6_lbl_patience",    self.sp_patience),
-            ("s6_lbl_device",      self.cb_train_device),
-            ("s6_lbl_resume",      resume_row),
+            ("s7_lbl_epochs",      self.sp_epochs),
+            ("s7_lbl_batch",       self.sp_batch),
+            ("s7_lbl_latent",      self.sp_latent),
+            ("s7_lbl_hidden",      self.sp_hidden),
+            ("s7_lbl_gnn_layers",  self.sp_gnn_layers),
+            ("s7_lbl_lr",          self.dsb_lr),
+            ("s7_lbl_beta_max",    self.dsb_beta),
+            ("s7_lbl_beta_warmup", self.sp_warmup),
+            ("s7_lbl_dropout",     self.dsb_dropout),
+            ("s7_lbl_patience",    self.sp_patience),
+            ("s7_lbl_device",      self.cb_train_device),
+            ("s7_lbl_resume",      resume_row),
             (None,                 self.chk_freeze_enc),
-            ("s6_lbl_ckpt_out",    ckpt_row),
+            ("s7_lbl_ckpt_out",    ckpt_row),
         ]:
             pf.addRow(self._trL(label_key) if label_key else "", widget)
 
@@ -3110,7 +3524,7 @@ class MainWindow(QMainWindow):
 
             if not (tensor_dir / "tensor_index.csv").exists():
                 raise ValueError(i18n.t(
-                    "s6_err_tensor_not_found", self._idioma,
+                    "s7_err_tensor_not_found", self._idioma,
                     phase=phase, tensor_dir=tensor_dir))
 
             return m.train, (), dict(
@@ -3132,13 +3546,13 @@ class MainWindow(QMainWindow):
             )
 
         return self._build_pipeline_tab(
-            "title_step6",
-            params, run_fn, "train", 5, 7, log_height=320
+            "title_step7",
+            params, run_fn, "train", 6, 8, log_height=320
         )
 
     def _browse_resume(self):
         p, _ = QFileDialog.getOpenFileName(
-            self, i18n.t("s6_dlg_select_best_model", self._idioma),
+            self, i18n.t("s7_dlg_select_best_model", self._idioma),
             self.ed_root.text(), "PyTorch (*.pt)")
         if p: self.ed_resume.setText(p)
 
@@ -3150,7 +3564,7 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
     # TAB 7 — STEP 7: AVALIAÇÃO
     # ══════════════════════════════════════════════════════════════════════
-    def _tab_step7(self):
+    def _tab_step8(self):
         params = QWidget(); pf = QFormLayout(params); pf.setSpacing(10)
 
         self.ed_eval_ckpt = QLineEdit(); self.ed_eval_ckpt.setReadOnly(True)
@@ -3160,23 +3574,23 @@ class MainWindow(QMainWindow):
         eck_row = QWidget(); el = QHBoxLayout(eck_row); el.setContentsMargins(0,0,0,0)
         el.addWidget(self.ed_eval_ckpt); el.addWidget(btn_eval_ckpt)
         self.chk_do_generate = QCheckBox()
-        self._tr("s7_chk_do_generate", self.chk_do_generate.setText)
+        self._tr("s8_chk_do_generate", self.chk_do_generate.setText)
 
-        pf.addRow(self._trL("s7_lbl_checkpoints"), eck_row)
+        pf.addRow(self._trL("s8_lbl_checkpoints"), eck_row)
         pf.addRow("",             self.chk_do_generate)
 
         # Botões de visualização de figuras — a chave (não o texto) é capturada na lambda, para
         # que o título repassado a _view_eval_fig reflita o idioma ATUAL no momento do clique,
         # não o idioma vigente quando o botão foi criado.
         vis_row = QWidget(); vl = QHBoxLayout(vis_row); vl.setContentsMargins(0,0,0,0)
-        for name_key, stem in [("s7_btn_training_curves", "training_curves"),
-                                ("s7_btn_performance_report", "performance_report")]:
+        for name_key, stem in [("s8_btn_training_curves", "training_curves"),
+                                ("s8_btn_performance_report", "performance_report")]:
             b = self._mk_btn_tr(name_key, _SS_BTN_SECONDARY, 180)
             b.clicked.connect(
                 lambda _, s=stem, k=name_key: self._view_eval_fig(s, i18n.t(k, self._idioma))
             )
             vl.addWidget(b)
-        pf.addRow(self._trL("s7_lbl_figures"), vis_row)
+        pf.addRow(self._trL("s8_lbl_figures"), vis_row)
 
         self.cb_eval_phase = QComboBox()
         self.cb_eval_phase.addItems(["1", "2", "3"])
@@ -3210,8 +3624,8 @@ class MainWindow(QMainWindow):
             }
 
         return self._build_pipeline_tab(
-            "title_step7",
-            params, run_fn, "evaluate", 6, 8
+            "title_step8",
+            params, run_fn, "evaluate", 7, 9
         )
 
     def _browse_eval_ckpt(self):
@@ -3222,19 +3636,19 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
     # TAB 8 — STEP 8: GERAÇÃO
     # ══════════════════════════════════════════════════════════════════════
-    def _tab_step8(self):
+    def _tab_step9(self):
         params = QWidget(); pf = QFormLayout(params); pf.setSpacing(10)
         self.cb_gen_phase = QComboBox()
         self.cb_gen_phase.addItems(["1", "2", "3"])
         self.ed_gen_pdb = QLineEdit(); self.ed_gen_pdb.setReadOnly(True)
-        self._tr("s8_ph_pdb", self.ed_gen_pdb.setPlaceholderText)
+        self._tr("s9_ph_pdb", self.ed_gen_pdb.setPlaceholderText)
         btn_pdb = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_pdb.clicked.connect(self._browse_gen_pdb)
         pdb_row = QWidget(); pl = QHBoxLayout(pdb_row); pl.setContentsMargins(0,0,0,0)
         pl.addWidget(self.ed_gen_pdb); pl.addWidget(btn_pdb)
 
         self.ed_gen_site_pdb = QLineEdit(); self.ed_gen_site_pdb.setReadOnly(True)
-        self._tr("s8_ph_site_pdb", self.ed_gen_site_pdb.setPlaceholderText)
+        self._tr("s9_ph_site_pdb", self.ed_gen_site_pdb.setPlaceholderText)
         btn_site_pdb = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_site_pdb.clicked.connect(self._browse_gen_site_pdb)
         site_pdb_row = QWidget(); spl = QHBoxLayout(site_pdb_row); spl.setContentsMargins(0,0,0,0)
@@ -3248,14 +3662,14 @@ class MainWindow(QMainWindow):
         gl2.addWidget(self.ed_gen_ckpt); gl2.addWidget(btn_gc)
 
         self.ed_gen_out = QLineEdit(); self.ed_gen_out.setReadOnly(True)
-        self._tr("s8_ph_out", self.ed_gen_out.setPlaceholderText)
+        self._tr("s9_ph_out", self.ed_gen_out.setPlaceholderText)
         btn_gout = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_gout.clicked.connect(self._browse_gen_out)
         gout_row = QWidget(); gl3 = QHBoxLayout(gout_row); gl3.setContentsMargins(0,0,0,0)
         gl3.addWidget(self.ed_gen_out); gl3.addWidget(btn_gout)
 
         self.ed_ligand_ref = QLineEdit(); self.ed_ligand_ref.setReadOnly(True)
-        self._tr("s8_ph_ligand_ref", self.ed_ligand_ref.setPlaceholderText)
+        self._tr("s9_ph_ligand_ref", self.ed_ligand_ref.setPlaceholderText)
         btn_ref = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_ref.clicked.connect(self._browse_ligand_ref)
         ref_row = QWidget(); rl2 = QHBoxLayout(ref_row); rl2.setContentsMargins(0,0,0,0)
@@ -3282,8 +3696,8 @@ class MainWindow(QMainWindow):
             _sp.setSingleStep(0.5)
 
         self.chk_use_site_center = QCheckBox()
-        self._tr("s8_chk_use_site_center", self.chk_use_site_center.setText)
-        self._tr("s8_tooltip_site_center", self.chk_use_site_center.setToolTip)
+        self._tr("s9_chk_use_site_center", self.chk_use_site_center.setText)
+        self._tr("s9_tooltip_site_center", self.chk_use_site_center.setToolTip)
         self.chk_use_site_center.setChecked(False)
 
         center_row = QWidget()
@@ -3295,16 +3709,16 @@ class MainWindow(QMainWindow):
         self.dsb_site_radius = QDoubleSpinBox()
         self.dsb_site_radius.setDecimals(1); self.dsb_site_radius.setRange(4.0, 25.0)
         self.dsb_site_radius.setValue(10.0); self.dsb_site_radius.setSingleStep(0.5)
-        self._tr("s8_tooltip_site_radius", self.dsb_site_radius.setToolTip)
+        self._tr("s9_tooltip_site_radius", self.dsb_site_radius.setToolTip)
 
         self.chk_heuristic_search = QCheckBox()
-        self._tr("s8_chk_heuristic_search", self.chk_heuristic_search.setText)
-        self._tr("s8_tooltip_heuristic_search", self.chk_heuristic_search.setToolTip)
+        self._tr("s9_chk_heuristic_search", self.chk_heuristic_search.setText)
+        self._tr("s9_tooltip_heuristic_search", self.chk_heuristic_search.setToolTip)
         self.chk_heuristic_search.setChecked(False)
 
         self.sp_pocket_rank = QSpinBox()
         self.sp_pocket_rank.setRange(1, 20); self.sp_pocket_rank.setValue(1)
-        self._tr("s8_tooltip_pocket_rank", self.sp_pocket_rank.setToolTip)
+        self._tr("s9_tooltip_pocket_rank", self.sp_pocket_rank.setToolTip)
 
         def _sync_site_mode():
             """Mantém os três modos de definição de sítio mutuamente exclusivos."""
@@ -3339,7 +3753,7 @@ class MainWindow(QMainWindow):
         # aviso no log se os dois divergirem) — não é mais possível gerar
         # com um mismatch treino↔inferência por engano nestes 4 campos.
         self.chk_gen_protonate_site = QCheckBox()
-        self._tr("s8_chk_protonate_site", self.chk_gen_protonate_site.setText)
+        self._tr("s9_chk_protonate_site", self.chk_gen_protonate_site.setText)
         self.chk_gen_protonate_site.setChecked(True)
         self.dsb_gen_ph = QDoubleSpinBox()
         self.dsb_gen_ph.setDecimals(1); self.dsb_gen_ph.setRange(0.0, 14.0)
@@ -3348,53 +3762,53 @@ class MainWindow(QMainWindow):
             ["qm_method_rhf_fragments", "qm_method_gfn_xtb_fragments",
              "qm_method_heuristic"]
         )
-        self._tr("s8_tooltip_gen_qm_method", self.cb_gen_site_qm_method.setToolTip)
+        self._tr("s9_tooltip_gen_qm_method", self.cb_gen_site_qm_method.setToolTip)
         self._GEN_SITE_QM_METHOD_VALUES = [
             "rhf_sto3g_fragments", "gfn_xtb_fragments", "heuristic",
         ]
         # qm_basis (base do RHF/STO-3G por resíduo) — antes desta correção
-        # não existia NENHUM controle equivalente na Etapa 8: a geração
+        # não existia NENHUM controle equivalente na Etapa 9: a geração
         # sempre usava o default "sto-3g" do módulo, mesmo que o treino
         # tivesse usado 3-21g/6-31g, sem nenhum aviso. Continua valendo só
         # como fallback (mesma regra acima).
         self.cb_gen_qm_basis = QComboBox()
         self.cb_gen_qm_basis.addItems(["sto-3g", "3-21g", "6-31g"])
-        self._tr("s8_tooltip_gen_qm_basis", self.cb_gen_qm_basis.setToolTip)
+        self._tr("s9_tooltip_gen_qm_basis", self.cb_gen_qm_basis.setToolTip)
 
         # ── FF de geometria final (minimização conjunta ligante+sítio) ───────
         self.cb_final_ff = self._mk_combo_tr(["ff_mmff_uff", "ff_amber_ff14sb", "ff_charmm36"])
         self.cb_final_ff.setCurrentIndex(0)   # MMFF/UFF — mais simples/rápido, pré-selecionado
-        self._tr("s8_tooltip_final_ff", self.cb_final_ff.setToolTip)
+        self._tr("s9_tooltip_final_ff", self.cb_final_ff.setToolTip)
         self._FINAL_FF_VALUES = ["mmff_uff", "amber_ff14sb", "charmm36"]
 
         # ── Induced-fit: backbone travado, cadeia lateral livre ──────────────
         self.chk_induced_fit = QCheckBox()
-        self._tr("s8_chk_induced_fit", self.chk_induced_fit.setText)
+        self._tr("s9_chk_induced_fit", self.chk_induced_fit.setText)
         self.chk_induced_fit.setChecked(False)   # desmarcado por padrão — sítio rígido
-        self._tr("s8_tooltip_induced_fit", self.chk_induced_fit.setToolTip)
+        self._tr("s9_tooltip_induced_fit", self.chk_induced_fit.setToolTip)
 
         for label_key, widget in [
-            ("s8_lbl_model_phase",   self.cb_gen_phase),
-            ("s8_lbl_protein_pdb",   pdb_row),
-            ("s8_lbl_site_pdb",      site_pdb_row),
-            ("s7_lbl_checkpoints",   gc_row),
-            ("s8_lbl_output",        gout_row),
-            ("s8_lbl_ref_ligand",    ref_row),
-            ("s8_lbl_n_samples",     self.sp_n_samples),
-            ("s8_lbl_temperature",   self.dsb_temp),
-            ("s8_lbl_cutoff",        self.sp_cutoff_gen),
-            ("s8_lbl_top_n",         self.sp_top_n),
-            ("s8_lbl_min_atoms",     self.sp_min_atoms_gen),
+            ("s9_lbl_model_phase",   self.cb_gen_phase),
+            ("s9_lbl_protein_pdb",   pdb_row),
+            ("s9_lbl_site_pdb",      site_pdb_row),
+            ("s8_lbl_checkpoints",   gc_row),
+            ("s9_lbl_output",        gout_row),
+            ("s9_lbl_ref_ligand",    ref_row),
+            ("s9_lbl_n_samples",     self.sp_n_samples),
+            ("s9_lbl_temperature",   self.dsb_temp),
+            ("s9_lbl_cutoff",        self.sp_cutoff_gen),
+            ("s9_lbl_top_n",         self.sp_top_n),
+            ("s9_lbl_min_atoms",     self.sp_min_atoms_gen),
             (None,                   self.chk_use_site_center),
-            ("s8_lbl_site_center",   center_row),
-            ("s8_lbl_site_radius",   self.dsb_site_radius),
+            ("s9_lbl_site_center",   center_row),
+            ("s9_lbl_site_radius",   self.dsb_site_radius),
             (None,                   self.chk_heuristic_search),
-            ("s8_lbl_pocket_rank",   self.sp_pocket_rank),
+            ("s9_lbl_pocket_rank",   self.sp_pocket_rank),
             (None,                   self.chk_gen_protonate_site),
             ("s5_lbl_site_ph",       self.dsb_gen_ph),
             ("s5_lbl_site_qm_method", self.cb_gen_site_qm_method),
             ("s5_lbl_qm_basis",      self.cb_gen_qm_basis),
-            ("s8_lbl_final_ff",      self.cb_final_ff),
+            ("s9_lbl_final_ff",      self.cb_final_ff),
             (None,                   self.chk_induced_fit),
         ]:
             pf.addRow(self._trL(label_key) if label_key else "", widget)
@@ -3402,21 +3816,21 @@ class MainWindow(QMainWindow):
         def run_fn():
             pdb = self.ed_gen_pdb.text().strip()
             if not pdb or not os.path.isfile(pdb):
-                raise ValueError(i18n.t("s8_err_invalid_pdb", self._idioma))
+                raise ValueError(i18n.t("s9_err_invalid_pdb", self._idioma))
             site_pdb = self.ed_gen_site_pdb.text().strip() or None
             if site_pdb and not os.path.isfile(site_pdb):
-                raise ValueError(i18n.t("s8_err_invalid_site_pdb", self._idioma))
+                raise ValueError(i18n.t("s9_err_invalid_site_pdb", self._idioma))
 
             heur = self.chk_heuristic_search.isChecked()
             usa_centro = self.chk_use_site_center.isChecked() and not heur
             # site_pdb já delimita o bolso; centro ou busca seriam ignorados
             # silenciosamente, então avisa em vez de deixar passar.
             if site_pdb and (heur or usa_centro):
-                raise ValueError(i18n.t("s8_err_site_conflict", self._idioma))
+                raise ValueError(i18n.t("s9_err_site_conflict", self._idioma))
             centro = ((self.dsb_site_x.value(), self.dsb_site_y.value(),
                        self.dsb_site_z.value()) if usa_centro else None)
             if usa_centro and centro == (0.0, 0.0, 0.0):
-                raise ValueError(i18n.t("s8_err_center_zero", self._idioma))
+                raise ValueError(i18n.t("s9_err_center_zero", self._idioma))
             root   = self.ed_root.text().strip()
             phase = self.cb_gen_phase.currentText()
             if phase == "1":
@@ -3427,7 +3841,7 @@ class MainWindow(QMainWindow):
                 ckpt = self.ed_gen_ckpt.text().strip() or str(Path(self.job_dir) / "checkpoints" / "phase3")
 
             if not (Path(ckpt) / "best_model.pt").exists():
-                raise ValueError(i18n.t("s8_err_no_checkpoint", self._idioma, phase=phase))
+                raise ValueError(i18n.t("s9_err_no_checkpoint", self._idioma, phase=phase))
             out    = self.ed_gen_out.text().strip() or None
             ref    = self.ed_ligand_ref.text().strip() or None
             from pathlib import Path as _P
@@ -3462,19 +3876,19 @@ class MainWindow(QMainWindow):
             )
 
         return self._build_pipeline_tab(
-            "title_step8",
-            params, run_fn, "generate", 7, 0, log_height=260
+            "title_step9",
+            params, run_fn, "generate", 8, 0, log_height=260
         )
 
     def _browse_gen_pdb(self):
         p, _ = QFileDialog.getOpenFileName(
-            self, i18n.t("s8_dlg_select_pdb", self._idioma), self.ed_root.text(), "PDB (*.pdb)")
+            self, i18n.t("s9_dlg_select_pdb", self._idioma), self.ed_root.text(), "PDB (*.pdb)")
         if p: self.ed_gen_pdb.setText(p)
 
     def _browse_gen_site_pdb(self):
         p, _ = QFileDialog.getOpenFileName(
             self,
-            i18n.t("s8_dlg_select_site_pdb", self._idioma),
+            i18n.t("s9_dlg_select_site_pdb", self._idioma),
             self.ed_root.text(),
             "PDB (*.pdb)",
         )
@@ -3492,12 +3906,12 @@ class MainWindow(QMainWindow):
 
     def _browse_gen_out(self):
         d = QFileDialog.getExistingDirectory(
-            self, i18n.t("s8_dlg_output_folder", self._idioma), self.ed_root.text())
+            self, i18n.t("s9_dlg_output_folder", self._idioma), self.ed_root.text())
         if d: self.ed_gen_out.setText(d)
 
     def _browse_ligand_ref(self):
         p, _ = QFileDialog.getOpenFileName(
-            self, i18n.t("s8_dlg_reference_ligand", self._idioma),
+            self, i18n.t("s9_dlg_reference_ligand", self._idioma),
             self.ed_root.text(), "Ligand files (*.sdf *.pdb *.mol2)")
         if p: self.ed_ligand_ref.setText(p)
 
@@ -3566,7 +3980,7 @@ class MainWindow(QMainWindow):
         )
 
     def _view_eval_fig(self, stem: str, title: str):
-        """Abre figura de avaliação da fase selecionada no Step 7."""
+        """Abre figura de avaliação da fase selecionada no Step 8."""
         phase = self.cb_eval_phase.currentText()
         root  = Path(self.ed_root.text().strip())
         job   = Path(self.job_dir) if self.job_dir else root

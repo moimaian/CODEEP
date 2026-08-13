@@ -55,9 +55,10 @@ _TEXTOS = {
     "menu_step3": {"en": "Step 3 – Curation", "pt": "Etapa 3 – Curadoria"},
     "menu_step4": {"en": "Step 4 – Exploration", "pt": "Etapa 4 – Exploração"},
     "menu_step5": {"en": "Step 5 – Voxelization", "pt": "Etapa 5 – Voxelização"},
-    "menu_step6": {"en": "Step 6 – Training", "pt": "Etapa 6 – Treinamento"},
-    "menu_step7": {"en": "Step 7 – Evaluation", "pt": "Etapa 7 – Avaliação"},
-    "menu_step8": {"en": "Step 8 – Generation", "pt": "Etapa 8 – Geração"},
+    "menu_step6": {"en": "Step 6 – Hyperparameters", "pt": "Etapa 6 – Hiperparâmetros"},
+    "menu_step7": {"en": "Step 7 – Training", "pt": "Etapa 7 – Treinamento"},
+    "menu_step8": {"en": "Step 8 – Evaluation", "pt": "Etapa 8 – Avaliação"},
+    "menu_step9": {"en": "Step 9 – Generation", "pt": "Etapa 9 – Geração"},
     "menu_exit": {"en": "Exit", "pt": "Sair"},
     "menu_help": {"en": "Help", "pt": "Ajuda"},
     "menu_install_requirements": {"en": "Install Requirements", "pt": "Instalar Dependências"},
@@ -74,6 +75,7 @@ _TEXTOS = {
     "tab_step6": {"en": "Step 6", "pt": "Etapa 6"},
     "tab_step7": {"en": "Step 7", "pt": "Etapa 7"},
     "tab_step8": {"en": "Step 8", "pt": "Etapa 8"},
+    "tab_step9": {"en": "Step 9", "pt": "Etapa 9"},
 
     # ---------------------------------------------------------------- HW monitor (top-right corner)
     # Monitor num PROCESSO separado (ver MODULES/hw_monitor_window.py), mesmo padrão do CODRUG —
@@ -82,10 +84,10 @@ _TEXTOS = {
     "btn_cpu_gpu_monitor": {"en": "CPU/GPU Monitor", "pt": "Monitor de CPU/GPU"},
     "tooltip_cpu_gpu_monitor": {
         "en": "Open a separate CPU/GPU monitor window that keeps updating even while the main "
-              "window is busy running a heavy task (e.g. Step 6 Training or Step 8 Generation).",
+              "window is busy running a heavy task (e.g. Step 7 Training or Step 9 Generation).",
         "pt": "Abre uma janela separada de monitor de CPU/GPU que continua atualizando mesmo "
-              "quando a janela principal estiver ocupada rodando uma tarefa pesada (ex.: Etapa 6 "
-              "Treinamento ou Etapa 8 Geração).",
+              "quando a janela principal estiver ocupada rodando uma tarefa pesada (ex.: Etapa 7 "
+              "Treinamento ou Etapa 9 Geração).",
     },
     "msg_title_monitor": {"en": "Monitor", "pt": "Monitor"},
     "msg_title_monitor_error": {"en": "Monitor error", "pt": "Erro no monitor"},
@@ -132,18 +134,26 @@ _TEXTOS = {
         "en": "3D tensors + molecular graphs (PyG)",
         "pt": "Tensores 3D + grafos moleculares (PyG)",
     },
-    "home_step6_name": {"en": "Step 6 – Training", "pt": "Etapa 6 – Treinamento"},
+    "home_step6_name": {
+        "en": "Step 6 – Hyperparameter optimization",
+        "pt": "Etapa 6 – Otimização de hiperparâmetros",
+    },
     "home_step6_desc": {
+        "en": "Optuna search on a cheap data subset (optional)",
+        "pt": "Busca com Optuna em um subconjunto barato dos dados (opcional)",
+    },
+    "home_step7_name": {"en": "Step 7 – Training", "pt": "Etapa 7 – Treinamento"},
+    "home_step7_desc": {
         "en": "CVAE: 3D-CNN encoder + GNN decoder",
         "pt": "CVAE: encoder 3D-CNN + decoder GNN",
     },
-    "home_step7_name": {"en": "Step 7 – Evaluation", "pt": "Etapa 7 – Avaliação"},
-    "home_step7_desc": {
+    "home_step8_name": {"en": "Step 8 – Evaluation", "pt": "Etapa 8 – Avaliação"},
+    "home_step8_desc": {
         "en": "Diagnostics, metrics and training curves",
         "pt": "Diagnósticos, métricas e curvas de treinamento",
     },
-    "home_step8_name": {"en": "Step 8 – Generation", "pt": "Etapa 8 – Geração"},
-    "home_step8_desc": {
+    "home_step9_name": {"en": "Step 9 – Generation", "pt": "Etapa 9 – Geração"},
+    "home_step9_desc": {
         "en": "Ligand candidates for a target protein",
         "pt": "Candidatos a ligante para uma proteína-alvo",
     },
@@ -490,75 +500,189 @@ _TEXTOS = {
         "en": "Site channels 3-4 method:", "pt": "Método dos canais 3-4 do sítio:",
     },
 
-    # ---------------------------------------------------------------- STEP 6 — Training
-    "title_step6": {"en": "Step 6 — CVAE / GNN Training", "pt": "Etapa 6 — Treinamento CVAE / GNN"},
-    "s6_lbl_epochs": {"en": "Epochs:", "pt": "Épocas:"},
-    "s6_lbl_batch": {"en": "Batch size:", "pt": "Tamanho do lote:"},
-    "s6_lbl_latent": {"en": "Latent dim:", "pt": "Dim. latente:"},
-    "s6_lbl_hidden": {"en": "Hidden dim:", "pt": "Dim. oculta:"},
-    "s6_lbl_gnn_layers": {"en": "GNN layers:", "pt": "Camadas GNN:"},
-    "s6_lbl_lr": {"en": "Learning rate:", "pt": "Taxa de aprendizado:"},
-    "s6_lbl_beta_max": {"en": "Beta KL (max):", "pt": "Beta KL (máx.):"},
-    "s6_lbl_beta_warmup": {"en": "Beta warmup:", "pt": "Beta warmup:"},
-    "s6_lbl_dropout": {"en": "Dropout:", "pt": "Dropout:"},
-    "s6_lbl_patience": {"en": "Patience:", "pt": "Paciência:"},
+    # ---------------------------------------------------------------- STEP 6 — Hyperparameter optimization
+    "title_step6": {
+        "en": "Step 6 — Hyperparameter optimization",
+        "pt": "Etapa 6 — Otimização de hiperparâmetros",
+    },
+    "s6_grp_budget": {"en": "Search budget", "pt": "Orçamento da busca"},
+    "s6_grp_space": {"en": "Search space", "pt": "Espaço de busca"},
+    "s6_lbl_phase": {"en": "Phase (dataset):", "pt": "Fase (dataset):"},
+    "s6_lbl_n_trials": {"en": "Trials:", "pt": "Trials:"},
+    "s6_lbl_trial_epochs": {"en": "Epochs per trial:", "pt": "Épocas por trial:"},
+    "s6_lbl_subset": {"en": "Dataset fraction:", "pt": "Fração do dataset:"},
+    "s6_lbl_seed": {"en": "Seed:", "pt": "Semente:"},
+    "s6_lbl_min_resource": {"en": "ASHA min. epochs:", "pt": "ASHA — épocas mínimas:"},
+    "s6_lbl_reduction": {"en": "ASHA reduction factor:", "pt": "ASHA — fator de redução:"},
+    "s6_lbl_study": {"en": "Study name:", "pt": "Nome do estudo:"},
     "s6_lbl_device": {"en": "Device:", "pt": "Dispositivo:"},
+    "s6_lbl_out_dir": {"en": "Output folder:", "pt": "Pasta de saída:"},
     "s6_lbl_resume": {"en": "Resume from:", "pt": "Retomar de:"},
-    "s6_lbl_ckpt_out": {"en": "Save ckpt to:", "pt": "Salvar checkpoint em:"},
     "s6_ph_resume": {
-        "en": "optional — best_model.pt from previous phase",
-        "pt": "opcional — best_model.pt da fase anterior",
+        "en": "optional — best_model.pt, to tune fine-tuning (Phases 2/3)",
+        "pt": "opcional — best_model.pt, para otimizar fine-tuning (Fases 2/3)",
     },
     "s6_chk_freeze_enc": {
         "en": "Freeze encoder (Phase 3 fine-tuning)",
         "pt": "Congelar encoder (fine-tuning da Fase 3)",
     },
-    "s6_dlg_select_best_model": {"en": "Select best_model.pt", "pt": "Selecione best_model.pt"},
+    "s6_chk_keep_ckpts": {
+        "en": "Keep checkpoints from every trial (uses much more disk)",
+        "pt": "Manter checkpoints de todos os trials (consome muito mais disco)",
+    },
+    "s6_btn_check_disk": {"en": "Estimate disk usage", "pt": "Estimar espaço em disco"},
+    "s6_btn_select_all": {"en": "Select all", "pt": "Marcar todos"},
+    "s6_btn_select_default": {"en": "Restore defaults", "pt": "Restaurar padrões"},
+    "s6_btn_select_none": {"en": "Clear all", "pt": "Desmarcar todos"},
+    "s6_hdr_param": {"en": "Hyperparameter", "pt": "Hiperparâmetro"},
+    "s6_hdr_range": {"en": "Range / options", "pt": "Faixa / opções"},
+    "s6_prio_high": {"en": "High priority", "pt": "Alta prioridade"},
+    "s6_prio_medium": {"en": "Medium priority", "pt": "Média prioridade"},
+    "s6_prio_low": {"en": "Low priority", "pt": "Baixa prioridade"},
+    "s6_note_space": {
+        "en": "Ranges: 'min,max' for continuous/integer parameters; a list of "
+              "values for categorical ones. High and medium priority come "
+              "pre-selected.",
+        "pt": "Faixas: 'mín,máx' para parâmetros contínuos/inteiros; lista de "
+              "valores para os categóricos. Alta e média prioridade já vêm "
+              "marcadas.",
+    },
+    "s6_note_objective": {
+        "en": "Objective: val_recon whenever beta_max or beta_warmup is in the "
+              "search space (val_total = recon + β·KL would reward a smaller β "
+              "instead of a better model), val_total otherwise.",
+        "pt": "Objetivo: val_recon sempre que beta_max ou beta_warmup estiver "
+              "no espaço de busca (val_total = recon + β·KL premiaria um β "
+              "menor, não um modelo melhor), val_total caso contrário.",
+    },
+    # Aviso de fidelidade — trocado ao vivo conforme a fração do dataset e as
+    # épocas por trial (ver _opt_update_fidelity_note em CODEEP.py). Com
+    # orçamento total a busca deixa de ser proxy e mandar repetir o treino na
+    # Etapa 7 seria mandar refazer o que já foi feito.
+    "s6_note_screen": {
+        "en": "With this budget the search is a PROXY: the ranking comes from "
+              "a subset and/or from early epochs. Use it to shortlist 2-3 "
+              "configurations, then confirm them with a full training run in "
+              "Step 7.",
+        "pt": "Com este orçamento a busca é um PROXY: o ranking vem de um "
+              "subconjunto e/ou de épocas iniciais. Use-a para selecionar 2-3 "
+              "configurações e confirme-as com um treino completo na Etapa 7.",
+    },
+    "s6_note_near_full": {
+        "en": "Full dataset, but a reduced epoch budget: the ranking is "
+              "reliable on data and approximate on convergence. Confirm the "
+              "top configurations with a full-length run in Step 7.",
+        "pt": "Dataset completo, mas orçamento de épocas reduzido: o ranking é "
+              "confiável quanto aos dados e aproximado quanto à convergência. "
+              "Confirme as melhores com um treino de duração completa na "
+              "Etapa 7.",
+    },
+    "s6_note_full": {
+        "en": "With this budget every trial is a COMPLETE training run — this "
+              "is a direct comparison, not a screen, and Step 7 need not be "
+              "repeated. Beware the cost (trials × epochs) and note that ASHA "
+              "still prunes on early epochs. Only the objective gap remains: "
+              "compare by the generation metrics of Steps 8-9, not by loss.",
+        "pt": "Com este orçamento cada trial é um treino COMPLETO — isto é uma "
+              "comparação direta, não uma triagem, e não é preciso repetir a "
+              "Etapa 7. Atenção ao custo (trials × épocas) e ao fato de o ASHA "
+              "ainda podar nas épocas iniciais. Resta só a lacuna de objetivo: "
+              "compare pelas métricas de geração das Etapas 8-9, não pela loss.",
+    },
+    "s6_dlg_out_dir": {"en": "Optimization output folder", "pt": "Pasta de saída da otimização"},
+    "s6_dlg_disk_title": {"en": "Disk space estimate", "pt": "Estimativa de espaço em disco"},
+    "s6_dlg_disk_question": {
+        "en": "\n\nRun the optimization anyway?",
+        "pt": "\n\nExecutar a otimização mesmo assim?",
+    },
+    "s6_err_no_params": {
+        "en": "No hyperparameter selected — tick at least one checkbox to "
+              "define the search space.",
+        "pt": "Nenhum hiperparâmetro selecionado — marque ao menos um "
+              "checkbox para definir o espaço de busca.",
+    },
     "s6_err_tensor_not_found": {
         "en": "Tensor dataset not found for Phase {phase}: {tensor_dir}",
         "pt": "Dataset de tensores não encontrado para a Fase {phase}: {tensor_dir}",
     },
-
-    # ---------------------------------------------------------------- STEP 7 — Evaluation
-    "title_step7": {
-        "en": "Step 7 — Trained Model Evaluation", "pt": "Etapa 7 — Avaliação do Modelo Treinado",
+    "s6_err_optuna_missing": {
+        "en": "Optuna is not installed. Install it with:\n\n"
+              "    pip install optuna\n\n"
+              "or use Help → Install Requirements.",
+        "pt": "O Optuna não está instalado. Instale com:\n\n"
+              "    pip install optuna\n\n"
+              "ou use Ajuda → Instalar Dependências.",
     },
-    "s7_chk_do_generate": {
+
+    # ---------------------------------------------------------------- STEP 7 — Training
+    "title_step7": {"en": "Step 7 — CVAE / GNN Training", "pt": "Etapa 7 — Treinamento CVAE / GNN"},
+    "s7_lbl_epochs": {"en": "Epochs:", "pt": "Épocas:"},
+    "s7_lbl_batch": {"en": "Batch size:", "pt": "Tamanho do lote:"},
+    "s7_lbl_latent": {"en": "Latent dim:", "pt": "Dim. latente:"},
+    "s7_lbl_hidden": {"en": "Hidden dim:", "pt": "Dim. oculta:"},
+    "s7_lbl_gnn_layers": {"en": "GNN layers:", "pt": "Camadas GNN:"},
+    "s7_lbl_lr": {"en": "Learning rate:", "pt": "Taxa de aprendizado:"},
+    "s7_lbl_beta_max": {"en": "Beta KL (max):", "pt": "Beta KL (máx.):"},
+    "s7_lbl_beta_warmup": {"en": "Beta warmup:", "pt": "Beta warmup:"},
+    "s7_lbl_dropout": {"en": "Dropout:", "pt": "Dropout:"},
+    "s7_lbl_patience": {"en": "Patience:", "pt": "Paciência:"},
+    "s7_lbl_device": {"en": "Device:", "pt": "Dispositivo:"},
+    "s7_lbl_resume": {"en": "Resume from:", "pt": "Retomar de:"},
+    "s7_lbl_ckpt_out": {"en": "Save ckpt to:", "pt": "Salvar checkpoint em:"},
+    "s7_ph_resume": {
+        "en": "optional — best_model.pt from previous phase",
+        "pt": "opcional — best_model.pt da fase anterior",
+    },
+    "s7_chk_freeze_enc": {
+        "en": "Freeze encoder (Phase 3 fine-tuning)",
+        "pt": "Congelar encoder (fine-tuning da Fase 3)",
+    },
+    "s7_dlg_select_best_model": {"en": "Select best_model.pt", "pt": "Selecione best_model.pt"},
+    "s7_err_tensor_not_found": {
+        "en": "Tensor dataset not found for Phase {phase}: {tensor_dir}",
+        "pt": "Dataset de tensores não encontrado para a Fase {phase}: {tensor_dir}",
+    },
+
+    # ---------------------------------------------------------------- STEP 8 — Evaluation
+    "title_step8": {
+        "en": "Step 8 — Trained Model Evaluation", "pt": "Etapa 8 — Avaliação do Modelo Treinado",
+    },
+    "s8_chk_do_generate": {
         "en": "Generate ligands during evaluation", "pt": "Gerar ligantes durante a avaliação",
     },
-    "s7_lbl_checkpoints": {"en": "Checkpoints:", "pt": "Checkpoints:"},
-    "s7_lbl_figures": {"en": "Figures:", "pt": "Figuras:"},
-    "s7_btn_training_curves": {"en": "Training Curves", "pt": "Curvas de Treinamento"},
-    "s7_btn_performance_report": {"en": "Performance Report", "pt": "Relatório de Desempenho"},
+    "s8_lbl_checkpoints": {"en": "Checkpoints:", "pt": "Checkpoints:"},
+    "s8_lbl_figures": {"en": "Figures:", "pt": "Figuras:"},
+    "s8_btn_training_curves": {"en": "Training Curves", "pt": "Curvas de Treinamento"},
+    "s8_btn_performance_report": {"en": "Performance Report", "pt": "Relatório de Desempenho"},
 
-    # ---------------------------------------------------------------- STEP 8 — Generation
-    "title_step8": {
-        "en": "Step 8 — Ligand Candidate Generation", "pt": "Etapa 8 — Geração de Candidatos a Ligante",
+    # ---------------------------------------------------------------- STEP 9 — Generation
+    "title_step9": {
+        "en": "Step 9 — Ligand Candidate Generation", "pt": "Etapa 9 — Geração de Candidatos a Ligante",
     },
-    "s8_ph_pdb": {
+    "s9_ph_pdb": {
         "en": "Target protein PDB file (required)", "pt": "Arquivo PDB da proteína-alvo (obrigatório)",
     },
-    "s8_ph_site_pdb": {
+    "s9_ph_site_pdb": {
         "en": "optional — PDB with only binding-site residues",
         "pt": "opcional — PDB apenas com os resíduos do sítio de ligação",
     },
-    "s8_ph_out": {
+    "s9_ph_out": {
         "en": "JOBS/<job_id>/results/{pdb}/ (default)",
         "pt": "JOBS/<job_id>/results/{pdb}/ (padrão)",
     },
-    "s8_ph_ligand_ref": {
+    "s9_ph_ligand_ref": {
         "en": "optional — reference ligand SDF", "pt": "opcional — SDF do ligante de referência",
     },
-    "s8_lbl_model_phase": {"en": "Model phase:", "pt": "Fase do modelo:"},
-    "s8_lbl_protein_pdb": {"en": "Protein (PDB):", "pt": "Proteína (PDB):"},
-    "s8_lbl_site_pdb": {"en": "Site residues (PDB):", "pt": "Resíduos do sítio (PDB):"},
-    "s8_lbl_output": {"en": "Output:", "pt": "Saída:"},
-    "s8_lbl_ref_ligand": {"en": "Ref. ligand:", "pt": "Ligante de ref.:"},
-    "s8_lbl_n_samples": {"en": "No. samples:", "pt": "Nº de amostras:"},
-    "s8_lbl_temperature": {"en": "Temperature:", "pt": "Temperatura:"},
-    "s8_lbl_cutoff": {"en": "Site cutoff (Å):", "pt": "Cutoff do sítio (Å):"},
-    "s8_lbl_top_n": {"en": "Top N report:", "pt": "Relatório Top N:"},
-    "s8_lbl_min_atoms": {"en": "Min. site atoms:", "pt": "Átomos mín. do sítio:"},
+    "s9_lbl_model_phase": {"en": "Model phase:", "pt": "Fase do modelo:"},
+    "s9_lbl_protein_pdb": {"en": "Protein (PDB):", "pt": "Proteína (PDB):"},
+    "s9_lbl_site_pdb": {"en": "Site residues (PDB):", "pt": "Resíduos do sítio (PDB):"},
+    "s9_lbl_output": {"en": "Output:", "pt": "Saída:"},
+    "s9_lbl_ref_ligand": {"en": "Ref. ligand:", "pt": "Ligante de ref.:"},
+    "s9_lbl_n_samples": {"en": "No. samples:", "pt": "Nº de amostras:"},
+    "s9_lbl_temperature": {"en": "Temperature:", "pt": "Temperatura:"},
+    "s9_lbl_cutoff": {"en": "Site cutoff (Å):", "pt": "Cutoff do sítio (Å):"},
+    "s9_lbl_top_n": {"en": "Top N report:", "pt": "Relatório Top N:"},
+    "s9_lbl_min_atoms": {"en": "Min. site atoms:", "pt": "Átomos mín. do sítio:"},
 
     # -------------------------------------------- Fechamento com pipeline ativo
     "worker_collect":  {"en": "Collection",   "pt": "Coleta"},
@@ -600,18 +724,18 @@ _TEXTOS = {
     },
 
     # ------------------------------------------- Definição do sítio sem ligante
-    "s8_chk_use_site_center": {
+    "s9_chk_use_site_center": {
         "en": "Define site by center coordinates",
         "pt": "Definir sítio por coordenadas do centro",
     },
-    "s8_lbl_site_center": {"en": "Site center:", "pt": "Centro do sítio:"},
-    "s8_lbl_site_radius": {"en": "Site radius (Å):", "pt": "Raio do sítio (Å):"},
-    "s8_chk_heuristic_search": {
+    "s9_lbl_site_center": {"en": "Site center:", "pt": "Centro do sítio:"},
+    "s9_lbl_site_radius": {"en": "Site radius (Å):", "pt": "Raio do sítio (Å):"},
+    "s9_chk_heuristic_search": {
         "en": "Heuristic search (P2Rank)",
         "pt": "Busca heurística (P2Rank)",
     },
-    "s8_lbl_pocket_rank": {"en": "Pocket to use:", "pt": "Bolso a usar:"},
-    "s8_tooltip_site_center": {
+    "s9_lbl_pocket_rank": {"en": "Pocket to use:", "pt": "Bolso a usar:"},
+    "s9_tooltip_site_center": {
         "en": "Use when the protein has no co-crystallized ligand. Residues with at "
               "least one atom within the radius of this point define the site. The "
               "coordinates must be in the same frame as the supplied PDB.",
@@ -619,7 +743,7 @@ _TEXTOS = {
               "ao menos um átomo dentro do raio em torno deste ponto definem o sítio. "
               "As coordenadas devem estar no mesmo referencial do PDB fornecido.",
     },
-    "s8_tooltip_site_radius": {
+    "s9_tooltip_site_radius": {
         "en": "Default 10 Å. Larger than the 6 Å used when a ligand is present: there "
               "the distance starts at the ligand atoms, which already fill the cavity, "
               "whereas here it starts at a single central point.",
@@ -627,7 +751,7 @@ _TEXTOS = {
               "distância parte dos átomos do ligante, que já preenchem a cavidade, "
               "enquanto aqui parte de um único ponto central.",
     },
-    "s8_tooltip_heuristic_search": {
+    "s9_tooltip_heuristic_search": {
         "en": "Predicts binding pockets with P2Rank (Krivák & Hoksza, 2018) and uses "
               "the chosen one, ranked by ligandability. Disables the manual "
               "coordinates. Requires P2Rank installed and Java 17+; the full ranking "
@@ -637,26 +761,26 @@ _TEXTOS = {
               "manuais. Exige P2Rank instalado e Java 17+; o ranking completo é "
               "gravado em pockets_p2rank.json na pasta de saída.",
     },
-    "s8_tooltip_pocket_rank": {
+    "s9_tooltip_pocket_rank": {
         "en": "Which pocket to use from the P2Rank ranking (1 = highest score). Check "
               "pockets_p2rank.json from a previous run to pick another one.",
         "pt": "Qual bolso usar no ranking do P2Rank (1 = maior score). Consulte o "
               "pockets_p2rank.json de uma execução anterior para escolher outro.",
     },
-    "s8_err_site_conflict": {
+    "s9_err_site_conflict": {
         "en": "The site PDB already delimits the pocket. Clear it before using center "
               "coordinates or heuristic search.",
         "pt": "O PDB do sítio já delimita o bolso. Remova-o antes de usar coordenadas "
               "do centro ou busca heurística.",
     },
-    "s8_err_center_zero": {
+    "s9_err_center_zero": {
         "en": "Set the site center coordinates (they are all zero).",
         "pt": "Informe as coordenadas do centro do sítio (estão todas em zero).",
     },
-    "s8_chk_protonate_site": {
+    "s9_chk_protonate_site": {
         "en": "Protonate site residues (pH-based)", "pt": "Protonar resíduos do sítio (baseado em pH)",
     },
-    "s8_tooltip_gen_qm_method": {
+    "s9_tooltip_gen_qm_method": {
         "en": "Fallback only: when the selected checkpoint has its training voxelization "
               "config saved (checkpoints trained after this feature was added), that value is "
               "always used instead, with a log warning if it differs from this field — this "
@@ -666,7 +790,7 @@ _TEXTOS = {
               "valor é sempre usado no lugar deste, com aviso no log se divergir — esta escolha "
               "só tem efeito para checkpoints treinados antes disso (sem config salva).",
     },
-    "s8_tooltip_gen_qm_basis": {
+    "s9_tooltip_gen_qm_basis": {
         "en": "Fallback only (same rule as the site channels 3-4 method above): only takes "
               "effect for checkpoints trained before the voxelization config started being "
               "saved automatically — only matters for the RHF/STO-3G per residue method.",
@@ -685,8 +809,8 @@ _TEXTOS = {
         "en": "CHARMM36 (protein FF, requires GROMACS+AmberTools)",
         "pt": "CHARMM36 (FF de proteína, requer GROMACS+AmberTools)",
     },
-    "s8_lbl_final_ff": {"en": "Final geometry FF:", "pt": "FF de geometria final:"},
-    "s8_tooltip_final_ff": {
+    "s9_lbl_final_ff": {"en": "Final geometry FF:", "pt": "FF de geometria final:"},
+    "s9_tooltip_final_ff": {
         "en": "Force field for the final minimization of the COMPLEX (ligand +\nsite, not the "
               "isolated ligand) before the steric clash check\nagainst the protein.\n\nMMFF/UFF "
               "(RDKit) — default, no extra dependency. UFF covers\nsite metals (Zn/Fe/Mg) that "
@@ -710,10 +834,10 @@ _TEXTOS = {
               "amber99sb-ildn.ff/charmm27.ff já empacotada com o\nGROMACS por padrão (não os "
               "arquivos ff14SB/CHARMM36 mais\nrecentes, que não vêm com a instalação padrão).",
     },
-    "s8_chk_induced_fit": {
+    "s9_chk_induced_fit": {
         "en": "Induced-fit (flexible side chains)", "pt": "Induced-fit (cadeias laterais flexíveis)",
     },
-    "s8_tooltip_induced_fit": {
+    "s9_tooltip_induced_fit": {
         "en": "Unchecked (default): site 100% rigid during the final minimization —\nonly the "
               "ligand moves.\n\nChecked: locks only the backbone of the site residues "
               "(N, Cα, C, O —\nrepresents where the rest of the real protein would hold this\n"
@@ -728,25 +852,25 @@ _TEXTOS = {
               "para se ajustar ao ligante durante a mesma\nminimização (não é uma dinâmica "
               "térmica separada). Funciona nos\ndois campos de força (MMFF/UFF e AMBER/CHARMM).",
     },
-    "s8_err_invalid_pdb": {
+    "s9_err_invalid_pdb": {
         "en": "Please select a valid PDB file for the target protein.",
         "pt": "Selecione um arquivo PDB válido para a proteína-alvo.",
     },
-    "s8_err_invalid_site_pdb": {
+    "s9_err_invalid_site_pdb": {
         "en": "Please select a valid PDB file containing only the binding-site residues.",
         "pt": "Selecione um arquivo PDB válido contendo apenas os resíduos do sítio de ligação.",
     },
-    "s8_err_no_checkpoint": {
+    "s9_err_no_checkpoint": {
         "en": "No trained checkpoint found for Phase {phase}.",
         "pt": "Nenhum checkpoint treinado encontrado para a Fase {phase}.",
     },
-    "s8_dlg_select_pdb": {"en": "Select PDB file", "pt": "Selecione o arquivo PDB"},
-    "s8_dlg_select_site_pdb": {
+    "s9_dlg_select_pdb": {"en": "Select PDB file", "pt": "Selecione o arquivo PDB"},
+    "s9_dlg_select_site_pdb": {
         "en": "Select binding-site residues PDB",
         "pt": "Selecione o PDB dos resíduos do sítio de ligação",
     },
-    "s8_dlg_output_folder": {"en": "Output folder", "pt": "Pasta de saída"},
-    "s8_dlg_reference_ligand": {"en": "Reference ligand", "pt": "Ligante de referência"},
+    "s9_dlg_output_folder": {"en": "Output folder", "pt": "Pasta de saída"},
+    "s9_dlg_reference_ligand": {"en": "Reference ligand", "pt": "Ligante de referência"},
 
     # ---------------------------------------------------------------- View-figure helpers / About
     "msg_figure_not_found": {"en": "Figure not found", "pt": "Figura não encontrada"},
@@ -770,8 +894,8 @@ _TEXTOS = {
         "en": "{title} — Phase {phase}", "pt": "{title} — Fase {phase}",
     },
     "msg_run_step7_first": {
-        "en": "Run Step 7 with Phase {phase} first.\n\nExpected at:\n{fig_dir}",
-        "pt": "Execute a Etapa 7 com a Fase {phase} primeiro.\n\nEsperado em:\n{fig_dir}",
+        "en": "Run Step 8 with Phase {phase} first.\n\nExpected at:\n{fig_dir}",
+        "pt": "Execute a Etapa 8 com a Fase {phase} primeiro.\n\nEsperado em:\n{fig_dir}",
     },
     "msg_module_not_found_title": {"en": "Module not found", "pt": "Módulo não encontrado"},
     "msg_module_not_found_body": {

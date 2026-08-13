@@ -1,5 +1,5 @@
 """
-Pipeline - Etapa 7: Geração de Ligantes para Proteína Externa
+Pipeline - Etapa 9: Geração de Ligantes para Proteína Externa
 =============================================================
 Recebe o PDB de uma proteína nova (não vista no treino), extrai o sítio
 de ligação, voxeliza e usa o modelo CVAE treinado para gerar um conjunto
@@ -836,7 +836,7 @@ def load_model(
         log.warning(
             "  Checkpoint sem voxel_config embutida (treinado antes desta "
             "funcionalidade existir) — a geração usará a config manual fornecida "
-            "pelo chamador (Etapa 8 da interface, ou defaults de VOXEL_CONFIG)."
+            "pelo chamador (Etapa 9 da interface, ou defaults de VOXEL_CONFIG)."
         )
 
     return model, mod, voxel_config
