@@ -77,6 +77,20 @@ _TEXTOS = {
     "tab_step8": {"en": "Step 8", "pt": "Etapa 8"},
     "tab_step9": {"en": "Step 9", "pt": "Etapa 9"},
 
+    # ---------------------------------------------------------------- Falha ao construir uma aba
+    "tab_load_error_title": {
+        "en": "Couldn't load this tab ({aba})",
+        "pt": "Não foi possível carregar esta aba ({aba})",
+    },
+    "tab_load_error_detail": {
+        "en": "A dependency is likely missing. Open Menu → Install "
+              "Requirements, install what's needed, and restart CODEEP.\n\n"
+              "Technical detail: {erro}",
+        "pt": "Provavelmente falta alguma dependência. Abra Menu → "
+              "Instalar Dependências, instale o que faltar e reinicie o "
+              "CODEEP.\n\nDetalhe técnico: {erro}",
+    },
+
     # ---------------------------------------------------------------- HW monitor (top-right corner)
     # Monitor num PROCESSO separado (ver MODULES/hw_monitor_window.py), mesmo padrão do CODRUG —
     # só um botão aqui na janela principal; os textos ao vivo (CPU/GPU/temperatura) ficam dentro

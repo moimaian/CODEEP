@@ -168,17 +168,30 @@ HAS_CUDA, GPU_DESC = _detect_gpu()
 # A função _voxelize_atoms usa einsum em vez de .sum(axis=0) para contornar.
 try:
     import cupy as cp
-    # Testa einsum — a operação específica que usamos (não o sum CUB)
-    _t = cp.zeros((2, 4), dtype=cp.float32)
-    cp.einsum('ij->j', _t)
-    del _t
+    # Testa o padrão REAL usado em _voxelize_atoms, não só o einsum. Um
+    # teste que só exercita einsum (via cuBLAS) pode passar mesmo quando o
+    # NVRTC — o compilador JIT que toda redução/kernel elementwise usa —
+    # está quebrado ou ausente (ex.: libnvrtc.so.12 não encontrado). Nesse
+    # caso o smoke test antigo dava HAS_CUPY=True, e o primeiro par
+    # processado de verdade travava o programa com um traceback bruto do
+    # CuPy — incompreensível para quem não programa, e só descoberto horas
+    # depois de iniciada a curadoria/voxelização.
+    _t   = cp.zeros((2, 4), dtype=cp.float32)
+    _d2  = (_t * _t).sum(axis=-1)          # redução NVRTC (o ponto de falha real)
+    _e   = cp.exp(-_d2)                    # kernel elementwise NVRTC
+    cp.einsum('ij->j', _t)                 # cuBLAS — não cobre o caso acima sozinho
+    del _t, _d2, _e
     HAS_CUPY = bool(HAS_CUDA)
     if HAS_CUPY:
         cp.cuda.Device(0).use()
-except Exception:
+except Exception as _cupy_exc:
     cp       = None
     HAS_CUPY = False
-    warnings.warn("CuPy indisponível — usando NumPy (CPU).")
+    warnings.warn(
+        f"CuPy indisponível ou com falha de compilação JIT (NVRTC) — "
+        f"usando NumPy (CPU) para a voxelização, mais lento. "
+        f"Causa: {type(_cupy_exc).__name__}: {_cupy_exc}"
+    )
 
 def _xp():
     """Retorna cupy se disponível, senão numpy."""

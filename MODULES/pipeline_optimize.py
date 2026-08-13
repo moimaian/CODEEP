@@ -69,7 +69,19 @@ import time as _time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import pandas as pd
+# pandas NÃO é importado aqui em cima de propósito. CODEEP.py._tab_step6()
+# importa este módulo de forma EAGER — ao contrário de todo outro
+# _tab_stepN(), que só importa o pipeline_*.py correspondente dentro do
+# run_fn() executado no clique de "Run" — porque precisa ler
+# SEARCH_SPACE_SPEC/SAMPLERS em tempo de construção da aba, para montar os
+# widgets. Isso acontece na primeira abertura do MainWindow, ANTES de o
+# usuário ter tido a chance de rodar "Install Requirements": num venv recém-
+# criado pelo bootstrap (que instala só PyQt5), `import pandas` no topo do
+# arquivo derrubava a aplicação inteira com ImportError antes mesmo da
+# janela aparecer. pandas só é de fato usado dentro de _cluster_key,
+# make_subset e save_history — todas chamadas apenas durante uma execução
+# real de busca (processo filho) —, então o import é feito localmente em
+# cada uma delas.
 
 # Import do pacote MODULES funciona tanto via `import MODULES.pipeline_optimize`
 # (interface) quanto via `python MODULES/pipeline_optimize.py` (terminal).
@@ -639,6 +651,7 @@ def make_subset(
     Reutiliza o diretório se já existir um subconjunto com o mesmo
     (frac, seed, origem), registrado em `subset_info.json`.
     """
+    import pandas as pd  # ver nota no topo do arquivo — import local de propósito
     tensor_dir = Path(tensor_dir).resolve()
     out_dir    = Path(out_dir)
 
@@ -1215,6 +1228,7 @@ def optimize(
 
     # Tabela completa dos trials — permite inspecionar o ranking depois sem
     # reabrir o SQLite.
+    import pandas as pd  # ver nota no topo do arquivo — import local de propósito
     rows = []
     for t in study.trials:
         row = {"trial": t.number + 1, "state": t.state.name,

@@ -1708,21 +1708,70 @@ class MainWindow(QMainWindow):
 
     # ── Abas — sem ícones, apenas nome curto, traduzido via i18n ───────────
     def _build_tabs(self):
-        pages_keys = [
-            (self._tab_home(),  "tab_home"),
-            (self._tab_step1(), "tab_step1"),
-            (self._tab_step2(), "tab_step2"),
-            (self._tab_step3(), "tab_step3"),
-            (self._tab_step4(), "tab_step4"),
-            (self._tab_step5(), "tab_step5"),
-            (self._tab_step6(), "tab_step6"),
-            (self._tab_step7(), "tab_step7"),
-            (self._tab_step8(), "tab_step8"),
-            (self._tab_step9(), "tab_step9"),
+        """Constrói e adiciona as dez abas (Home + 9 etapas).
+
+        Cada `_tab_stepN()` roda AQUI, de forma síncrona, na primeira
+        construção da janela — antes de o usuário ter tido qualquer chance
+        de abrir "Install Requirements". A maioria das etapas só importa seu
+        módulo pipeline_*.py mais tarde, dentro do run_fn() executado no
+        clique de "Run" (em processo filho); mas nada IMPEDE que uma aba
+        futura precise, como a Etapa 6 (Optuna) precisa hoje, ler alguma
+        constante do módulo em tempo de construção da aba — e nem toda
+        dependência pesada desse módulo é garantida existir num venv
+        recém-criado pelo bootstrap (que instala só PyQt5). Foi exatamente
+        isso que derrubou o app inteiro antes da janela aparecer, quando
+        pipeline_optimize.py importava pandas incondicionalmente no topo do
+        arquivo (corrigido lá, com import local — ver o módulo).
+        Esse `try/except` é a segunda camada: se uma aba falhar por
+        QUALQUER motivo, no futuro, a janela ainda abre, com as demais abas
+        utilizáveis e a que falhou substituída por um aviso — em vez do
+        processo inteiro morrer com um traceback bruto no terminal, que é
+        precisamente o tipo de falha que a Seção de acessibilidade deste
+        trabalho existe para evitar.
+        """
+        builders = [
+            (self._tab_home,  "tab_home"),
+            (self._tab_step1, "tab_step1"),
+            (self._tab_step2, "tab_step2"),
+            (self._tab_step3, "tab_step3"),
+            (self._tab_step4, "tab_step4"),
+            (self._tab_step5, "tab_step5"),
+            (self._tab_step6, "tab_step6"),
+            (self._tab_step7, "tab_step7"),
+            (self._tab_step8, "tab_step8"),
+            (self._tab_step9, "tab_step9"),
         ]
-        for idx, (page, chave) in enumerate(pages_keys):
+        for idx, (build_fn, chave) in enumerate(builders):
+            try:
+                page = build_fn()
+            except Exception as exc:
+                log.error(f"Falha ao construir a aba '{chave}': "
+                         f"{type(exc).__name__}: {exc}", exc_info=True)
+                page = self._tab_load_error(chave, exc)
             self.tabs.addTab(page, "")
             self._tr(chave, lambda txt, i=idx: self.tabs.setTabText(i, txt))
+
+    def _tab_load_error(self, chave: str, exc: Exception) -> QWidget:
+        """Aba de reserva exibida quando a construção de uma etapa falha.
+
+        Mantém a janela utilizável: as demais abas continuam funcionando, e
+        esta explica o que houve em vez de deixar o processo morrer.
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(36, 32, 36, 24)
+        nome_aba = i18n.t(chave, self._idioma)  # nome amigável, não a chave crua
+        titulo = QLabel(i18n.t("tab_load_error_title", self._idioma, aba=nome_aba))
+        titulo.setStyleSheet("font-weight: bold; font-size: 13pt; color: #F57C6F;")
+        titulo.setWordWrap(True)
+        detalhe = QLabel(i18n.t("tab_load_error_detail", self._idioma,
+                                erro=f"{type(exc).__name__}: {exc}"))
+        detalhe.setWordWrap(True)
+        detalhe.setStyleSheet("color: #C9D1D9;")
+        lay.addWidget(titulo)
+        lay.addWidget(detalhe)
+        lay.addStretch(1)
+        return w
 
     # ══════════════════════════════════════════════════════════════════════
     # TAB 0 — HOME
@@ -1980,6 +2029,23 @@ class MainWindow(QMainWindow):
                 rows.append((display, ver))
             except ImportError:
                 rows.append((display, "not installed"))
+
+        # Backend real de voxelização — NÃO é o mesmo que "CuPy importou".
+        # O import de cupy sempre funciona sem GPU/NVRTC funcionais; quem
+        # falha é a compilação JIT do primeiro kernel real, só na hora do
+        # uso (ver o smoke-test de pipeline_voxelize.py, que exercita
+        # exatamente esse caminho). Reusar aqui o mesmo HAS_CUPY, em vez de
+        # testar de novo, evita que a Home diga "GPU ok" enquanto a
+        # curadoria trava horas depois com um traceback de NVRTC.
+        try:
+            import MODULES.pipeline_voxelize as _vx
+            if _vx.HAS_CUPY:
+                rows.append(("Voxelização (GPU/CuPy)", "ok"))
+            else:
+                rows.append(("Voxelização (GPU/CuPy)",
+                             "CPU/NumPy — CuPy indisponível ou NVRTC quebrado"))
+        except Exception as _exc:
+            rows.append(("Voxelização (GPU/CuPy)", f"erro ao testar: {_exc}"))
 
         # ── Ferramentas externas (binários, não pacotes pip) ──────────────
         # xtb: níveis de teoria semi-empíricos da voxelização (Etapa 5).
