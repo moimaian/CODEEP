@@ -507,6 +507,41 @@ _TEXTOS = {
     },
     "s6_grp_budget": {"en": "Search budget", "pt": "Orçamento da busca"},
     "s6_grp_space": {"en": "Search space", "pt": "Espaço de busca"},
+    "s6_lbl_sampler": {"en": "Search algorithm:", "pt": "Algoritmo de busca:"},
+    "s6_tooltip_sampler": {
+        "en": "Which configuration to try next. Orthogonal to pruning: "
+              "Successive Halving (ASHA) is a PRUNER — it decides when to "
+              "kill a running trial, not what to try — and is configured in "
+              "the ASHA fields, combining with any algorithm here.",
+        "pt": "Qual configuração testar em seguida. Ortogonal à poda: o "
+              "Successive Halving (ASHA) é um algoritmo de PODA — decide "
+              "quando matar um trial em andamento, não o que testar — e é "
+              "configurado nos campos ASHA, combinando com qualquer "
+              "algoritmo daqui.",
+    },
+    "s6_lbl_objective": {"en": "Objective:", "pt": "Objetivo:"},
+    "s6_tooltip_objective": {
+        "en": "val_recon = reconstruction only, invariant to beta.\n"
+              "val_total = recon + beta·KL, only valid with beta FIXED.\n\n"
+              "Ticking beta_max or beta_warmup disables val_total: with a "
+              "varying beta, val_total rewards whoever drew a smaller beta "
+              "rather than the better model.\n\n"
+              "val_kl is deliberately absent — its global minimum (KL=0) is "
+              "posterior collapse, so it would be a metric whose optimum is "
+              "the worst model.",
+        "pt": "val_recon = só a reconstrução, invariante a beta.\n"
+              "val_total = recon + beta·KL, só válido com beta FIXO.\n\n"
+              "Marcar beta_max ou beta_warmup desabilita val_total: com beta "
+              "variando, val_total premia quem sorteou um beta menor em vez "
+              "do modelo melhor.\n\n"
+              "val_kl não é oferecida de propósito — seu mínimo global "
+              "(KL=0) é o posterior collapse, ou seja, uma métrica cujo "
+              "ótimo é o pior modelo.",
+    },
+    "s6_note_objective_forced": {
+        "en": "val_total disabled: beta is in the search space.",
+        "pt": "val_total desabilitado: beta está no espaço de busca.",
+    },
     "s6_lbl_phase": {"en": "Phase (dataset):", "pt": "Fase (dataset):"},
     "s6_lbl_n_trials": {"en": "Trials:", "pt": "Trials:"},
     "s6_lbl_trial_epochs": {"en": "Epochs per trial:", "pt": "Épocas por trial:"},

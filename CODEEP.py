@@ -1243,6 +1243,7 @@ class MainWindow(QMainWindow):
             # também é derivada dele — acrescentar um hiperparâmetro lá passa
             # a ser salvo/restaurado aqui sem edição manual.
             "step6": [
+                "cb_opt_sampler",
                 "cb_opt_phase", "sp_opt_trials", "sp_opt_epochs", "dsb_opt_subset",
                 "sp_opt_seed", "sp_opt_min_resource", "sp_opt_reduction",
                 "cb_opt_device", "ed_opt_study", "ed_opt_resume",
@@ -1251,6 +1252,13 @@ class MainWindow(QMainWindow):
                 f"{prefix}_opt_{name}"
                 for name in _opt_param_names
                 for prefix in ("chk", "ed")
+            ] + [
+                # cb_opt_objective vem POR ÚLTIMO de propósito: restaurar os
+                # checkboxes de beta dispara _opt_update_objective_state, que
+                # força o objetivo de volta para val_recon enquanto algum beta
+                # ainda estiver marcado. Aplicado antes deles, o val_total
+                # salvo pelo usuário era desfeito no meio da restauração.
+                "cb_opt_objective",
             ],
             "step7": [
                 "cb_train_phase", "sp_epochs", "sp_batch", "sp_latent", "sp_hidden",
@@ -3064,6 +3072,27 @@ class MainWindow(QMainWindow):
         self._tr("s6_grp_budget", grp_budget.setTitle)
         bv = QVBoxLayout(grp_budget); bv.setSpacing(8)
 
+        # Algoritmo de busca (sampler). Fica em linha própria acima das três
+        # colunas por ser o controle mestre do grupo — e porque o Grid Search
+        # muda o significado de "Trials" (vira o teto da grade, não o nº de
+        # amostras). Os rótulos vêm de pipeline_optimize.SAMPLERS; o VALOR
+        # usado pela lógica é SAMPLERS[currentIndex()]["name"], nunca o texto.
+        self.cb_opt_sampler = QComboBox()
+        for s in opt.SAMPLERS:
+            self.cb_opt_sampler.addItem(s["label"])
+        self.cb_opt_sampler.setCurrentIndex(
+            [s["name"] for s in opt.SAMPLERS].index(opt.DEFAULT_SAMPLER))
+        self._tr("s6_tooltip_sampler", self.cb_opt_sampler.setToolTip)
+        for i, s in enumerate(opt.SAMPLERS):
+            self.cb_opt_sampler.setItemData(i, s["help"], Qt.ToolTipRole)
+
+        row_sampler = QWidget()
+        rs = QHBoxLayout(row_sampler); rs.setContentsMargins(0,0,0,0); rs.setSpacing(8)
+        rs.addWidget(self._trL("s6_lbl_sampler"))
+        rs.addWidget(self.cb_opt_sampler, 1)
+        rs.addStretch(2)
+        bv.addWidget(row_sampler)
+
         self.cb_opt_phase = QComboBox(); self.cb_opt_phase.addItems(["1", "2", "3"])
 
         self.sp_opt_trials = QSpinBox()
@@ -3208,6 +3237,11 @@ class MainWindow(QMainWindow):
                 # silenciosamente, que é pior do que não deixar digitar.
                 chk.toggled.connect(ed.setEnabled)
 
+                # Marcar/desmarcar um parâmetro de beta muda quais objetivos
+                # são admissíveis — ver _opt_update_objective_state.
+                if name in opt.BETA_PARAMS:
+                    chk.toggled.connect(self._opt_update_objective_state)
+
                 setattr(self, f"chk_opt_{name}", chk)
                 setattr(self, f"ed_opt_{name}",  ed)
                 self._opt_param_widgets[name] = (chk, ed)
@@ -3221,6 +3255,35 @@ class MainWindow(QMainWindow):
             cl.addWidget(col_w, 1)
 
         sv.addWidget(cols_row)
+
+        # ── Objetivo ──────────────────────────────────────────────────────
+        # val_total só é admissível com beta FIXO. Se beta_max ou beta_warmup
+        # estiverem marcados, a opção é desabilitada e a seleção volta para
+        # val_recon — proibir na interface é melhor que aceitar e depois
+        # sobrescrever silenciosamente no meio do log.
+        self.cb_opt_objective = QComboBox()
+        for m in opt.OBJECTIVE_METRICS:
+            self.cb_opt_objective.addItem(m["label"])
+        for i, m in enumerate(opt.OBJECTIVE_METRICS):
+            self.cb_opt_objective.setItemData(i, m["help"], Qt.ToolTipRole)
+        self.cb_opt_objective.setCurrentIndex(
+            [m["name"] for m in opt.OBJECTIVE_METRICS].index(opt.DEFAULT_OBJECTIVE))
+        self._tr("s6_tooltip_objective", self.cb_opt_objective.setToolTip)
+
+        self.lbl_opt_objective_forced = QLabel()
+        self.lbl_opt_objective_forced.setStyleSheet(
+            "color:#E3B341;font-size:9pt;")
+
+        row_obj = QWidget()
+        rb = QHBoxLayout(row_obj); rb.setContentsMargins(0,8,0,0); rb.setSpacing(8)
+        rb.addWidget(self._trL("s6_lbl_objective"))
+        rb.addWidget(self.cb_opt_objective)
+        rb.addWidget(self.lbl_opt_objective_forced, 1)
+        rb.addStretch()
+        sv.addWidget(row_obj)
+        self._tr("s6_note_objective_forced",
+                 lambda _t: self._opt_update_objective_state())
+        self._opt_update_objective_state()
 
         sel_row = QWidget(); sl = QHBoxLayout(sel_row); sl.setContentsMargins(0,6,0,0)
         btn_all  = self._mk_btn_tr("s6_btn_select_all",     _SS_BTN_SECONDARY, 130)
@@ -3315,6 +3378,8 @@ class MainWindow(QMainWindow):
                 trial_epochs=self.sp_opt_epochs.value(),
                 subset_frac=self.dsb_opt_subset.value(),
                 seed=self.sp_opt_seed.value(),
+                sampler=self._opt_selected_sampler(),
+                objective_metric=self._opt_selected_objective(),
                 pruner_min_resource=self.sp_opt_min_resource.value(),
                 pruner_reduction_factor=self.sp_opt_reduction.value(),
                 study_name=self.ed_opt_study.text().strip() or "codeep_hpo",
@@ -3348,6 +3413,50 @@ class MainWindow(QMainWindow):
             else:
                 chk.setChecked(name in opt.DEFAULT_SELECTED)
                 ed.setText(opt.format_default(name))
+
+    def _opt_update_objective_state(self):
+        """Habilita/desabilita val_total conforme beta esteja ou não na busca.
+
+        `total = recon + beta·KL`: se beta varia entre trials, comparar total
+        premia quem sorteou beta menor, não quem reconstruiu melhor. Nesse
+        caso val_total deixa de ser uma escolha válida e a seleção é forçada
+        de volta para val_recon.
+        """
+        cb = getattr(self, "cb_opt_objective", None)
+        if cb is None:
+            return
+        import MODULES.pipeline_optimize as opt
+
+        forced = any(self._opt_param_widgets[n][0].isChecked()
+                     for n in opt.BETA_PARAMS
+                     if n in self._opt_param_widgets)
+
+        names = [m["name"] for m in opt.OBJECTIVE_METRICS]
+        i_total = names.index("total")
+        i_recon = names.index("recon")
+
+        # Item desabilitado dentro do combo: continua visível (o usuário vê
+        # que a opção existe e por que está bloqueada), mas não selecionável.
+        modelo = cb.model()
+        item = modelo.item(i_total)
+        if item is not None:
+            item.setEnabled(not forced)
+        if forced and cb.currentIndex() == i_total:
+            cb.setCurrentIndex(i_recon)
+
+        self.lbl_opt_objective_forced.setText(
+            i18n.t("s6_note_objective_forced", self._idioma) if forced else "")
+
+    def _opt_selected_objective(self) -> str:
+        """Nome interno ('recon'/'total') do objetivo escolhido no combo."""
+        import MODULES.pipeline_optimize as opt
+        return opt.OBJECTIVE_METRICS[
+            self.cb_opt_objective.currentIndex()]["name"]
+
+    def _opt_selected_sampler(self) -> str:
+        """Nome interno do algoritmo de busca escolhido no combo."""
+        import MODULES.pipeline_optimize as opt
+        return opt.SAMPLERS[self.cb_opt_sampler.currentIndex()]["name"]
 
     def _opt_update_fidelity_note(self):
         """Troca o aviso da Etapa 6 conforme o orçamento escolhido.

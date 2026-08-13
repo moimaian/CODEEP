@@ -190,9 +190,79 @@ DEFAULT_SELECTED: list[str] = [
     s["name"] for s in SEARCH_SPACE_SPEC if s["priority"] in ("high", "medium")
 ]
 
-#: Se qualquer um destes estiver no espaço de busca, o objetivo passa a ser
+#: Se qualquer um destes estiver no espaço de busca, o objetivo é FORÇADO a
 #: `val_recon` — ver resolve_objective_metric().
 BETA_PARAMS = frozenset({"beta_max", "beta_warmup"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MÉTRICA-OBJETIVO
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `val_kl` NÃO é oferecida de propósito. Minimizar KL isoladamente é
+# degenerado: o mínimo global é KL = 0, que é exatamente o posterior collapse
+# (o decoder ignora z e a geração perde diversidade). Seria uma métrica cujo
+# ótimo é o pior modelo possível.
+
+OBJECTIVE_METRICS: list[dict] = [
+    {
+        "name": "recon", "label": "val_recon",
+        "help": "Só a reconstrução, sem o termo KL. Invariante a beta — é a "
+                "única escolha honesta quando beta_max ou beta_warmup estão "
+                "no espaço de busca.",
+    },
+    {
+        "name": "total", "label": "val_total",
+        "help": "Loss completa (recon + beta·KL). Só faz sentido com beta "
+                "FIXO: se beta varia entre trials, quem sorteia beta menor "
+                "ganha no total sem ser modelo melhor.",
+    },
+]
+
+#: Objetivo pré-selecionado na interface.
+DEFAULT_OBJECTIVE = "recon"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALGORITMOS DE BUSCA (samplers)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ATENÇÃO à distinção: SAMPLER decide QUAL configuração testar em seguida;
+# PRUNER (ASHA/Successive Halving, configurado à parte em pruner_min_resource/
+# pruner_reduction_factor) decide QUANDO matar um trial em andamento. São
+# eixos ortogonais e combináveis — "Halving" não é um tipo de busca.
+
+SAMPLERS: list[dict] = [
+    {
+        "name": "tpe", "label": "TPE (Optuna)",
+        "help": "Tree-structured Parzen Estimator — otimização bayesiana "
+                "baseada em densidades. Default e melhor custo/benefício para "
+                "espaços pequenos como este. Aprende com os trials anteriores.",
+    },
+    {
+        "name": "random", "label": "Random Search",
+        "help": "Amostragem uniforme independente. Não aprende com o "
+                "histórico, mas é imbatível como baseline e paraleliza sem "
+                "coordenação. Bom para mapear o espaço antes de refinar.",
+    },
+    {
+        "name": "grid", "label": "Grid Search",
+        "help": "Varredura exaustiva. As faixas contínuas são discretizadas "
+                "com a resolução que couber no nº de trials. O custo explode "
+                "com o nº de hiperparâmetros — use só com 2-3 marcados.",
+    },
+    {
+        "name": "gp", "label": "Bayesiano (Processo Gaussiano)",
+        "help": "Otimização bayesiana clássica com GP. Costuma superar o TPE "
+                "quando os trials são caros e o espaço é contínuo e de baixa "
+                "dimensão, mas o custo por sugestão cresce com o nº de trials.",
+    },
+]
+
+SAMPLER_BY_NAME: dict[str, dict] = {s["name"]: s for s in SAMPLERS}
+
+#: Algoritmo pré-selecionado na interface.
+DEFAULT_SAMPLER = "tpe"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -361,15 +431,36 @@ def build_search_space(selected: dict[str, str]) -> dict[str, tuple]:
     return space
 
 
-def resolve_objective_metric(search_space: dict) -> str:
-    """Decide entre 'recon' e 'total' como métrica-objetivo.
+def objective_is_forced(search_space: dict) -> bool:
+    """True quando o objetivo NÃO pode ser escolhido pelo usuário.
 
     `total = recon + beta·KL`. Se beta (ou o seu warmup) varia entre trials,
     comparar `total` premia quem sorteou beta menor em vez de quem
     reconstruiu melhor — o ranking mediria o espaço de busca, não o modelo.
-    Nesse caso o objetivo passa a ser `recon`, que é invariante a beta.
+    Nesses casos só `recon` é admissível. A interface usa esta função para
+    desabilitar a opção val_total.
     """
-    return "recon" if (BETA_PARAMS & set(search_space)) else "total"
+    return bool(BETA_PARAMS & set(search_space))
+
+
+def resolve_objective_metric(search_space: dict,
+                             preferred: Optional[str] = None) -> str:
+    """Métrica-objetivo efetiva, respeitando a escolha do usuário quando ela
+    for admissível.
+
+    `preferred=None` mantém o comportamento automático original
+    ('recon' se beta estiver no espaço, 'total' caso contrário).
+    """
+    if objective_is_forced(search_space):
+        return "recon"
+    if preferred is None:
+        return "total"
+    if preferred not in {m["name"] for m in OBJECTIVE_METRICS}:
+        raise ValueError(
+            f"Métrica-objetivo desconhecida: {preferred!r}. "
+            f"Válidas: {[m['name'] for m in OBJECTIVE_METRICS]}."
+        )
+    return preferred
 
 
 def suggest_params(trial, search_space: dict[str, tuple]) -> dict[str, Any]:
@@ -387,6 +478,135 @@ def suggest_params(trial, search_space: dict[str, tuple]) -> dict[str, Any]:
         else:
             out[name] = trial.suggest_categorical(name, list(vals))
     return out
+
+
+# ── Grid Search: discretização das faixas contínuas ───────────────────────────
+
+def discretize_for_grid(search_space: dict[str, tuple],
+                        points: int) -> dict[str, list]:
+    """Converte o espaço em uma grade explícita {nome: [valores]}.
+
+    Categóricos entram como estão. Faixas contínuas viram `points` valores
+    igualmente espaçados — em escala LOG para os parâmetros log (lr,
+    beta_max, weight_decay), senão a grade desperdiçaria quase todos os
+    pontos na parte alta da faixa.
+    """
+    grid: dict[str, list] = {}
+    for name, vals in search_space.items():
+        kind = SPEC_BY_NAME[name]["kind"]
+        if kind == "categorical":
+            grid[name] = list(vals)
+            continue
+
+        lo, hi = float(vals[0]), float(vals[1])
+        k = max(2, points)
+        if kind == "float_log":
+            lo_l, hi_l = math.log10(lo), math.log10(hi)
+            xs = [10 ** (lo_l + (hi_l - lo_l) * i / (k - 1)) for i in range(k)]
+        else:
+            xs = [lo + (hi - lo) * i / (k - 1) for i in range(k)]
+
+        if kind == "int":
+            xs = sorted({int(round(x)) for x in xs})
+        grid[name] = xs
+    return grid
+
+
+def grid_size(grid: dict[str, list]) -> int:
+    n = 1
+    for vals in grid.values():
+        n *= max(1, len(vals))
+    return n
+
+
+def build_grid_within_budget(search_space: dict[str, tuple],
+                             n_trials: int) -> tuple[dict[str, list], int, int]:
+    """Escolhe a resolução da grade que cabe no orçamento de trials.
+
+    Em vez de exigir mais um campo na interface ("pontos por parâmetro"), a
+    resolução é derivada de `n_trials`: pega-se o maior número de pontos por
+    parâmetro contínuo cuja grade ainda caiba no orçamento. É o comportamento
+    que o usuário espera — ele já disse quantos trials pode pagar.
+
+    Returns (grade, pontos_por_parametro, tamanho_da_grade).
+    """
+    best = None
+    for points in range(2, 11):
+        g = discretize_for_grid(search_space, points)
+        size = grid_size(g)
+        if best is None:
+            best = (g, points, size)      # garante pelo menos a grade mínima
+        if size <= n_trials:
+            best = (g, points, size)
+        else:
+            break
+    return best
+
+
+def build_sampler(name: str, search_space: dict[str, tuple],
+                  seed: int, n_trials: int):
+    """Instancia o sampler do Optuna e devolve (sampler, info).
+
+    `info` traz o que precisa ser dito ao usuário no log: rótulo, e no caso
+    do Grid Search a resolução escolhida e o tamanho real da grade.
+    """
+    import optuna
+    from optuna.samplers import GridSampler, RandomSampler, TPESampler
+
+    if name not in SAMPLER_BY_NAME:
+        raise ValueError(
+            f"Algoritmo de busca desconhecido: {name!r}. "
+            f"Válidos: {[s['name'] for s in SAMPLERS]}."
+        )
+    info: dict = {"name": name, "label": SAMPLER_BY_NAME[name]["label"],
+                  "notes": []}
+
+    if name == "random":
+        return RandomSampler(seed=seed), info
+
+    if name == "grid":
+        grid, points, size = build_grid_within_budget(search_space, n_trials)
+        info["grid"] = grid
+        info["grid_points"] = points
+        info["grid_size"] = size
+        info["notes"].append(
+            f"grade com {points} ponto(s) por parâmetro contínuo → "
+            f"{size} combinações"
+        )
+        if size > n_trials:
+            info["notes"].append(
+                f"⚠  a grade MÍNIMA ({size} combinações) já excede os "
+                f"{n_trials} trials do orçamento: a varredura ficará "
+                f"incompleta e o resultado não será um grid search de "
+                f"verdade. Reduza o nº de hiperparâmetros marcados ou "
+                f"aumente os trials para >= {size}."
+            )
+        elif size < n_trials:
+            info["notes"].append(
+                f"a busca encerra sozinha após as {size} combinações — os "
+                f"{n_trials - size} trials restantes do orçamento não serão "
+                f"usados (grid search não repete pontos)."
+            )
+        return GridSampler(grid, seed=seed), info
+
+    if name == "gp":
+        try:
+            from optuna.samplers import GPSampler
+            info["notes"].append(
+                "o GPSampler é marcado como experimental pelo Optuna (desde "
+                "a v3.6) — a interface dele pode mudar entre versões."
+            )
+            return GPSampler(seed=seed), info
+        except Exception as e:
+            # GPSampler exige optuna >= 3.6 + scipy/torch. Cair para TPE em
+            # silêncio seria pior: o usuário acharia que rodou GP.
+            info["notes"].append(
+                f"GPSampler indisponível ({e}) — usando TPE no lugar."
+            )
+            info["label"] = SAMPLER_BY_NAME["tpe"]["label"] + " (fallback)"
+            return TPESampler(seed=seed), info
+
+    return TPESampler(seed=seed), info
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -661,6 +881,8 @@ def optimize(
     trial_epochs: int = 15,
     subset_frac: float = 0.20,
     seed: int = 42,
+    sampler: str = DEFAULT_SAMPLER,
+    objective_metric: Optional[str] = None,
     pruner_min_resource: int = 3,
     pruner_reduction_factor: int = 3,
     study_name: str = "codeep_hpo",
@@ -682,6 +904,11 @@ def optimize(
         n_trials     : nº de configurações a testar (podadas incluídas).
         trial_epochs : epochs por trial — orçamento, não busca.
         subset_frac  : fração de CLUSTERS PDB usada nos trials (1.0 = tudo).
+        sampler      : algoritmo de busca — "tpe" | "random" | "grid" | "gp".
+                       Ortogonal à poda (ASHA), que é configurada à parte.
+        objective_metric : "recon" | "total" | None (automático). É IGNORADO
+                       e forçado a "recon" quando beta_max/beta_warmup estão
+                       no espaço de busca — ver resolve_objective_metric().
         resume/freeze_encoder : repassados a train(), para otimizar
                        hiperparâmetros de fine-tuning (Fases 2/3).
         fixed_params : valores fixos para hiperparâmetros NÃO buscados
@@ -692,7 +919,6 @@ def optimize(
     """
     import optuna
     from optuna.pruners import SuccessiveHalvingPruner
-    from optuna.samplers import TPESampler
 
     from MODULES.pipeline_train import train
 
@@ -712,8 +938,20 @@ def optimize(
     if unknown:
         raise ValueError(f"Hiperparâmetros desconhecidos: {sorted(unknown)}")
 
-    objective_metric = resolve_objective_metric(search_space)
+    requested_objective = objective_metric
+    objective_metric = resolve_objective_metric(search_space, objective_metric)
+    if requested_objective and requested_objective != objective_metric:
+        # Backstop para a CLI: a interface já desabilita val_total nesse caso.
+        log.warning(
+            f"Objetivo pedido (val_{requested_objective}) é inválido com "
+            f"beta no espaço de busca — usando val_{objective_metric}. "
+            f"val_total = recon + beta·KL premiaria um beta menor, não um "
+            f"modelo melhor."
+        )
     fixed_params = dict(fixed_params or {})
+
+    sampler_obj, sampler_info = build_sampler(sampler, search_space, seed,
+                                              n_trials)
 
     # ── Verificação de disco ──────────────────────────────────────────────
     if not skip_disk_check:
@@ -731,13 +969,16 @@ def optimize(
     log.info("═" * 72)
     log.info("Etapa 6 — Otimização de hiperparâmetros")
     log.info("═" * 72)
+    log.info(f"  Algoritmo de busca    : {sampler_info['label']}")
+    for nota in sampler_info["notes"]:
+        log.info(f"      {nota}")
     log.info(f"  Trials                : {n_trials}")
     log.info(f"  Epochs por trial      : {trial_epochs}")
     log.info(f"  Fração do dataset     : {subset_frac:.0%}")
     log.info(f"  Métrica-objetivo      : val_{objective_metric}"
-             + ("  (beta está no espaço de busca — val_total premiaria "
-                "beta menor, não modelo melhor)" if objective_metric == "recon"
-                else ""))
+             + ("  (forçado: beta está no espaço de busca — val_total "
+                "premiaria beta menor, não modelo melhor)"
+                if objective_is_forced(search_space) else ""))
     log.info(f"  Poda                  : ASHA "
              f"(min_resource={pruner_min_resource}, "
              f"reduction_factor={pruner_reduction_factor})")
@@ -786,7 +1027,7 @@ def optimize(
     study = optuna.create_study(
         study_name=study_name,
         direction="minimize",
-        sampler=TPESampler(seed=seed),
+        sampler=sampler_obj,
         pruner=SuccessiveHalvingPruner(
             min_resource=pruner_min_resource,
             reduction_factor=pruner_reduction_factor,
@@ -992,6 +1233,9 @@ def optimize(
         "n_pruned":         len(pruned),
         "n_failed":         len(failed),
         "search_space":     {k: list(v) for k, v in search_space.items()},
+        "sampler":          sampler_info["name"],
+        "sampler_label":    sampler_info["label"],
+        "grid_size":        sampler_info.get("grid_size"),
         "trial_epochs":     trial_epochs,
         "subset_frac":      subset_frac,
         "study_db":         str(db_path),
@@ -1039,7 +1283,25 @@ def _print_params_table():
                   f"default: {format_default(spec['name'])}")
             print(f"    {'':<16} {spec['help']}")
     print("\n" + "─" * 72)
-    print("Use --params nome1,nome2  e  --range nome=v1,v2  para customizar.\n")
+    print("Use --params nome1,nome2  e  --range nome=v1,v2  para customizar.")
+    print("\nAlgoritmos de busca (--sampler)\n" + "─" * 72)
+    for s in SAMPLERS:
+        marca = "  (default)" if s["name"] == DEFAULT_SAMPLER else ""
+        print(f"  {s['name']:<8} {s['label']}{marca}")
+        print(f"  {'':<8} {s['help']}")
+    print("\n  Nota: Successive Halving (ASHA) NÃO é um algoritmo de busca, e "
+          "sim de PODA.\n"
+          "  Ele decide quando matar um trial, não qual configuração testar. "
+          "É configurado\n"
+          "  em --min-resource/--reduction-factor e combina com qualquer "
+          "sampler acima.")
+    print("\nMétricas-objetivo (--objective)\n" + "─" * 72)
+    for m in OBJECTIVE_METRICS:
+        marca = "  (default)" if m["name"] == DEFAULT_OBJECTIVE else ""
+        print(f"  {m['name']:<8} {m['label']}{marca}")
+        print(f"  {'':<8} {m['help']}")
+    print("\n  val_kl não é oferecida: seu mínimo global (KL=0) é o posterior "
+          "collapse,\n  ou seja, uma métrica cujo ótimo é o pior modelo.\n")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1081,6 +1343,16 @@ Exemplos de uso:
     parser.add_argument("--trial-epochs", type=int, default=15)
     parser.add_argument("--subset-frac", type=float, default=0.20)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--sampler", type=str, default=DEFAULT_SAMPLER,
+                        choices=[s["name"] for s in SAMPLERS],
+                        help="Algoritmo de busca (default: tpe). Ortogonal à "
+                             "poda ASHA, configurada em --min-resource/"
+                             "--reduction-factor")
+    parser.add_argument("--objective", type=str, default=DEFAULT_OBJECTIVE,
+                        choices=[m["name"] for m in OBJECTIVE_METRICS],
+                        help="Métrica-objetivo (default: recon). Forçada a "
+                             "'recon' se beta_max/beta_warmup estiverem no "
+                             "espaço de busca")
     parser.add_argument("--min-resource", type=int, default=3,
                         help="ASHA: epochs mínimos antes de podar (default: 3)")
     parser.add_argument("--reduction-factor", type=int, default=3,
@@ -1156,6 +1428,8 @@ Exemplos de uso:
         trial_epochs=args.trial_epochs,
         subset_frac=args.subset_frac,
         seed=args.seed,
+        sampler=args.sampler,
+        objective_metric=args.objective,
         pruner_min_resource=args.min_resource,
         pruner_reduction_factor=args.reduction_factor,
         study_name=args.study_name,
