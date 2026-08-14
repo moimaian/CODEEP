@@ -531,6 +531,127 @@ def generate_ligands_for_site(
     return real_smiles, generated_records
 
 
+def compute_active_units(
+    ckpt_dir: Path,
+    tensor_dir: Path,
+    split: str = "val",
+    threshold: float = 0.01,
+    max_samples: int = 500,
+) -> "dict | None":
+    """Métrica "active units" (Burda, Grosse & Salakhutdinov, 2016 — Importance
+    Weighted Autoencoders) para diagnosticar colapso PARCIAL de posterior, que
+    o heurístico já existente (analyze_training_history: "KL ≈ 0" sobre o
+    escalar médio final_kl) não detecta — uma média de KL moderada pode
+    esconder poucas dimensões fortemente ativas e o resto morto, indistinguível
+    de "todas as dimensões fracamente ativas" olhando só o agregado (ver
+    pipeline_train.cvae_loss: L_KL é a MÉDIA sobre batch×latent_dim, não a
+    soma por amostra).
+
+    Para cada dimensão u do espaço latente, AU_u = Var_x(E_{q(z|x)}[z_u]) — a
+    variância, ENTRE AMOSTRAS do split (sítios diferentes), da média
+    posterior z_mean naquela dimensão. Uma dimensão "morta" tem z_mean
+    praticamente constante entre sítios diferentes (o encoder não usa aquele
+    eixo para diferenciar sítios) — variância perto de zero. Convenção do
+    artigo original: ativa se essa variância > 0.01.
+
+    Retorna None em qualquer falha (torch ausente, checkpoint/tensor_dir
+    ausentes ou split vazio, poucas amostras) — o chamador decide como
+    reportar a ausência do diagnóstico.
+    """
+    if not HAS_TORCH:
+        log.warning("  PyTorch indisponível — não é possível calcular active units.")
+        return None
+
+    ckpt_dir = Path(ckpt_dir)
+    best_ckpt = ckpt_dir / "best_model.pt"
+    if not best_ckpt.exists():
+        log.error(f"  Checkpoint não encontrado: {best_ckpt}")
+        return None
+
+    try:
+        mod = _load_train_module()
+    except Exception as e:
+        log.error(f"  Erro ao importar pipeline_train.py: {e}")
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+    except Exception as e:
+        log.error(f"  Erro ao carregar {best_ckpt}: {e}")
+        return None
+    cfg = ckpt.get("config", {})
+    latent_dim = cfg.get("latent_dim", 256)
+
+    model = mod.LigandCVAE(
+        in_channels=5,
+        latent_dim=latent_dim,
+        hidden_dim=cfg.get("hidden_dim", 256),
+        n_gnn_layers=cfg.get("n_gnn_layers", 4),
+    ).to(device)
+    try:
+        model.load_state_dict(ckpt["model_state"], strict=False)
+    except Exception as e:
+        log.error(f"  Erro ao carregar pesos do checkpoint: {e}")
+        return None
+    model.eval()
+
+    try:
+        ds = mod.SiteLigandDataset(tensor_dir=Path(tensor_dir), split=split)
+    except Exception as e:
+        log.error(f"  Erro ao carregar split '{split}' de {tensor_dir}: {e}")
+        return None
+    if len(ds) == 0:
+        log.error(f"  Split '{split}' vazio em {tensor_dir}.")
+        return None
+
+    from torch.utils.data import DataLoader
+    loader = DataLoader(ds, batch_size=16, shuffle=False,
+                         collate_fn=mod.SiteLigandDataset.collate_fn)
+
+    z_means = []
+    n_seen = 0
+    with torch.no_grad():
+        for batch in loader:
+            if batch is None:
+                continue
+            site        = batch["tensor"].to(device)
+            voxel_sizes = batch["voxel_sizes"].to(device)
+            zm, _ = model.encoder(site, voxel_sizes)
+            z_means.append(zm.cpu())
+            n_seen += zm.shape[0]
+            if n_seen >= max_samples:
+                break
+
+    if not z_means:
+        log.error("  Nenhum lote válido obtido do DataLoader — não foi possível calcular.")
+        return None
+
+    z_means = torch.cat(z_means, dim=0)[:max_samples]   # (N, latent_dim)
+    n_used  = z_means.shape[0]
+    if n_used < 2:
+        log.error(f"  Amostras insuficientes ({n_used}) para calcular variância entre sítios.")
+        return None
+
+    per_dim_var = z_means.var(dim=0, unbiased=True).numpy()   # (latent_dim,)
+    n_active    = int((per_dim_var > threshold).sum())
+
+    # kl_mean_per_dim: reaproveita a MESMA fórmula de pipeline_train.cvae_loss
+    # (via mean/var, não a variância entre amostras usada acima) como
+    # cross-check contra o valor já logado durante o treino — devem bater
+    # aproximadamente se o split/checkpoint forem os mesmos.
+    return {
+        "n_active":        n_active,
+        "n_total":         latent_dim,
+        "fraction_active": (n_active / latent_dim) if latent_dim else 0.0,
+        "threshold":       threshold,
+        "n_samples_used":  n_used,
+        "split":           split,
+        "per_dim_variance": per_dim_var,
+        "ckpt_epoch":      ckpt.get("epoch", "?"),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -550,6 +671,7 @@ def plot_performance_report(
     gen_smiles,
     ckpt_dir,
     fig_dir,
+    active_units=None,
 ):
     """Painel de desempenho: 3 paineis lado a lado.
 
@@ -569,11 +691,22 @@ def plot_performance_report(
 
     _best_vl  = df["val_total"].min() if "val_total" in df.columns else 0
     _test_tot = test_results.get("test_total", "N/A")
-    fig.suptitle(
+    _title = (
         "CODEEP - Performance | Val loss: " + str(round(float(_best_vl), 4)) +
-        " | Test loss: " + str(_test_tot),
-        fontsize=12, fontweight="bold", y=1.02,
+        " | Test loss: " + str(_test_tot)
     )
+    # Active units (Burda et al., 2016) — diagnóstico de colapso PARCIAL de
+    # posterior, complementar ao heurístico "KL ≈ 0" já usado em
+    # analyze_training_history (que só enxerga o escalar agregado, ver
+    # compute_active_units). None quando o cálculo falhou (torch ausente,
+    # split de validação vazio etc.) — não interrompe o resto do relatório.
+    if active_units:
+        _title += (
+            " | Active units: " + str(active_units["n_active"]) + "/" +
+            str(active_units["n_total"]) + " (" +
+            str(round(active_units["fraction_active"] * 100, 1)) + "%)"
+        )
+    fig.suptitle(_title, fontsize=12, fontweight="bold", y=1.02)
 
     # Painel 1: barras dos componentes de teste
     ax1 = axes[0]
@@ -718,6 +851,24 @@ def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path):
                          f"> Val loss ({test_results['val_loss_ckpt']}): "
                          "possible data leakage or small dataset.")
 
+    print_section("2b. LATENT SPACE DIAGNOSTICS (ACTIVE UNITS)")
+    active_units = compute_active_units(ckpt_dir, tensor_dir)
+    if active_units:
+        log.info(
+            f"  Active units: {active_units['n_active']}/{active_units['n_total']} "
+            f"({active_units['fraction_active']*100:.1f}%) — "
+            f"threshold={active_units['threshold']}, "
+            f"split={active_units['split']} ({active_units['n_samples_used']} amostras)"
+        )
+        if active_units["fraction_active"] < 0.10:
+            log.info(
+                "  ⚠️  Poucas dimensões ativas — possível colapso PARCIAL de "
+                "posterior mesmo com KL médio agregado não-nulo (ver nota em "
+                "compute_active_units)."
+            )
+    else:
+        log.warning("  Não foi possível calcular active units (ver mensagens acima).")
+
     if do_generate:
         print_section("3. GENERATION OF NEW LIGANDS")
 
@@ -785,6 +936,7 @@ def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path):
         gen_smiles=_gen_smiles,
         ckpt_dir=ckpt_dir,
         fig_dir=fig_dir,
+        active_units=active_units,
     )
 
     print_section("SUMMARY AND NEXT STEPS")

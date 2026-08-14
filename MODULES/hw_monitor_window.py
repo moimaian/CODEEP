@@ -90,7 +90,7 @@ class HwMonitorWindow(QDialog):
 
         note = QLabel(
             "This window runs in its own process, so it keeps updating even while\n"
-            "CODEEP's main window is busy (e.g. running Step 7 Training or Step 9 Generation)."
+            "CODEEP's main window is busy (e.g. running Step 5 Training or Step 7 Generation)."
         )
         note.setAlignment(Qt.AlignCenter)
         note.setWordWrap(True)
