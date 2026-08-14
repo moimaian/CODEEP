@@ -725,13 +725,40 @@ def _fragment_qm_weights(
 def _xtb_bin() -> "str | None":
     """Localiza o binário `xtb`, com aviso único (não um por chamada — este
     dispatcher pode ser chamado dezenas de vezes por sítio no modo
-    fragmentado)."""
+    fragmentado).
+
+    Ordem de busca: XTB_HOME, PATH, e <projeto>/tools/xtb*/bin/xtb — este
+    último é onde CODEEP_requirements.install_xtb() o instala. Mesma ordem
+    usada por CODEEP_requirements.detect_xtb(), para que o que a tela de
+    Install Requirements mostra seja o que este pipeline de fato encontra.
+    """
+    env_home = os.environ.get("XTB_HOME")
+    if env_home:
+        cand = Path(env_home) / "bin" / "xtb"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+
     xtb_bin = shutil.which("xtb")
     if xtb_bin is None:
+        for base in (PROJECT_ROOT / "tools", Path.home(), Path("/opt")):
+            if not base.is_dir():
+                continue
+            try:
+                for cand in sorted(base.glob("xtb*/bin/xtb")):
+                    if cand.is_file() and os.access(cand, os.X_OK):
+                        xtb_bin = str(cand)
+                        break
+            except OSError:
+                continue
+            if xtb_bin:
+                break
+
+    if xtb_bin is None:
         log.warning(
-            "  xtb não encontrado no PATH — instale com "
-            "'conda install -c conda-forge xtb' (ou compile de "
-            "https://github.com/grimme-lab/xtb). Usando aproximação semi-empírica."
+            "  xtb não encontrado — instale pelo menu Install Requirements "
+            "(baixa um binário estático, sem dependências) ou manualmente "
+            "de https://github.com/grimme-lab/xtb. Usando aproximação "
+            "semi-empírica."
         )
     return xtb_bin
 

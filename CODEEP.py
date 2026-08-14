@@ -1262,7 +1262,9 @@ class MainWindow(QMainWindow):
             ],
             "step7": [
                 "cb_train_phase", "sp_epochs", "sp_batch", "sp_latent", "sp_hidden",
-                "sp_gnn_layers", "dsb_lr", "dsb_beta", "sp_warmup", "dsb_dropout",
+                "sp_gnn_layers", "dsb_lr", "dsb_beta", "sp_warmup",
+                "dsb_pos_weight", "dsb_stop_weight", "dsb_dropout",
+                "dsb_weight_decay", "dsb_grad_clip",
                 "sp_patience", "cb_train_device", "ed_resume", "chk_freeze_enc",
                 "ed_ckpt_out",
             ],
@@ -2053,8 +2055,16 @@ class MainWindow(QMainWindow):
         # exige Java 17+, então a versão do Java é informada junto — um
         # Java 11 com P2Rank instalado falha na execução, e o usuário
         # precisa conseguir ver isso aqui.
-        _xtb = _sh.which("xtb")
-        rows.append(("xtb", "installed" if _xtb else "not installed"))
+        # Usa a mesma busca de CODEEP_requirements.detect_xtb() (PATH +
+        # tools/xtb*/bin/xtb), não só shutil.which — senão esta linha diria
+        # "not installed" mesmo logo depois de instalar via Install
+        # Requirements, que grava em tools/, não no PATH do sistema.
+        try:
+            import CODEEP_requirements as _req
+            _xtb = _req.detect_xtb()
+        except Exception:
+            _xtb = _sh.which("xtb")
+        rows.append(("xtb", f"installed ({_xtb})" if _xtb else "not installed"))
 
         _java = _sh.which("java")
         if _java:
@@ -3609,8 +3619,27 @@ class MainWindow(QMainWindow):
         self.dsb_beta      = QDoubleSpinBox()
         self.dsb_beta.setDecimals(3); self.dsb_beta.setRange(0,10); self.dsb_beta.setValue(0.5)
         self.sp_warmup     = QSpinBox(); self.sp_warmup.setRange(1,500); self.sp_warmup.setValue(30)
+        # Pesos das cabeças da loss e regularização/estabilidade do otimizador.
+        # Defaults idênticos aos de pipeline_train.train() — mudar um lado sem
+        # o outro faria a interface mentir sobre o que o treino vai usar.
+        self.dsb_pos_weight = QDoubleSpinBox()
+        self.dsb_pos_weight.setDecimals(2); self.dsb_pos_weight.setRange(0.0, 20.0)
+        self.dsb_pos_weight.setSingleStep(0.25); self.dsb_pos_weight.setValue(2.00)
+        self._tr("s7_tooltip_pos_weight", self.dsb_pos_weight.setToolTip)
+        self.dsb_stop_weight = QDoubleSpinBox()
+        self.dsb_stop_weight.setDecimals(2); self.dsb_stop_weight.setRange(0.0, 20.0)
+        self.dsb_stop_weight.setSingleStep(0.25); self.dsb_stop_weight.setValue(1.00)
+        self._tr("s7_tooltip_stop_weight", self.dsb_stop_weight.setToolTip)
         self.dsb_dropout   = QDoubleSpinBox()
         self.dsb_dropout.setDecimals(2); self.dsb_dropout.setRange(0,0.9); self.dsb_dropout.setValue(0.20)
+        self.dsb_weight_decay = QDoubleSpinBox()
+        self.dsb_weight_decay.setDecimals(6); self.dsb_weight_decay.setRange(0.0, 1.0)
+        self.dsb_weight_decay.setSingleStep(1e-5); self.dsb_weight_decay.setValue(1e-4)
+        self._tr("s7_tooltip_weight_decay", self.dsb_weight_decay.setToolTip)
+        self.dsb_grad_clip = QDoubleSpinBox()
+        self.dsb_grad_clip.setDecimals(2); self.dsb_grad_clip.setRange(0.01, 100.0)
+        self.dsb_grad_clip.setSingleStep(0.1); self.dsb_grad_clip.setValue(0.50)
+        self._tr("s7_tooltip_grad_clip", self.dsb_grad_clip.setToolTip)
         self.sp_patience   = QSpinBox(); self.sp_patience.setRange(1,500); self.sp_patience.setValue(15)
         self.cb_train_device = QComboBox()
         self.cb_train_device.addItems(["cuda","cpu","cuda:0","cuda:1"])
@@ -3642,7 +3671,11 @@ class MainWindow(QMainWindow):
             ("s7_lbl_lr",          self.dsb_lr),
             ("s7_lbl_beta_max",    self.dsb_beta),
             ("s7_lbl_beta_warmup", self.sp_warmup),
+            ("s7_lbl_pos_weight",  self.dsb_pos_weight),
+            ("s7_lbl_stop_weight", self.dsb_stop_weight),
             ("s7_lbl_dropout",     self.dsb_dropout),
+            ("s7_lbl_weight_decay", self.dsb_weight_decay),
+            ("s7_lbl_grad_clip",   self.dsb_grad_clip),
             ("s7_lbl_patience",    self.sp_patience),
             ("s7_lbl_device",      self.cb_train_device),
             ("s7_lbl_resume",      resume_row),
@@ -3711,7 +3744,11 @@ class MainWindow(QMainWindow):
                 lr=self.dsb_lr.value(),
                 beta_max=self.dsb_beta.value(),
                 beta_warmup=self.sp_warmup.value(),
+                pos_weight=self.dsb_pos_weight.value(),
+                stop_weight=self.dsb_stop_weight.value(),
                 dropout=self.dsb_dropout.value(),
+                weight_decay=self.dsb_weight_decay.value(),
+                grad_clip=self.dsb_grad_clip.value(),
                 patience=self.sp_patience.value(),
                 checkpoint_dir=str(ckpt_out),
                 tensor_dir=str(tensor_dir),

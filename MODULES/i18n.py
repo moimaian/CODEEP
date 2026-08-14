@@ -673,7 +673,59 @@ _TEXTOS = {
     "s7_lbl_lr": {"en": "Learning rate:", "pt": "Taxa de aprendizado:"},
     "s7_lbl_beta_max": {"en": "Beta KL (max):", "pt": "Beta KL (máx.):"},
     "s7_lbl_beta_warmup": {"en": "Beta warmup:", "pt": "Beta warmup:"},
+    "s7_lbl_pos_weight": {"en": "Position weight:", "pt": "Peso da posição:"},
+    "s7_tooltip_pos_weight": {
+        "en": "Weight of the 3D position term in the reconstruction loss "
+              "(recon = stop_w·L_stop + L_atom + L_bond + L_exist + "
+              "pos_w·L_pos + 0.5·L_charge).\n\n"
+              "At the default of 2.0 this term alone accounts for about 78% "
+              "of recon — it is the model's declared bottleneck. Raising it "
+              "buys geometric accuracy at the cost of chemistry; lowering it "
+              "does the reverse.",
+        "pt": "Peso do termo de posição 3D na perda de reconstrução "
+              "(recon = stop_w·L_stop + L_atom + L_bond + L_exist + "
+              "pos_w·L_pos + 0,5·L_charge).\n\n"
+              "No default de 2,0 esse termo sozinho responde por cerca de "
+              "78% da recon — é o gargalo declarado do modelo. Aumentar "
+              "compra precisão geométrica ao custo da química; diminuir faz "
+              "o inverso.",
+    },
+    "s7_lbl_stop_weight": {"en": "Stop weight:", "pt": "Peso da parada:"},
+    "s7_tooltip_stop_weight": {
+        "en": "Weight of the stop head (when to end the ligand construction) "
+              "in the reconstruction loss.\n\n"
+              "Controls the size distribution of the generated molecules: too "
+              "low produces ligands that never stop growing, too high "
+              "produces fragments.",
+        "pt": "Peso da cabeça de parada (quando encerrar a construção do "
+              "ligante) na perda de reconstrução.\n\n"
+              "Controla a distribuição de tamanhos das moléculas geradas: "
+              "baixo demais gera ligantes que não param de crescer, alto "
+              "demais gera fragmentos.",
+    },
     "s7_lbl_dropout": {"en": "Dropout:", "pt": "Dropout:"},
+    "s7_lbl_weight_decay": {"en": "Weight decay:", "pt": "Weight decay:"},
+    "s7_tooltip_weight_decay": {
+        "en": "L2 regularization of the AdamW optimizer.\n\n"
+              "Raise it if training overfits (validation loss rising while "
+              "training loss falls). With the current dataset there is no "
+              "sign of overfitting, so the default of 1e-4 is conservative.",
+        "pt": "Regularização L2 do otimizador AdamW.\n\n"
+              "Aumente se o treino sobreajustar (perda de validação subindo "
+              "enquanto a de treino cai). Com o dataset atual não há sinal "
+              "de sobreajuste, então o default de 1e-4 é conservador.",
+    },
+    "s7_lbl_grad_clip": {"en": "Gradient clipping:", "pt": "Recorte do gradiente:"},
+    "s7_tooltip_grad_clip": {
+        "en": "Maximum gradient norm per step.\n\n"
+              "Guards against gradient explosion, which corrupts the weights "
+              "with NaN. Only worth changing if the log shows 'Gradiente NaN "
+              "detectado' or the loss diverges — lower it in that case.",
+        "pt": "Norma máxima do gradiente por passo.\n\n"
+              "Protege contra explosão de gradiente, que corrompe os pesos "
+              "com NaN. Só vale mexer se o log acusar 'Gradiente NaN "
+              "detectado' ou a loss divergir — nesse caso, reduza.",
+    },
     "s7_lbl_patience": {"en": "Patience:", "pt": "Paciência:"},
     "s7_lbl_device": {"en": "Device:", "pt": "Dispositivo:"},
     "s7_lbl_resume": {"en": "Resume from:", "pt": "Retomar de:"},

@@ -568,6 +568,15 @@ P2RANK_URL_TMPL = ("https://github.com/rdk/p2rank/releases/download/"
 JAVA_MIN_MAJOR = 17
 JAVA_INSTALL_HINT = "sudo apt install openjdk-17-jre-headless"
 
+# xtb: binário ESTÁTICO (`ldd` confirma: "não é um executável dinâmico"),
+# sem nenhuma dependência de sistema — mais simples que o P2Rank, que ao
+# menos precisa de Java. Usado pela voxelização (Etapa 5) como nível de
+# teoria semi-empírico (GFN-xTB) para os canais doador/aceptor de elétrons
+# do sítio; sem ele, cai automaticamente na aproximação heurística.
+XTB_VERSION = "6.7.1"
+XTB_URL_TMPL = ("https://github.com/grimme-lab/xtb/releases/download/"
+                "v{v}/xtb-{v}-linux-x86_64.tar.xz")
+
 _PROJECT_ROOT = Path(__file__).resolve().parent
 TOOLS_DIR = _PROJECT_ROOT / "tools"
 
@@ -657,6 +666,68 @@ def install_p2rank(version: str = P2RANK_VERSION, log=print) -> bool:
     return True
 
 
+def detect_xtb() -> Optional[str]:
+    """Caminho do executável `xtb`, se instalado.
+
+    Mesma ordem de busca de pipeline_voxelize._xtb_bin, para que o que o
+    instalador mostra seja o que o pipeline vai encontrar.
+    """
+    env_home = os.environ.get("XTB_HOME")
+    if env_home:
+        cand = Path(env_home) / "bin" / "xtb"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    found = shutil.which("xtb")
+    if found:
+        return found
+    for base in (TOOLS_DIR, Path.home(), Path("/opt")):
+        if not base.is_dir():
+            continue
+        try:
+            for cand in sorted(base.glob("xtb*/bin/xtb")):
+                if cand.is_file() and os.access(cand, os.X_OK):
+                    return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def install_xtb(version: str = XTB_VERSION, log=print) -> bool:
+    """Baixa e extrai o xtb em <projeto>/tools/. Não requer root.
+
+    O tarball oficial já vem com o binário estático em bin/xtb e os
+    parâmetros GFN em share/xtb/ (lidos em tempo de execução, achados por
+    caminho relativo ao binário — extrair preserva essa estrutura).
+    """
+    import tarfile
+    import urllib.request
+
+    url = XTB_URL_TMPL.format(v=version)
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    tarball = TOOLS_DIR / f"xtb-{version}-linux-x86_64.tar.xz"
+    try:
+        log(f"$ download {url}")
+        urllib.request.urlretrieve(url, tarball)
+        log(f"$ tar -xJf {tarball.name} -C {TOOLS_DIR}")
+        with tarfile.open(tarball, "r:xz") as tf:
+            tf.extractall(TOOLS_DIR)
+        tarball.unlink(missing_ok=True)
+    except Exception as exc:
+        log(f"FAILED  xtb download/extract: {exc}")
+        return False
+
+    xtb_bin = detect_xtb()
+    if not xtb_bin:
+        log("FAILED  xtb extracted but 'bin/xtb' not found in tools/")
+        return False
+    try:
+        os.chmod(xtb_bin, 0o755)
+    except OSError:
+        pass
+    log(f"OK  xtb {version} installed at {xtb_bin}")
+    return True
+
+
 # (display, key, default_spec, description, auto_installable)
 EXTERNAL_TOOLS: list[tuple] = [
     ("P2Rank", "__p2rank__", P2RANK_VERSION,
@@ -665,6 +736,9 @@ EXTERNAL_TOOLS: list[tuple] = [
     ("Java (JRE)", "__java__", JAVA_INSTALL_HINT,
      f"Required by P2Rank (version {JAVA_MIN_MAJOR} or newer). Needs root: "
      "run the command shown in a terminal.", False),
+    ("xtb", "__xtb__", XTB_VERSION,
+     "Semi-empirical (GFN-xTB) electronic descriptors for the site (Step 5). "
+     "Static binary, no other dependency, installed into tools/.", True),
 ]
 
 
@@ -676,9 +750,10 @@ class _InstallWorker(QThread):
 
     def __init__(self, python_bin: str, tasks: list[tuple], parent=None):
         """
-        tasks: lista de (display_name, spec, kind), com kind em {"pip", "p2rank"}.
-        Tuplas de 2 elementos são aceitas e tratadas como "pip", para não
-        quebrar chamadas anteriores a esta classe.
+        tasks: lista de (display_name, spec, kind), com kind em
+        {"pip", "p2rank", "xtb"}. Tuplas de 2 elementos são aceitas e
+        tratadas como "pip", para não quebrar chamadas anteriores a esta
+        classe.
         """
         super().__init__(parent)
         self.python_bin = python_bin
@@ -693,6 +768,9 @@ class _InstallWorker(QThread):
             if kind == "p2rank":
                 ok = install_p2rank(spec or P2RANK_VERSION,
                                     log=self.log_signal.emit)
+                success = success and ok
+            elif kind == "xtb":
+                ok = install_xtb(spec or XTB_VERSION, log=self.log_signal.emit)
                 success = success and ok
             else:
                 self.log_signal.emit(f"$ pip install {spec}")
@@ -998,6 +1076,17 @@ class RequirementsInstaller(QWidget):
                       f"{java['version'] or 'is missing'}; it requires "
                       f"{JAVA_MIN_MAJOR}+. Run: {JAVA_INSTALL_HINT}")
 
+        xtb_bin = detect_xtb()
+        lbl, chk = self._status["__xtb__"], self._checks["__xtb__"]
+        if xtb_bin:
+            lbl.setText("✅"); lbl.setToolTip(f"Installed at {xtb_bin}")
+            chk.setChecked(False)
+        else:
+            lbl.setText("⚠️")
+            lbl.setToolTip("Not found — Step 5 falls back to the heuristic "
+                           "approximation (no QM electronic descriptors)")
+            chk.setChecked(True)
+
         self._log(f"Check complete. Python: {sys.executable}")
 
     # ── Helpers de seleção ─────────────────────────────────────────────────
@@ -1009,6 +1098,9 @@ class RequirementsInstaller(QWidget):
         for import_name, chk in self._checks.items():
             if import_name == "__p2rank__":
                 chk.setChecked(detect_p2rank() is None)
+                continue
+            if import_name == "__xtb__":
+                chk.setChecked(detect_xtb() is None)
                 continue
             if import_name == "__java__":
                 continue          # não instalável por aqui (exige root)
@@ -1042,6 +1134,10 @@ class RequirementsInstaller(QWidget):
             tasks.append(("P2Rank",
                           self._edits["__p2rank__"].text().strip() or P2RANK_VERSION,
                           "p2rank"))
+        if self._checks["__xtb__"].isChecked():
+            tasks.append(("xtb",
+                          self._edits["__xtb__"].text().strip() or XTB_VERSION,
+                          "xtb"))
 
         if not tasks:
             QMessageBox.information(self, "No packages selected",
