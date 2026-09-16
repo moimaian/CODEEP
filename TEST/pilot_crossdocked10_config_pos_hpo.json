@@ -1,0 +1,20 @@
+{
+  "benchmark_name": "crossdocked_pocket10_local_pilot10_pos_hpo",
+  "method_name": "CODEEP",
+  "ckpt": "checkpoints/phase1",
+  "tensor_dir": "data/tensors",
+  "dataset_root": "TEST/crossdocked_pocket10",
+  "targets_tsv": "TEST/pilot_crossdocked10_targets.tsv",
+  "output_dir": "results/benchmarks/crossdocked_pocket10_local_pilot10_pos_hpo",
+  "n_samples": 50,
+  "top_n": 20,
+  "temperature": 1.0,
+  "cutoff": 6.0,
+  "min_atoms": 5,
+  "final_ff": "mmff_uff",
+  "induced_fit": false,
+  "ligand_charge_method": "gas",
+  "run_seeds": [11, 29],
+  "site_config_overrides": {}
+}
+

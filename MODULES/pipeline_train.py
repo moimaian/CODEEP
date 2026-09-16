@@ -506,12 +506,45 @@ _ATOM_TYPE_Z = torch.tensor(
     [6, 7, 8, 16, 15, 9, 17, 35, 53, 26, 30, 12, 6], dtype=torch.float32
 )
 
+# Valência máxima por índice de ATOM_TYPES — mesma tabela de
+# pipeline_generate.MAX_VALENCE, aqui indexada por TIPO (não por símbolo)
+# para virar feature do nó e máscara de amostragem. "OTHER" recebe 4, o
+# mesmo default usado do lado da geração.
+_ATOM_TYPE_MAXVAL = torch.tensor(
+    [4, 3, 2, 6, 5, 1, 1, 1, 1, 6, 4, 2, 4], dtype=torch.float32
+)
+
+# Ordem de ligação consumida por tipo (SINGLE, DOUBLE, TRIPLE, AROMATIC) —
+# mesma convenção de pipeline_generate.BOND_ORDER_BUDGET.
+_BOND_ORDER = torch.tensor([1.0, 2.0, 3.0, 1.5], dtype=torch.float32)
+
+#: Versão da arquitetura do decoder, gravada no checkpoint.
+#:   1 — cabeça de posição determinística (Huber sobre coordenada absoluta
+#:       no referencial da grade), decoder sem geometria nem tipo de
+#:       ligação nas entradas.
+#:   2 — posição ancorada em átomo focal e modelada por mixture density
+#:       network; geometria, valência restante e contagem de ligações nas
+#:       features dos nós; arestas com tipo + distância; cabeças de foco e
+#:       de carga formal.
+#: Checkpoints da versão 1 são estruturalmente incompatíveis: os mesmos
+#: campos do vetor de features têm outro significado, então carregá-los
+#: com strict=False produziria um modelo silenciosamente errado. Ver
+#: pipeline_generate.load_model.
+ARCH_VERSION = 2
+
+#: Nº de componentes gaussianas da MDN de posição (Pocket2Mol usa a mesma
+#: ideia com n_component configurável em models/position.py).
+N_POS_COMPONENTS = 6
+
 
 def _make_partial_features(
     atom_type_idx: torch.Tensor,   # (n,) long
     charge:        torch.Tensor,   # (n,) float
     degree:        torch.Tensor,   # (n,) float/long — grau NO GRAFO PARCIAL
     node_feat_dim: int = 37,
+    positions:     "torch.Tensor | None" = None,   # (n,3) — grafo PARCIAL
+    valence_used:  "torch.Tensor | None" = None,   # (n,)  — ordem consumida
+    bond_counts:   "torch.Tensor | None" = None,   # (n,4) — por tipo
 ) -> torch.Tensor:
     """Features (37-dim, mesmo layout de pipeline_voxelize.atom_features)
     de átomos JÁ COLOCADOS no grafo parcial — usadas como entrada do
@@ -547,6 +580,38 @@ def _make_partial_features(
     x[:, 17] = _ATOM_TYPE_Z.to(device)[clipped] / 100.0
     x[:, 19] = charge.float()
     x[:, 21] = (degree.float() / 6.0).clamp(0.0, 1.0)
+
+    # ── Campos [28:37]: geometria e saturação do grafo parcial ────────────
+    # Eram os slots "reservados para expansão futura". Sem eles o decoder
+    # era cego para a própria geometria que estava construindo: head_pos
+    # recebia só [média do grafo ; z], não tinha como saber onde havia
+    # colocado o átomo anterior e, sob Huber, colapsava para a média
+    # condicional (raio de giro gerado ~0,3 Å contra ~3,3 Å real).
+    #
+    # Todos os campos aqui são igualmente conhecíveis em treino e geração —
+    # derivam só do que JÁ foi colocado, nunca da molécula final —, então a
+    # paridade treino/inferência das outras features é preservada.
+    max_val = _ATOM_TYPE_MAXVAL.to(device)[clipped]
+
+    if positions is not None and n > 0:
+        pos = positions.float().to(device)
+        # Relativo ao centroide dos átomos já colocados: invariante a
+        # translação, que é o que o tensor do sítio já fixa. A escala /10
+        # mantém os valores na mesma ordem de grandeza das demais features.
+        centroid = pos.mean(dim=0, keepdim=True)
+        rel = pos - centroid
+        x[:, 28:31] = (rel / 10.0).clamp(-1.0, 1.0)
+        x[:, 31] = (rel.norm(dim=-1) / 10.0).clamp(0.0, 1.0)
+
+    if valence_used is not None and n > 0:
+        remaining = (max_val - valence_used.float().to(device)).clamp(min=0.0)
+        x[:, 32] = (remaining / 6.0).clamp(0.0, 1.0)
+    else:
+        x[:, 32] = (max_val / 6.0).clamp(0.0, 1.0)
+
+    if bond_counts is not None and n > 0:
+        x[:, 33:37] = (bond_counts.float().to(device) / 4.0).clamp(0.0, 1.0)
+
     return x
 
 
@@ -609,6 +674,7 @@ class GNNDecoder(nn.Module):
         dropout:      float = 0.2,
         use_ecfp4:    bool = False,
         ecfp4_bits:   int  = 512,
+        n_pos_components: int = N_POS_COMPONENTS,
     ):
         super().__init__()
         self.latent_dim    = latent_dim
@@ -635,9 +701,16 @@ class GNNDecoder(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
         )
+        # edge_dim: o passo parcial agora carrega features de aresta
+        # [one-hot do tipo de ligação (4) ; distância/2 Å (1)]. Antes o
+        # GATConv era chamado sem edge_attr — o decoder não via sequer o
+        # tipo das ligações que ele próprio já havia decidido, quanto mais
+        # a geometria.
+        self.edge_feat_dim = n_bond_types + 1
         self.gnn_layers = nn.ModuleList([
             GATConv(hidden_dim, hidden_dim // 4, heads=4,
-                    dropout=dropout, concat=True)
+                    dropout=dropout, concat=True,
+                    edge_dim=self.edge_feat_dim)
             for _ in range(n_gnn_layers)
         ])
         self.layer_norms = nn.ModuleList([
@@ -659,10 +732,44 @@ class GNNDecoder(nn.Module):
             nn.Linear(ctx_dim, 64), nn.GELU(),
             nn.Linear(64, 1)
         )
-        self.head_pos = nn.Sequential(
-            nn.Linear(ctx_dim, 128), nn.GELU(),
-            nn.Linear(128, 3)
+        # ── Carga FORMAL (−1/0/+1) ────────────────────────────────────────
+        # head_charge acima prevê carga de Gasteiger (parcial, contínua),
+        # que não serve para Chem.Atom.SetFormalCharge. Esta cabeça prevê a
+        # carga formal de verdade, que a montagem da molécula precisa para
+        # que grupos legitimamente carregados sobrevivam à sanitização.
+        self.head_fcharge = nn.Sequential(
+            nn.Linear(ctx_dim, 64), nn.GELU(),
+            nn.Linear(64, 3)
         )
+
+        # ── Átomo FOCAL ───────────────────────────────────────────────────
+        # Escolhe, entre os átomos já colocados, aquele a partir do qual o
+        # próximo cresce — o mesmo papel do focal_net do PocketFlow e da
+        # seleção de foco do Pocket2Mol. É o que dá uma âncora concreta à
+        # posição e o ponto onde a máscara de valência age.
+        self.head_focal = nn.Sequential(
+            nn.Linear(hidden_dim + ctx_dim, hidden_dim // 2), nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+        # ── Posição: mixture density network RELATIVA ao focal ────────────
+        # Substitui a regressão determinística da coordenada absoluta. Sob
+        # incerteza multimodal (o próximo átomo pode ir para várias direções
+        # igualmente válidas), a regressão com Huber devolve a média — que
+        # é justamente o ponto onde NÃO há átomo nenhum. A MDN representa
+        # os modos e é amostrada, não promediada. Mesma formulação de
+        # Pocket2Mol (models/position.py): mu relativo ao focal, sigma por
+        # componente e por eixo, pesos pi.
+        self.n_pos_components = n_pos_components
+        self.head_pos_mdn = nn.Sequential(
+            nn.Linear(hidden_dim + ctx_dim, 128), nn.GELU(),
+            nn.Linear(128, n_pos_components * 7)   # 3 mu + 3 logsigma + 1 pi
+        )
+        # Embedding usado no lugar de h_focal quando não existe focal
+        # (primeiro átomo da molécula, ou reinício de fragmento): nesses
+        # casos a MDN prevê a posição ABSOLUTA no referencial da grade,
+        # com pos_focal = 0. Treino e geração usam a mesma convenção.
+        self.no_focal_embed = nn.Parameter(torch.zeros(hidden_dim))
 
         # Cabeça de ligação: [embedding do átomo JÁ EXISTENTE ; contexto do
         # NOVO átomo] — uma predição por par (novo, existente_i).
@@ -679,7 +786,7 @@ class GNNDecoder(nn.Module):
 
     # ── Núcleo: um passo, para um lote de grafos parciais já concatenados ──
     def _encode_partial(self, z_input, partial_x, partial_edge_index,
-                         partial_batch_vec, n_active):
+                         partial_batch_vec, n_active, partial_edge_attr=None):
         """z_input: (n_active, z_input_dim). partial_x/edge_index/batch_vec:
         grafo parcial "solto" (não é PyG Batch — tensores concatenados +
         vetor de pertencimento manual, ver forward_teacher_forcing), pode
@@ -693,27 +800,87 @@ class GNNDecoder(nn.Module):
         else:
             z_node = z_proj[partial_batch_vec]
             h = self.node_embed(partial_x) + z_node
+            if partial_edge_attr is None and partial_edge_index.shape[1] > 0:
+                partial_edge_attr = partial_edge_index.new_zeros(
+                    (partial_edge_index.shape[1], self.edge_feat_dim),
+                    dtype=h.dtype,
+                )
             for gnn, ln in zip(self.gnn_layers, self.layer_norms):
-                h = ln(h + gnn(h, partial_edge_index))
+                h = ln(h + gnn(h, partial_edge_index, edge_attr=partial_edge_attr))
             pooled = global_mean_pool(h, partial_batch_vec, size=n_active)
         ctx = torch.cat([pooled, z_proj], dim=-1)
         return h, ctx
 
     def forward_step(self, z_input, partial_x, partial_edge_index,
-                      partial_batch_vec, n_active):
-        """Prediz parar/tipo/carga/posição do PRÓXIMO átomo para as
-        n_active moléculas ativas neste passo. Retorna também (h, ctx) —
-        necessários para predict_bonds."""
+                      partial_batch_vec, n_active, partial_edge_attr=None):
+        """Prediz parar/tipo/carga/carga formal do PRÓXIMO átomo e pontua
+        cada átomo já colocado como candidato a FOCAL, para as n_active
+        moléculas ativas neste passo. Retorna também (h, ctx) — necessários
+        para predict_bonds e para a MDN de posição.
+
+        A posição NÃO sai daqui: ela depende de qual átomo focal foi
+        escolhido, e essa escolha difere entre treino (focal real, vindo da
+        ordem de construção) e geração (focal amostrado sob máscara de
+        valência). Ver position_mdn().
+        """
         h, ctx = self._encode_partial(
-            z_input, partial_x, partial_edge_index, partial_batch_vec, n_active
+            z_input, partial_x, partial_edge_index, partial_batch_vec,
+            n_active, partial_edge_attr
         )
+        if h.shape[0] > 0:
+            focal_logits = self.head_focal(
+                torch.cat([h, ctx[partial_batch_vec]], dim=-1)
+            ).squeeze(-1)
+        else:
+            focal_logits = h.new_zeros((0,))
         return {
             "stop_logit":       self.head_stop(ctx).squeeze(-1),
             "atom_type_logits": self.head_atom_type(ctx),
             "charge":           self.head_charge(ctx).squeeze(-1),
-            "pos":              self.head_pos(ctx),
+            "fcharge_logits":   self.head_fcharge(ctx),
+            "focal_logits":     focal_logits,
             "_h": h, "_ctx": ctx,
         }
+
+    def _focal_feature(self, h, focal_node_idx, n_active):
+        """Embedding do átomo focal de cada molécula ativa.
+
+        focal_node_idx: (n_active,) índices em h, ou −1 quando a molécula
+        não tem focal neste passo (primeiro átomo, ou reinício de
+        fragmento). Nesses casos entra `no_focal_embed` e a MDN passa a
+        prever a posição ABSOLUTA no referencial da grade.
+        """
+        feat = self.no_focal_embed.unsqueeze(0).expand(n_active, -1).contiguous()
+        if h.shape[0] > 0:
+            valid = focal_node_idx >= 0
+            if bool(valid.any()):
+                feat = feat.clone()
+                feat[valid] = h[focal_node_idx[valid]]
+        return feat
+
+    def position_mdn(self, h, ctx, focal_node_idx, focal_pos):
+        """Parâmetros da mixture density network da posição do próximo átomo.
+
+        Args:
+            focal_node_idx: (n_active,) índice do focal em h, ou −1.
+            focal_pos:      (n_active,3) posição do focal (zeros se −1).
+
+        Returns:
+            mu_abs (n_active, K, 3) — médias JÁ em coordenadas absolutas
+                (mu relativo + posição do focal, como em Pocket2Mol);
+            sigma  (n_active, K, 3);
+            pi_logits (n_active, K) — pesos SEM softmax (a loss usa
+                log_softmax, a amostragem usa softmax).
+        """
+        n_active = ctx.shape[0]
+        h_focal = self._focal_feature(h, focal_node_idx, n_active)
+        raw = self.head_pos_mdn(torch.cat([h_focal, ctx], dim=-1))
+        K = self.n_pos_components
+        mu_rel   = raw[:, :K * 3].view(n_active, K, 3)
+        logsigma = raw[:, K * 3:K * 6].view(n_active, K, 3).clamp(-5.0, 3.0)
+        pi_logits = raw[:, K * 6:]
+        mu_abs = mu_rel + focal_pos.unsqueeze(1)
+        return mu_abs, logsigma.exp(), pi_logits
 
     def predict_bonds(self, h, ctx, batch_vec_h, active_next_local):
         """h/batch_vec_h: nós/pertencimento do grafo parcial DE TODAS as
@@ -782,7 +949,9 @@ class GNNDecoder(nn.Module):
 
         acc = {k: [] for k in (
             "stop_logits", "stop_targets", "atom_logits", "atom_targets",
-            "charges", "charge_targets", "positions", "pos_targets",
+            "charges", "charge_targets", "pos_targets",
+            "pos_mu", "pos_sigma", "pos_pi", "focal_nll",
+            "fcharge_logits", "fcharge_targets",
             "bond_exist", "bond_exist_targets", "bond_logits", "bond_targets",
         )}
 
@@ -793,36 +962,67 @@ class GNNDecoder(nn.Module):
             n_active = len(active_stop)
 
             xs, eis, eas, batch_vec_parts = [], [], [], []
+            pos_maps, offsets = {}, {}
             offset = 0
             for local_i, orig_i in enumerate(active_stop):
                 g = graphs[orig_i]
                 if t == 0:
                     continue
+                dev_g = g.x.device
                 order_t = g.atom_order[:t]
                 pos_map = {int(idx): k for k, idx in enumerate(order_t.tolist())}
+                pos_maps[local_i] = pos_map
+                offsets[local_i] = offset
                 ei, ea = g.edge_index, g.edge_attr
                 keep_cols = [k for k in range(ei.shape[1])
                              if int(ei[0, k]) in pos_map and int(ei[1, k]) in pos_map]
 
+                # Posições dos átomos JÁ colocados: entram como feature do nó
+                # (relativas ao centroide) e como distância nas arestas. Sem
+                # isso o decoder não via a própria geometria — causa raiz do
+                # colapso da cabeça de posição na arquitetura 1.
+                pos_t = g.pos[order_t].float()
+
                 # Grau NO GRAFO PARCIAL (não o grau da molécula final) — ver
                 # _make_partial_features. Calculado nos índices LOCAIS
                 # (0..t-1) antes de aplicar o offset do batch.
-                degree_t = torch.zeros(t, dtype=torch.float32)
+                degree_t = torch.zeros(t, dtype=torch.float32, device=dev_g)
+                valence_t = torch.zeros(t, dtype=torch.float32, device=dev_g)
+                bcounts_t = torch.zeros((t, BOND_TYPE_DIM), dtype=torch.float32,
+                                        device=dev_g)
                 if keep_cols:
-                    idx_t = torch.tensor(keep_cols, dtype=torch.long)
+                    idx_t = torch.tensor(keep_cols, dtype=torch.long, device=dev_g)
                     sub_ei_local = ei[:, idx_t].clone()
                     for col in range(sub_ei_local.shape[1]):
                         sub_ei_local[0, col] = pos_map[int(sub_ei_local[0, col])]
                         sub_ei_local[1, col] = pos_map[int(sub_ei_local[1, col])]
                     degree_t = torch.bincount(sub_ei_local[0], minlength=t).float()
-                    sub_ei = sub_ei_local + offset
-                    eis.append(sub_ei)
-                    eas.append(ea[idx_t])
+
+                    # Tipo de cada aresta mantida (mesma convenção de
+                    # _build_adjacency: argmax dos BOND_TYPE_DIM primeiros
+                    # canais de edge_attr).
+                    bt_col = ea[idx_t][:, :BOND_TYPE_DIM].argmax(dim=-1)
+                    bt_onehot = torch.zeros((bt_col.shape[0], BOND_TYPE_DIM),
+                                            dtype=torch.float32, device=dev_g)
+                    bt_onehot[torch.arange(bt_col.shape[0], device=dev_g), bt_col] = 1.0
+                    order_val = _BOND_ORDER.to(dev_g)[bt_col]
+                    # edge_index é bidirecional: somar em [0] dá, para cada
+                    # átomo, a ordem total consumida e a contagem por tipo.
+                    valence_t = valence_t.index_add(0, sub_ei_local[0], order_val)
+                    bcounts_t = bcounts_t.index_add(0, sub_ei_local[0], bt_onehot)
+
+                    d_edge = (pos_t[sub_ei_local[0]] - pos_t[sub_ei_local[1]]
+                              ).norm(dim=-1, keepdim=True) / 2.0
+                    eis.append(sub_ei_local + offset)
+                    eas.append(torch.cat([bt_onehot, d_edge.clamp(0.0, 2.0)], dim=-1))
 
                 atom_type_t = g.x[order_t, :ATOM_TYPE_DIM].argmax(dim=-1)
                 charge_t    = g.x[order_t, 19]
-                xs.append(_make_partial_features(atom_type_t, charge_t, degree_t))
-                batch_vec_parts.append(torch.full((t,), local_i, dtype=torch.long))
+                xs.append(_make_partial_features(
+                    atom_type_t, charge_t, degree_t,
+                    positions=pos_t, valence_used=valence_t, bond_counts=bcounts_t))
+                batch_vec_parts.append(
+                    torch.full((t,), local_i, dtype=torch.long, device=dev_g))
                 offset += t
 
             if xs:
@@ -830,15 +1030,19 @@ class GNNDecoder(nn.Module):
                 partial_batch_vec = torch.cat(batch_vec_parts, dim=0).to(device)
                 partial_edge_index = (torch.cat(eis, dim=1).to(device)
                                       if eis else torch.zeros((2, 0), dtype=torch.long, device=device))
+                partial_edge_attr = (torch.cat(eas, dim=0).to(device)
+                                     if eas else z.new_zeros((0, self.edge_feat_dim)))
             else:
                 partial_x = z.new_zeros((0, self.node_feat_dim))
                 partial_batch_vec = torch.zeros(0, dtype=torch.long, device=device)
                 partial_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+                partial_edge_attr = z.new_zeros((0, self.edge_feat_dim))
 
             active_stop_t = torch.tensor(active_stop, dtype=torch.long, device=device)
             z_input_active = z_input_full[active_stop_t]
             step_out = self.forward_step(
-                z_input_active, partial_x, partial_edge_index, partial_batch_vec, n_active
+                z_input_active, partial_x, partial_edge_index,
+                partial_batch_vec, n_active, partial_edge_attr
             )
 
             stop_target = torch.tensor(
@@ -867,8 +1071,64 @@ class GNNDecoder(nn.Module):
             acc["atom_targets"].append(next_feats[:, :ATOM_TYPE_DIM].argmax(dim=-1))
             acc["charges"].append(step_out["charge"][active_next_local])
             acc["charge_targets"].append(next_feats[:, 19])
-            acc["positions"].append(step_out["pos"][active_next_local])
+
+            # Carga FORMAL (slot 18 do vetor de features) discretizada em
+            # {−1, 0, +1} → classes {0, 1, 2}. Cargas fora dessa faixa são
+            # raras em ligantes depositados e são saturadas no extremo.
+            acc["fcharge_logits"].append(step_out["fcharge_logits"][active_next_local])
+            acc["fcharge_targets"].append(
+                (next_feats[:, 18].round().clamp(-1.0, 1.0) + 1.0).long())
+
+            # ── Átomo focal real e MDN de posição ─────────────────────────
+            # O focal do próximo átomo é o vizinho REAL dele que foi
+            # colocado PRIMEIRO na ordem de construção. É a âncora que torna
+            # a posição uma quantidade local (~1,5 Å) em vez de uma
+            # coordenada absoluta no referencial da grade.
+            focal_idx_list, focal_pos_list = [], []
+            for jl, no in zip(anl_list, next_orig):
+                orig_i = active_stop[jl]
+                g = graphs[orig_i]
+                adj = adjacencies[orig_i]
+                pmap = pos_maps.get(jl, {})
+                cand_local = [pmap[nb] for nb in adj.get(no, {}) if nb in pmap]
+                if cand_local:
+                    f_local = min(cand_local)          # o colocado mais cedo
+                    f_orig  = int(g.atom_order[f_local])
+                    focal_idx_list.append(offsets[jl] + f_local)
+                    focal_pos_list.append(g.pos[f_orig].float())
+                else:
+                    # Primeiro átomo, ou reinício de fragmento: sem âncora.
+                    # A MDN prevê a posição absoluta (focal_pos = 0).
+                    focal_idx_list.append(-1)
+                    focal_pos_list.append(
+                        torch.zeros(3, dtype=torch.float32, device=device))
+
+            focal_idx_t = torch.tensor(focal_idx_list, dtype=torch.long, device=device)
+            focal_pos_t = torch.stack(focal_pos_list).to(device)
+
+            mu, sigma, pi_logits = self.position_mdn(
+                step_out["_h"], step_out["_ctx"][active_next_local],
+                focal_idx_t, focal_pos_t,
+            )
+            acc["pos_mu"].append(mu)
+            acc["pos_sigma"].append(sigma)
+            acc["pos_pi"].append(pi_logits)
             acc["pos_targets"].append(next_pos_t)
+
+            # Perda do foco: entropia cruzada DENTRO de cada molécula (os
+            # candidatos a focal são os átomos já colocados daquela
+            # molécula, não do batch inteiro) — por isso é acumulada aqui
+            # como NLL por amostra, já segmentada.
+            focal_logits_all = step_out["focal_logits"]
+            for k, jl in enumerate(anl_list):
+                f_global = focal_idx_list[k]
+                if f_global < 0 or t == 0:
+                    continue
+                seg = focal_logits_all[offsets[jl]: offsets[jl] + t]
+                if seg.numel() == 0:
+                    continue
+                acc["focal_nll"].append(
+                    -F.log_softmax(seg, dim=0)[f_global - offsets[jl]].view(1))
 
             bond_exist_logits, bond_type_logits = self.predict_bonds(
                 step_out["_h"], step_out["_ctx"], partial_batch_vec, active_next_local
@@ -904,8 +1164,13 @@ class GNNDecoder(nn.Module):
             "atom_targets":       _cat("atom_targets").long(),
             "charges":            _cat("charges"),
             "charge_targets":     _cat("charge_targets"),
-            "positions":          _cat("positions", (3,)),
             "pos_targets":        _cat("pos_targets", (3,)),
+            "pos_mu":             _cat("pos_mu", (self.n_pos_components, 3)),
+            "pos_sigma":          _cat("pos_sigma", (self.n_pos_components, 3)),
+            "pos_pi":             _cat("pos_pi", (self.n_pos_components,)),
+            "focal_nll":          _cat("focal_nll"),
+            "fcharge_logits":     _cat("fcharge_logits", (3,)),
+            "fcharge_targets":    _cat("fcharge_targets").long(),
             "bond_exist":         _cat("bond_exist"),
             "bond_exist_targets": _cat("bond_exist_targets"),
             "bond_logits":        _cat("bond_logits", (self.n_bond_types,)),
@@ -945,6 +1210,7 @@ class LigandCVAE(nn.Module):
         dropout:      float = 0.2,
         use_ecfp4:    bool  = False,
         ecfp4_bits:   int   = 512,
+        n_pos_components: int = N_POS_COMPONENTS,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -963,6 +1229,7 @@ class LigandCVAE(nn.Module):
             dropout=dropout,
             use_ecfp4=use_ecfp4,
             ecfp4_bits=ecfp4_bits,
+            n_pos_components=n_pos_components,
         )
 
     def _init_weights(self):
@@ -1063,8 +1330,14 @@ class LigandCVAE(nn.Module):
 
         atom_types: list = [[] for _ in range(n_samples)]
         charges:    list = [[] for _ in range(n_samples)]
+        fcharges:   list = [[] for _ in range(n_samples)]   # carga FORMAL (−1/0/+1)
         positions:  list = [[] for _ in range(n_samples)]
         bonds:      list = [[] for _ in range(n_samples)]   # (i, j, bond_type) locais
+        # Ordem de ligação já consumida e contagem por tipo, por átomo —
+        # alimentam as features do nó e a máscara de valência da escolha do
+        # focal. Mantidos incrementalmente para não recomputar a cada passo.
+        valence_used: list = [[] for _ in range(n_samples)]
+        bond_counts:  list = [[] for _ in range(n_samples)]
         finished = [False] * n_samples
 
         for t in range(max_atoms):
@@ -1074,27 +1347,39 @@ class LigandCVAE(nn.Module):
 
             # ── monta o grafo parcial dos candidatos ativos ────────────────
             xs, eis, eas, batch_vec_parts = [], [], [], []
+            offsets = {}
             offset = 0
             for local_i, cand in enumerate(active):
                 n_i = len(atom_types[cand])
                 if n_i == 0:
                     continue
+                offsets[local_i] = offset
                 type_t   = torch.tensor(atom_types[cand], dtype=torch.long, device=device)
                 charge_t = torch.tensor(charges[cand], dtype=torch.float32, device=device)
+                pos_t    = torch.tensor(positions[cand], dtype=torch.float32, device=device)
+                val_t    = torch.tensor(valence_used[cand], dtype=torch.float32, device=device)
+                bc_t     = torch.tensor(bond_counts[cand], dtype=torch.float32, device=device)
                 if bonds[cand]:
                     pairs = [[a, b] for (a, b, _) in bonds[cand]] + \
                             [[b, a] for (a, b, _) in bonds[cand]]
                     ei_local = torch.tensor(pairs, dtype=torch.long, device=device).t()
                     degree_t = torch.bincount(ei_local[0], minlength=n_i).float()
-                    ea_local = []
-                    for (_, _, bt) in bonds[cand]:
-                        v = [0.0] * 8; v[bt] = 1.0
-                        ea_local += [v, v]
+                    # Features de aresta idênticas às do treino:
+                    # [one-hot do tipo (4) ; distância/2 Å (1)].
+                    bt_list = [bt for (_, _, bt) in bonds[cand]] * 2
+                    bt_col = torch.tensor(bt_list, dtype=torch.long, device=device)
+                    bt_onehot = torch.zeros((bt_col.shape[0], BOND_TYPE_DIM),
+                                            dtype=torch.float32, device=device)
+                    bt_onehot[torch.arange(bt_col.shape[0], device=device), bt_col] = 1.0
+                    d_edge = (pos_t[ei_local[0]] - pos_t[ei_local[1]]
+                              ).norm(dim=-1, keepdim=True) / 2.0
                     eis.append(ei_local + offset)
-                    eas.append(torch.tensor(ea_local, dtype=torch.float32, device=device))
+                    eas.append(torch.cat([bt_onehot, d_edge.clamp(0.0, 2.0)], dim=-1))
                 else:
                     degree_t = torch.zeros(n_i, dtype=torch.float32, device=device)
-                xs.append(_make_partial_features(type_t, charge_t, degree_t))
+                xs.append(_make_partial_features(
+                    type_t, charge_t, degree_t,
+                    positions=pos_t, valence_used=val_t, bond_counts=bc_t))
                 batch_vec_parts.append(torch.full((n_i,), local_i, dtype=torch.long, device=device))
                 offset += n_i
 
@@ -1103,15 +1388,19 @@ class LigandCVAE(nn.Module):
                 partial_batch_vec = torch.cat(batch_vec_parts, dim=0)
                 partial_edge_index = (torch.cat(eis, dim=1) if eis
                                       else torch.zeros((2, 0), dtype=torch.long, device=device))
+                partial_edge_attr = (torch.cat(eas, dim=0) if eas
+                                     else z.new_zeros((0, self.decoder.edge_feat_dim)))
             else:
                 partial_x = z.new_zeros((0, self.decoder.node_feat_dim))
                 partial_batch_vec = torch.zeros(0, dtype=torch.long, device=device)
                 partial_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+                partial_edge_attr = z.new_zeros((0, self.decoder.edge_feat_dim))
 
             active_t = torch.tensor(active, dtype=torch.long, device=device)
             z_input_active = z_input_full[active_t]
             step_out = self.decoder.forward_step(
-                z_input_active, partial_x, partial_edge_index, partial_batch_vec, len(active)
+                z_input_active, partial_x, partial_edge_index,
+                partial_batch_vec, len(active), partial_edge_attr
             )
 
             stop_prob = torch.sigmoid(step_out["stop_logit"])
@@ -1120,14 +1409,74 @@ class LigandCVAE(nn.Module):
                 will_stop = torch.ones_like(will_stop)   # força parar no teto
 
             type_probs = (step_out["atom_type_logits"] / max(temperature, 1e-3)).softmax(dim=-1)
-            next_type  = torch.multinomial(type_probs, 1).squeeze(-1)
-            next_pos   = step_out["pos"]
-            next_charge = step_out["charge"]
+            next_type    = torch.multinomial(type_probs, 1).squeeze(-1)
+            next_charge  = step_out["charge"]
+            next_fcharge = step_out["fcharge_logits"].argmax(dim=-1) - 1   # {0,1,2} → {−1,0,+1}
+
+            maxval = _ATOM_TYPE_MAXVAL.to(device)
+            border = _BOND_ORDER.to(device)
+
+            # ── Átomo FOCAL, sob máscara de valência ──────────────────────
+            # Só átomos com valência sobrando podem receber o próximo. Um
+            # candidato cujos átomos estão todos saturados é encerrado em
+            # vez de forçar uma ligação impossível — mesma decisão do
+            # choose_focal do PocketFlow.
+            focal_local, focal_idx_list, focal_pos_list = {}, [], []
+            for li in range(len(active)):
+                if bool(will_stop[li]):
+                    continue
+                cand = active[li]
+                n_i = len(atom_types[cand])
+                if n_i == 0:
+                    focal_local[li] = -1      # primeiro átomo: sem âncora
+                    continue
+                base = offsets[li]
+                rem = torch.tensor(
+                    [float(maxval[atom_types[cand][k]]) - valence_used[cand][k]
+                     for k in range(n_i)], dtype=torch.float32, device=device)
+                logits_i = step_out["focal_logits"][base:base + n_i].clone()
+                logits_i[rem <= 0.05] = float("-inf")
+                if not bool(torch.isfinite(logits_i).any()):
+                    will_stop[li] = True
+                    continue
+                probs_f = (logits_i / max(temperature, 1e-3)).softmax(dim=-1)
+                focal_local[li] = int(torch.multinomial(probs_f, 1))
 
             continue_local = [li for li in range(len(active)) if not bool(will_stop[li])]
+            for li in continue_local:
+                cand = active[li]
+                f = focal_local.get(li, -1)
+                if f < 0:
+                    focal_idx_list.append(-1)
+                    focal_pos_list.append(torch.zeros(3, device=device))
+                else:
+                    focal_idx_list.append(offsets[li] + f)
+                    focal_pos_list.append(torch.tensor(
+                        positions[cand][f], dtype=torch.float32, device=device))
+
+            next_pos_map = {}
             bond_exist_probs = bond_type_pred = None
             if continue_local:
                 cl_t = torch.tensor(continue_local, dtype=torch.long, device=device)
+
+                # ── Posição AMOSTRADA da mistura, não promediada ──────────
+                # É aqui que a arquitetura 2 difere da 1: em vez de um
+                # ponto determinístico (que sob incerteza multimodal vira a
+                # média — o lugar onde não há átomo nenhum), sorteia-se uma
+                # componente da mistura e depois um ponto dentro dela.
+                mu, sigma, pi_logits = self.decoder.position_mdn(
+                    step_out["_h"], step_out["_ctx"][cl_t],
+                    torch.tensor(focal_idx_list, dtype=torch.long, device=device),
+                    torch.stack(focal_pos_list),
+                )
+                pi = (pi_logits / max(temperature, 1e-3)).softmax(dim=-1)
+                comp = torch.multinomial(pi, 1).squeeze(-1)
+                ar = torch.arange(mu.shape[0], device=device)
+                sampled = torch.normal(mu[ar, comp],
+                                       sigma[ar, comp] * max(temperature, 1e-3))
+                for k, li in enumerate(continue_local):
+                    next_pos_map[li] = sampled[k]
+
                 bond_exist_logits, bond_type_logits = self.decoder.predict_bonds(
                     step_out["_h"], step_out["_ctx"], partial_batch_vec, cl_t
                 )
@@ -1135,27 +1484,71 @@ class LigandCVAE(nn.Module):
                     bond_exist_probs = torch.sigmoid(bond_exist_logits)
                     bond_type_pred   = bond_type_logits.argmax(dim=-1)
 
+            for li in range(len(active)):
+                if bool(will_stop[li]):
+                    finished[active[li]] = True
+
             # distribui as decisões de volta para cada candidato — a ordem
             # dos pares em bond_exist_probs segue exatamente a ordem de
             # continue_local (li crescente) × átomos já existentes (0..n_i-1
             # na ordem de colocação), ver GNNDecoder.predict_bonds.
             cursor = 0
-            for li in range(len(active)):
+            for li in continue_local:
                 cand = active[li]
-                if bool(will_stop[li]):
-                    finished[cand] = True
-                    continue
                 n_i = len(atom_types[cand])
+                new_type = int(next_type[li])
+                new_max  = float(maxval[new_type])
+                f_local  = focal_local.get(li, -1)
+
+                probs_i = types_i = None
                 if bond_exist_probs is not None and n_i > 0:
                     probs_i = bond_exist_probs[cursor:cursor + n_i]
                     types_i = bond_type_pred[cursor:cursor + n_i]
-                    for k in range(n_i):
-                        if float(probs_i[k]) > bond_threshold:
-                            bonds[cand].append((k, n_i, int(types_i[k])))
                     cursor += n_i
-                atom_types[cand].append(int(next_type[li]))
+
+                new_used   = [0.0]
+                new_counts = [0.0] * BOND_TYPE_DIM
+
+                def _try_bond(k: int, bt: int) -> bool:
+                    """Aceita a ligação só se couber na valência dos DOIS
+                    lados. Rejeitar aqui, ANTES de a ligação existir, evita
+                    a fragmentação que a filtragem pós-hoc causava."""
+                    o = float(border[bt])
+                    rem_k = float(maxval[atom_types[cand][k]]) - valence_used[cand][k]
+                    if o > rem_k + 1e-6 or new_used[0] + o > new_max + 1e-6:
+                        return False
+                    bonds[cand].append((k, n_i, int(bt)))
+                    valence_used[cand][k] += o
+                    bond_counts[cand][k][bt] += 1.0
+                    new_used[0] += o
+                    new_counts[bt] += 1.0
+                    return True
+
+                # A ligação com o focal é a âncora da posição: tentada
+                # primeiro e, se o tipo previsto não couber na valência
+                # restante, rebaixada para simples antes de desistir.
+                if f_local >= 0:
+                    bt_focal = int(types_i[f_local]) if types_i is not None else 0
+                    if not _try_bond(f_local, bt_focal):
+                        _try_bond(f_local, 0)
+
+                # Demais ligações, por probabilidade decrescente e só
+                # enquanto a valência permitir — o rollback do PocketFlow,
+                # aqui de forma determinística (sem reamostragem).
+                if probs_i is not None:
+                    for k in torch.argsort(probs_i, descending=True).tolist():
+                        if k == f_local:
+                            continue
+                        if float(probs_i[k]) <= bond_threshold:
+                            break
+                        _try_bond(k, int(types_i[k]))
+
+                atom_types[cand].append(new_type)
                 charges[cand].append(float(next_charge[li]))
-                positions[cand].append(next_pos[li].tolist())
+                fcharges[cand].append(int(next_fcharge[li]))
+                positions[cand].append(next_pos_map[li].tolist())
+                valence_used[cand].append(new_used[0])
+                bond_counts[cand].append(new_counts)
                 if len(atom_types[cand]) >= max_atoms:
                     finished[cand] = True
 
@@ -1164,6 +1557,7 @@ class LigandCVAE(nn.Module):
             results.append({
                 "atom_types": torch.tensor(atom_types[cand], dtype=torch.long),
                 "charges":    torch.tensor(charges[cand], dtype=torch.float32),
+                "formal_charges": torch.tensor(fcharges[cand], dtype=torch.long),
                 "positions":  (torch.tensor(positions[cand], dtype=torch.float32)
                               if positions[cand] else torch.zeros((0, 3))),
                 "bonds":      bonds[cand],
@@ -1180,6 +1574,7 @@ def cvae_loss(
     beta: float = 1.0,
     pos_weight: float = 2.0,
     stop_weight: float = 1.0,
+    focal_weight: float = 1.0,
 ) -> dict:
     """Loss total do CVAE (decoder autorregressivo) = reconstruction loss +
     β·KL divergence.
@@ -1216,14 +1611,32 @@ def cvae_loss(
     device = preds["z_mean"].device
     zero = torch.zeros((), device=device)
 
-    L_stop = (F.binary_cross_entropy_with_logits(preds["stop_logits"], preds["stop_targets"])
+    def _pos_weight_for(targets: torch.Tensor) -> "torch.Tensor | None":
+        """pos_weight do BCE = nº de negativos / nº de positivos do batch.
+
+        Sem isto, as duas cabeças binárias ficam sistematicamente
+        subestimadas: parar acontece 1 vez a cada ~21 passos, e só 8,6% dos
+        pares (novo átomo × átomo já colocado) são ligação de verdade. O
+        ótimo de um BCE não ponderado sob esse desbalanceamento é prever
+        "não" quase sempre — foi o que produziu moléculas grandes demais
+        (43-54 átomos contra mediana real de 20) e fragmentadas.
+        """
+        n_pos = float(targets.sum().item())
+        if n_pos <= 0.0:
+            return None
+        n_neg = float(targets.numel()) - n_pos
+        return torch.tensor(max(n_neg / n_pos, 1.0), device=targets.device)
+
+    L_stop = (F.binary_cross_entropy_with_logits(
+                  preds["stop_logits"], preds["stop_targets"],
+                  pos_weight=_pos_weight_for(preds["stop_targets"]))
               if preds["stop_logits"].shape[0] > 0 else zero)
     L_atom = (F.cross_entropy(preds["atom_logits"], preds["atom_targets"])
               if preds["atom_logits"].shape[0] > 0 else zero)
     L_charge = (F.mse_loss(preds["charges"], preds["charge_targets"])
                 if preds["charges"].shape[0] > 0 else zero)
 
-    if preds["positions"].shape[0] > 0:
+    if preds["pos_targets"].shape[0] > 0:
         # Huber (smooth L1) em Å, com beta = 1 Å: quadrático dentro de 1 Å,
         # linear além disso.
         #
@@ -1240,12 +1653,72 @@ def cvae_loss(
         # 3 Å custam ~2,5, comparáveis ao termo de tipo atômico. O Huber
         # evita que os erros grandes das primeiras épocas dominem o
         # gradiente, como aconteceria com MSE puro.
-        L_pos = F.smooth_l1_loss(preds["positions"], preds["pos_targets"], beta=1.0)
+        # SUBSTITUÍDO na arquitetura 2 por −log-verossimilhança sob a MDN.
+        # O Huber acima media a incerteza: quando o próximo átomo pode ir
+        # para várias direções igualmente válidas, o mínimo do erro
+        # quadrático/Huber é a MÉDIA dessas direções — um ponto onde não há
+        # átomo nenhum. Medido: o modelo treinado ficava PIOR que um
+        # preditor que sempre chuta o centroide (1,599 contra 1,126), e na
+        # geração livre todos os átomos saíam empilhados (raio de giro
+        # 0,3 Å contra 3,3 Å real). A mistura representa os modos em vez de
+        # promediá-los, e é AMOSTRADA na geração.
+        #
+        # Calculada em espaço log (logsumexp) e não como produto de
+        # densidades: com 3 dimensões e sigma pequeno o produto satura em 0
+        # e o log explode. Pocket2Mol multiplica as densidades e loga
+        # depois (models/position.py); aqui, a forma estável.
+        mu    = preds["pos_mu"]                      # (N, K, 3)
+        sigma = preds["pos_sigma"].clamp(min=1e-4)   # (N, K, 3)
+        tgt   = preds["pos_targets"].unsqueeze(1)    # (N, 1, 3)
+        log_norm = (-0.5 * ((tgt - mu) / sigma) ** 2
+                    - sigma.log() - 0.9189385332046727)   # 0.5·log(2π)
+        log_comp = log_norm.sum(dim=-1) + F.log_softmax(preds["pos_pi"], dim=-1)
+        L_pos = -torch.logsumexp(log_comp, dim=-1).mean()
+
+        # Diagnóstico legível em Å (não entra no gradiente): distância
+        # entre o alvo e a média da componente de maior peso. O log da
+        # arquitetura 1 imprimia o valor do Huber rotulado como "Å", o que
+        # era enganoso.
+        with torch.no_grad():
+            best = preds["pos_pi"].argmax(dim=-1)
+            ar = torch.arange(mu.shape[0], device=mu.device)
+            pos_mae = (mu[ar, best] - preds["pos_targets"]).norm(dim=-1).mean()
     else:
         L_pos = zero
+        pos_mae = zero
 
-    L_exist = (F.binary_cross_entropy_with_logits(preds["bond_exist"], preds["bond_exist_targets"])
+    L_exist = (F.binary_cross_entropy_with_logits(
+                   preds["bond_exist"], preds["bond_exist_targets"],
+                   pos_weight=_pos_weight_for(preds["bond_exist_targets"]))
                if preds["bond_exist"].shape[0] > 0 else zero)
+
+    # ── Foco e carga formal ───────────────────────────────────────────────
+    L_focal = (preds["focal_nll"].mean()
+               if preds["focal_nll"].shape[0] > 0 else zero)
+    # Carga formal: 99,2% dos átomos do conjunto de treino têm carga 0
+    # (0,56% em −1 e 0,22% em +1). Sem ponderação, a entropia cruzada
+    # colapsa para "prever 0 sempre" e a cabeça não entrega nada.
+    #
+    # A ponderação é pela RAIZ da frequência inversa, não pela frequência
+    # inversa cheia. Balanceamento total daria ~124× de peso às classes
+    # raras, e aqui os dois erros NÃO custam o mesmo: deixar de prever uma
+    # carga é inócuo (é o comportamento anterior, em que nenhuma carga era
+    # atribuída), enquanto inventar uma carga é nocivo — altera a valência
+    # permitida e pode quebrar a molécula na sanitização. A raiz dá ~11× de
+    # razão: o bastante para sair do colapso sem virar gatilho fácil.
+    #
+    # Os pesos são renormalizados para média 1 de modo que a escala de
+    # L_fcharge continue comparável à das outras cabeças — o coeficiente
+    # 0,5 aplicado adiante segue significando a mesma coisa.
+    if preds["fcharge_logits"].shape[0] > 0:
+        tgt_fc = preds["fcharge_targets"]
+        n_cls  = preds["fcharge_logits"].shape[1]
+        counts = torch.bincount(tgt_fc, minlength=n_cls).float().clamp(min=1.0)
+        w_fc   = (tgt_fc.numel() / (n_cls * counts)).sqrt().clamp(0.2, 10.0)
+        w_fc   = w_fc / w_fc.mean()
+        L_fcharge = F.cross_entropy(preds["fcharge_logits"], tgt_fc, weight=w_fc)
+    else:
+        L_fcharge = zero
 
     # Tipo de ligação: só nos pares REALMENTE ligados (bond_exist_target==1)
     # — classificar o "tipo" de uma ligação que não existe não tem sentido.
@@ -1263,19 +1736,23 @@ def cvae_loss(
 
     # Total
     L_recon = (stop_weight * L_stop + L_atom + L_bond + L_exist +
-               pos_weight * L_pos + 0.5 * L_charge)
+               pos_weight * L_pos + 0.5 * L_charge +
+               focal_weight * L_focal + 0.5 * L_fcharge)
     L_total = L_recon + beta * L_KL
 
     return {
-        "total":  L_total,
-        "recon":  L_recon,
-        "stop":   L_stop,
-        "atom":   L_atom,
-        "bond":   L_bond,
-        "exist":  L_exist,
-        "pos":    L_pos,
-        "charge": L_charge,
-        "kl":     L_KL,
+        "total":   L_total,
+        "recon":   L_recon,
+        "stop":    L_stop,
+        "atom":    L_atom,
+        "bond":    L_bond,
+        "exist":   L_exist,
+        "pos":     L_pos,
+        "pos_mae": pos_mae,
+        "focal":   L_focal,
+        "fcharge": L_fcharge,
+        "charge":  L_charge,
+        "kl":      L_KL,
     }
 
 
@@ -1292,9 +1769,11 @@ def train_epoch(
     grad_clip: float = 0.5,   # reduzido de 1.0 para prevenir explosão
     pos_weight:  float = 2.0,
     stop_weight: float = 1.0,
+    focal_weight: float = 1.0,
 ) -> dict:
     model.train()
-    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos",
+                               "pos_mae","focal","fcharge","charge","kl"]}
     n_batches = 0
 
     for batch in tqdm(loader, desc="  Train", leave=False):
@@ -1307,7 +1786,8 @@ def train_epoch(
         optimizer.zero_grad()
         preds  = model(site, graphs, voxel_sizes)
         losses = cvae_loss(preds, beta=beta,
-                           pos_weight=pos_weight, stop_weight=stop_weight)
+                           pos_weight=pos_weight, stop_weight=stop_weight,
+                           focal_weight=focal_weight)
 
         # Pula batch se a loss for NaN/Inf (tensor corrompido escapou do filtro)
         if not torch.isfinite(losses["total"]):
@@ -1347,9 +1827,11 @@ def eval_epoch(
     beta:   float,
     pos_weight:  float = 2.0,
     stop_weight: float = 1.0,
+    focal_weight: float = 1.0,
 ) -> dict:
     model.eval()
-    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos",
+                               "pos_mae","focal","fcharge","charge","kl"]}
     n_batches = 0
 
     for batch in tqdm(loader, desc="  Eval ", leave=False):
@@ -1360,7 +1842,8 @@ def eval_epoch(
         voxel_sizes = batch["voxel_sizes"].to(device)
         preds       = model(site, graphs, voxel_sizes)
         losses = cvae_loss(preds, beta=beta,
-                           pos_weight=pos_weight, stop_weight=stop_weight)
+                           pos_weight=pos_weight, stop_weight=stop_weight,
+                           focal_weight=focal_weight)
         # Pula batch com loss NaN (modelo corrompido ou dado degenerado)
         if not torch.isfinite(losses["total"]):
             continue
@@ -1398,6 +1881,7 @@ def train(
     # ficavam presos nos defaults de cvae_loss, inalcançáveis pela interface.
     pos_weight:    float = 2.0,
     stop_weight:   float = 1.0,
+    focal_weight:  float = 1.0,
     # Regularização/estabilidade: também estavam presos no corpo de train()
     # (AdamW) e no default de train_epoch. Expostos pelo mesmo motivo.
     weight_decay:  float = 1e-4,
@@ -1514,6 +1998,30 @@ def train(
         # que o modelo instanciado tem a mesma forma dos pesos salvos
         ckpt_resume = torch.load(resume, map_location=device, weights_only=False)
         ckpt_cfg    = ckpt_resume.get("config", {})
+
+        # Mesma guarda de pipeline_generate.load_model, que faltava aqui.
+        # O load_state_dict abaixo usa strict=False: pesos de uma
+        # arquitetura anterior entrariam PARCIALMENTE (encoder e camadas
+        # comuns do decoder), deixando as cabeças novas — foco, MDN de
+        # posição e carga formal — com inicialização aleatória, e o treino
+        # seguiria como se nada houvesse, com um mero aviso de "camadas
+        # ausentes". O campo "Retomar de" da interface é preenchido a
+        # partir do estado salvo do job, então esse cenário é fácil de
+        # cair sem perceber.
+        _ck_arch = int(ckpt_cfg.get("arch_version", 1))
+        if _ck_arch != ARCH_VERSION:
+            raise RuntimeError(
+                f"Checkpoint de retomada incompatível: {resume}\n"
+                f"  arquitetura do checkpoint : versão {_ck_arch}\n"
+                f"  arquitetura do código     : versão {ARCH_VERSION}\n\n"
+                "Fine-tuning a partir de outra arquitetura carregaria só "
+                "parte dos pesos e deixaria as cabeças de foco, posição "
+                "(MDN) e carga formal aleatórias.\n"
+                "Deixe o campo 'Retomar de' VAZIO para treinar do zero, ou "
+                "aponte para um checkpoint da versão "
+                f"{ARCH_VERSION}."
+            )
+
         if ckpt_cfg:
             latent_dim   = ckpt_cfg.get("latent_dim",   latent_dim)
             hidden_dim   = ckpt_cfg.get("hidden_dim",   hidden_dim)
@@ -1584,9 +2092,11 @@ def train(
 
         train_losses = train_epoch(model, train_loader, optimizer, device, beta,
                                    grad_clip=grad_clip,
-                                   pos_weight=pos_weight, stop_weight=stop_weight)
+                                   pos_weight=pos_weight, stop_weight=stop_weight,
+                                   focal_weight=focal_weight)
         val_losses   = eval_epoch (model, val_loader,              device, beta,
-                                   pos_weight=pos_weight, stop_weight=stop_weight)
+                                   pos_weight=pos_weight, stop_weight=stop_weight,
+                                   focal_weight=focal_weight)
         scheduler.step()
 
         # Termos separados no log. Só `recon` e `kl` agregados escondiam o
@@ -1594,10 +2104,16 @@ def train(
         # ficou travado em ~1,0 (variância explicada zero) por 111 épocas
         # sem que isso aparecesse em lugar nenhum. `pos` está em Å.
         def _linha(rot, L):
+            # `pos` agora é −log-verossimilhança da MDN (adimensional, pode
+            # ser negativa quando o ajuste é bom); `pos_mae` é o erro
+            # geométrico de verdade, em Å. Na arquitetura 1 o valor do
+            # Huber era impresso com sufixo "Å", o que induzia a erro.
             return (f"  {rot} → total={L['total']:.4f}  recon={L['recon']:.4f}  "
-                    f"kl={L['kl']:.4f}  |  atom={L['atom']:.4f}  pos={L['pos']:.4f}Å  "
-                    f"exist={L['exist']:.4f}  bond={L['bond']:.4f}  "
-                    f"stop={L['stop']:.4f}  charge={L['charge']:.4f}")
+                    f"kl={L['kl']:.4f}  |  atom={L['atom']:.4f}  "
+                    f"posNLL={L['pos']:.4f}  posMAE={L['pos_mae']:.2f}Å  "
+                    f"focal={L['focal']:.4f}  exist={L['exist']:.4f}  "
+                    f"bond={L['bond']:.4f}  stop={L['stop']:.4f}  "
+                    f"charge={L['charge']:.4f}  fcharge={L['fcharge']:.4f}")
         log.info(_linha("Train", train_losses))
         log.info(_linha("Val  ", val_losses))
 
@@ -1626,6 +2142,8 @@ def train(
                 # um treino ruim depois exige remedir tudo do zero.
                 "history":       history,
                 "config": {
+                    "arch_version":     ARCH_VERSION,
+                    "n_pos_components": N_POS_COMPONENTS,
                     "latent_dim":   latent_dim,
                     "hidden_dim":   hidden_dim,
                     "n_gnn_layers": n_gnn_layers,
@@ -1717,6 +2235,9 @@ Exemplos de uso:
                         help="Peso do termo de posição na recon loss (default: 2.0)")
     parser.add_argument("--stop-weight",    type=float, default=1.0,
                         help="Peso do termo de parada na recon loss (default: 1.0)")
+    parser.add_argument("--focal-weight",   type=float, default=1.0,
+                        help="Peso do termo de átomo focal na recon loss "
+                             "(default: 1.0)")
     parser.add_argument("--weight-decay",   type=float, default=1e-4,
                         help="Weight decay do AdamW (default: 1e-4)")
     parser.add_argument("--grad-clip",      type=float, default=0.5,
@@ -1757,6 +2278,7 @@ Exemplos de uso:
         dropout=args.dropout,
         pos_weight=args.pos_weight,
         stop_weight=args.stop_weight,
+        focal_weight=args.focal_weight,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         checkpoint_dir=args.checkpoint_dir,

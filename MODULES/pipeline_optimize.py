@@ -132,9 +132,11 @@ SEARCH_SPACE_SPEC: list[dict] = [
     {
         "name": "pos_weight", "train_kw": "pos_weight", "priority": "high",
         "kind": "float", "default": (0.5, 4.0), "cast": float,
-        "help": "Peso do termo de posição 3D na recon loss. Domina ~78% da "
-                "loss nos defaults atuais (pos_weight=2.0); é o gargalo "
-                "declarado do modelo.",
+        "help": "Peso do termo de posição 3D na recon loss. Na arquitetura 2 "
+                "esse termo é a −log-verossimilhança da mistura de posição "
+                "(MDN), adimensional e podendo ser negativa — não um erro em "
+                "ångström. Aumentar prioriza geometria sobre química. O erro "
+                "geométrico de verdade aparece como posMAE no log do treino.",
     },
     {
         "name": "stop_weight", "train_kw": "stop_weight", "priority": "high",

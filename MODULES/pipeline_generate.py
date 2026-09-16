@@ -805,6 +805,26 @@ def load_model(
     cfg  = ckpt.get("config", {})
     voxel_config = cfg.get("voxel_config", {}) or {}
 
+    # Versão da arquitetura do decoder. Checkpoints da versão 1 (cabeça de
+    # posição determinística, decoder sem geometria) são estruturalmente
+    # incompatíveis com a versão 2: os mesmos campos do vetor de features
+    # significam outra coisa e faltam três cabeças. Carregar com
+    # strict=False produziria um modelo que roda e gera lixo silenciosamente
+    # — daí o erro explícito em vez de um aviso.
+    ckpt_arch = int(cfg.get("arch_version", 1))
+    cur_arch  = int(getattr(mod, "ARCH_VERSION", 1))
+    if ckpt_arch != cur_arch:
+        raise RuntimeError(
+            f"Checkpoint incompatível: {best_ckpt}\n"
+            f"  arquitetura do checkpoint : versão {ckpt_arch}\n"
+            f"  arquitetura do código     : versão {cur_arch}\n\n"
+            "A versão 2 ancora a posição num átomo focal e a modela por "
+            "mixture density network, dá geometria e valência ao decoder e "
+            "acrescenta as cabeças de foco e de carga formal. Pesos da "
+            "versão 1 não têm correspondência nessas camadas.\n"
+            "É necessário RETREINAR a Fase 1 (Etapa 7) com o código atual."
+        )
+
     model = mod.LigandCVAE(
         in_channels  = 5,
         latent_dim   = cfg.get("latent_dim",   128),
@@ -973,9 +993,22 @@ def _connect_components(
     positions: np.ndarray,
     valence_used: list[float],
     added_bonds: set[tuple[int, int]],
+    max_vals: "list[float] | None" = None,
 ) -> bool:
-    """Tenta conectar componentes desconexos usando a ligação simples válida mais próxima."""
+    """Tenta conectar componentes desconexos usando a ligação simples válida mais próxima.
+
+    `max_vals` traz a valência máxima POR ÁTOMO já corrigida pela carga
+    formal prevista (N+ aceita 4, O− aceita 1). Sem ela, esta função
+    recusaria ligações legítimas em grupos carregados — e, pior, divergiria
+    do limite usado em preds_to_mol.
+    """
     n_atoms = len(atom_types)
+    if max_vals is None:
+        max_vals = [
+            float(MAX_VALENCE.get(
+                ATOM_TYPES_GEN[min(int(t), len(ATOM_TYPES_GEN) - 1)].upper(), 4))
+            for t in atom_types
+        ]
     while True:
         components = _bond_components(n_atoms, added_bonds)
         if len(components) <= 1:
@@ -987,14 +1020,14 @@ def _connect_components(
             for right in components[left_idx + 1:]:
                 for i in left:
                     sym_i = ATOM_TYPES_GEN[min(int(atom_types[i]), len(ATOM_TYPES_GEN) - 1)].upper()
-                    if valence_used[i] + 1.0 > MAX_VALENCE.get(sym_i, 4) + 1e-6:
+                    if valence_used[i] + 1.0 > max_vals[i] + 1e-6:
                         continue
                     for j in right:
                         pair = tuple(sorted((i, j)))
                         if pair in added_bonds:
                             continue
                         sym_j = ATOM_TYPES_GEN[min(int(atom_types[j]), len(ATOM_TYPES_GEN) - 1)].upper()
-                        if valence_used[j] + 1.0 > MAX_VALENCE.get(sym_j, 4) + 1e-6:
+                        if valence_used[j] + 1.0 > max_vals[j] + 1e-6:
                             continue
                         dist = float(np.linalg.norm(positions[i] - positions[j]))
                         if not _bond_distance_ok(sym_i, sym_j, BondType.SINGLE, dist):
@@ -1826,13 +1859,38 @@ def preds_to_mol(
         if n_atoms < 1:
             return None
 
+        # Cargas formais previstas pela cabeça head_fcharge. Sem elas,
+        # qualquer grupo legitimamente carregado (amônio, carboxilato,
+        # nitro) falha na sanitização por valência explícita acima da
+        # permitida, e o candidato inteiro é descartado. Pocket2Mol e
+        # PocketFlow atacam o mesmo problema com a heurística modify_submol
+        # (N+/O−); aqui o valor é aprendido.
+        fcharges = candidate.get("formal_charges")
+        if fcharges is not None:
+            fcharges = np.asarray(
+                fcharges.detach().cpu().numpy()
+                if hasattr(fcharges, "detach") else fcharges
+            ).astype(int).reshape(-1)
+
         rwmol = Chem.RWMol()
         conf  = Chem.Conformer(n_atoms)
         for i, at_idx in enumerate(atom_types):
             sym = ATOM_TYPES_GEN[min(int(at_idx), len(ATOM_TYPES_GEN) - 1)]
-            rwmol.AddAtom(Chem.Atom(sym))
+            atom = Chem.Atom(sym)
+            if fcharges is not None and i < fcharges.shape[0]:
+                atom.SetFormalCharge(int(fcharges[i]))
+            rwmol.AddAtom(atom)
             conf.SetAtomPosition(i, positions[i].tolist())
         rwmol.AddConformer(conf, assignId=True)
+
+        # A carga formal desloca a valência permitida: N+ aceita 4 ligações,
+        # O− aceita 1. Para os elementos do grupo principal usados aqui, o
+        # ajuste é exatamente MAX_VALENCE + carga_formal.
+        def _max_val(sym_u: str, i: int) -> float:
+            base = float(MAX_VALENCE.get(sym_u, 4))
+            if fcharges is not None and i < fcharges.shape[0]:
+                return base + float(fcharges[i])
+            return base
 
         valence_used = [0.0] * n_atoms
         added = set()
@@ -1847,9 +1905,9 @@ def preds_to_mol(
             if not _bond_distance_ok(sym_i, sym_j, bond_type, dist):
                 continue
             budget = BOND_ORDER_BUDGET.get(bond_type, 1.0)
-            if valence_used[i] + budget > MAX_VALENCE.get(sym_i, 4) + 1e-6:
+            if valence_used[i] + budget > _max_val(sym_i, i) + 1e-6:
                 continue
-            if valence_used[j] + budget > MAX_VALENCE.get(sym_j, 4) + 1e-6:
+            if valence_used[j] + budget > _max_val(sym_j, j) + 1e-6:
                 continue
             rwmol.AddBond(i, j, bond_type)
             valence_used[i] += budget
@@ -1866,16 +1924,22 @@ def preds_to_mol(
                     if 1.0 < d < cutoff_dist:
                         sym_i = ATOM_TYPES_GEN[min(int(atom_types[i]), len(ATOM_TYPES_GEN) - 1)].upper()
                         sym_j = ATOM_TYPES_GEN[min(int(atom_types[j]), len(ATOM_TYPES_GEN) - 1)].upper()
-                        if valence_used[i] >= MAX_VALENCE.get(sym_i, 4):
+                        if valence_used[i] >= _max_val(sym_i, i):
                             continue
-                        if valence_used[j] >= MAX_VALENCE.get(sym_j, 4):
+                        if valence_used[j] >= _max_val(sym_j, j):
                             continue
                         rwmol.AddBond(i, j, BondType.SINGLE)
                         valence_used[i] += 1.0
                         valence_used[j] += 1.0
                         added.add((i, j))
 
-        if added and not _connect_components(rwmol, atom_types, positions, valence_used, added):
+        max_vals_all = [
+            _max_val(ATOM_TYPES_GEN[min(int(atom_types[k]),
+                                        len(ATOM_TYPES_GEN) - 1)].upper(), k)
+            for k in range(n_atoms)
+        ]
+        if added and not _connect_components(rwmol, atom_types, positions,
+                                             valence_used, added, max_vals_all):
             return None
 
         mol = _sanitize_generated_mol(rwmol.GetMol())

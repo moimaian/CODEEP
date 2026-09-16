@@ -43,46 +43,89 @@ from versao import VERSAO, LICENCA_CURTA
 # Caminho canônico do venv dedicado ao CODEEP
 _VENV_DIR    = Path.home() / ".venv" / "CODEEP"
 _VENV_PYTHON = _VENV_DIR / "bin" / "python"
+_APP_LOG_DIR = Path.home() / ".local" / "state" / "CODEEP"
+_APP_TERMINAL_LOG = _APP_LOG_DIR / "terminal.log"
 
 log = logging.getLogger(__name__)
+
+
+class _DualWriter:
+    """Duplica stdout/stderr para o terminal original e para um arquivo."""
+
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        for stream in self._streams:
+            try:
+                stream.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+
+def _setup_terminal_capture() -> None:
+    """Redireciona stdout/stderr para um log persistente da sessão atual."""
+    try:
+        _APP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        mode = "a" if os.environ.get("CODEEP_TERMINAL_LOG_READY") == "1" else "w"
+        log_fp = open(_APP_TERMINAL_LOG, mode, encoding="utf-8", buffering=1)
+        os.environ["CODEEP_TERMINAL_LOG_READY"] = "1"
+        if mode == "w":
+            from datetime import datetime as _dt
+            log_fp.write(f"[CODEEP] Session started at {_dt.now().isoformat()}\n")
+            log_fp.flush()
+        sys.stdout = _DualWriter(sys.__stdout__, log_fp)
+        sys.stderr = _DualWriter(sys.__stderr__, log_fp)
+    except Exception:
+        pass
 
 # ── Atalho no menu Linux ───────────────────────────────────────────────────
 _APP_DIR      = Path(__file__).resolve().parent
 _DESKTOP_DIR  = Path.home() / ".local" / "share" / "applications"
 _DESKTOP_FILE = _DESKTOP_DIR / "CODEEP.desktop"
 
-def _write_desktop() -> None:
-    """Escreve (ou sobrescreve) o arquivo .desktop do CODEEP."""
-    _DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+def _desktop_content() -> str:
+    """Conteúdo esperado do atalho Linux do CODEEP."""
     icon_path = _APP_DIR / "ICONS" / "CODEEP.png"
-    content = (
+    return (
         "[Desktop Entry]\n"
         f"Version={VERSAO}\n"
         "Name=CODEEP\n"
         "Comment=Deep Learning Pipeline for Ligand Generation\n"
-        f"Exec=bash -i -c \"env PYTHONNOUSERSITE=1 '{_VENV_PYTHON}' '{_APP_DIR / 'CODEEP.py'}'\"\n"
+        f"Exec=env PYTHONNOUSERSITE=1 {_VENV_PYTHON} {_APP_DIR / 'CODEEP.py'}\n"
         f"Icon={icon_path}\n"
-        "Terminal=true\n"
+        "Terminal=false\n"
         "Type=Application\n"
         "Categories=Qt;Science;Chemistry;Education;\n"
         "StartupNotify=false\n"
     )
-    _DESKTOP_FILE.write_text(content, encoding="utf-8")
+
+def _write_desktop() -> None:
+    """Escreve (ou sobrescreve) o arquivo .desktop do CODEEP."""
+    _DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+    _DESKTOP_FILE.write_text(_desktop_content(), encoding="utf-8")
     _DESKTOP_FILE.chmod(0o755)
 
 
 def _ensure_desktop() -> None:
-    """Cria o atalho no menu Linux se não existir ou se o venv mudou de lugar."""
+    """Cria/atualiza o atalho no menu Linux quando o conteúdo esperado mudar."""
     try:
-        if not _DESKTOP_FILE.exists():
+        current = _DESKTOP_FILE.read_text(encoding="utf-8") if _DESKTOP_FILE.exists() else None
+        if current != _desktop_content():
             _write_desktop()
-        else:
-            # Recria se o caminho do venv no arquivo não bater com o atual
-            # (usuário moveu a instalação ou recriou o venv)
-            if str(_VENV_PYTHON) not in _DESKTOP_FILE.read_text(encoding="utf-8"):
-                _write_desktop()
     except Exception:
         pass  # nunca travar a inicialização por causa do atalho
+
+
+_setup_terminal_capture()
 
 # ── Bootstrap ───────────────────────────────────────────────────
 def _already_in_venv() -> bool:
@@ -202,14 +245,14 @@ from typing import Optional
 from PyQt5.QtCore    import Qt, QThread, pyqtSignal, QTimer, QDateTime, QSettings, QSize
 from PyQt5.QtGui     import QPixmap, QGuiApplication, QFont, QIcon
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QTabWidget,
+    QApplication, QMainWindow, QRadioButton, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLabel, QPushButton, QTextEdit, QLineEdit, QSpinBox,
     QDoubleSpinBox, QComboBox, QCheckBox, QGroupBox,
     QFileDialog, QMessageBox, QProgressBar, QAction,
     QSplitter, QFrame, QScrollArea, QDialog,
-    QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup,
-    QDateTimeEdit,
+    QTableWidget, QTableWidgetItem,
+    QDateTimeEdit, QSizePolicy,
 )
 print("✅ PyQt5 importado com sucesso.")
 
@@ -345,18 +388,41 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
     padding: 4px 8px;
     background: #1C3249;
     color: #C9D1D9;
-    selection-background-color: #27AE60;
+    selection-background-color: #F57C6F;
+    selection-color: #0D1B2A;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
-QComboBox:focus, QTextEdit:focus {
-    border: 1.5px solid #2ECC71;
+QTextEdit:focus {
+    border: 1.5px solid #F57C6F;
 }
-QComboBox::drop-down { border: none; }
-QComboBox QAbstractItemView {
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
+    selection-background-color: #F57C6F;
+    selection-color: #0D1B2A;
+}
+QComboBox:focus,
+QComboBox:on {
+    border: 1px solid #6E8CA8;
     background: #1C3249;
     color: #C9D1D9;
+}
+QComboBox:focus QLineEdit,
+QComboBox:on QLineEdit {
+    color: #C9D1D9;
+}
+QComboBox::drop-down {
+    border: none;
+    background: #1C3249;
+}
+QComboBox QAbstractItemView {
+    background: #0D1B2A;
+    color: #C9D1D9;
     border: 1px solid #2A4A6B;
-    selection-background-color: #27AE60;
+    selection-background-color: #1C3249;
+    selection-color: #C9D1D9;
+}
+QComboBox QAbstractItemView::item:selected {
+    background: #1C3249;
+    color: #C9D1D9;
 }
 QScrollArea, QScrollArea > QWidget > QWidget {
     background: #0D1B2A;
@@ -487,6 +553,13 @@ QPushButton:hover   { background: #E74C3C; color: #FFF; }
 QPushButton:pressed { background: #C0392B; color: #FFF; }
 QPushButton:disabled{ background: #2A1A1A; color: #6B3030; border-color: #4A2A2A; }
 """
+
+_SS_STEP1_JOB_FIELD_DISABLED = (
+    "background:#14253A;"
+    "color:#6E8CA8;"
+    "border:1px solid #24384C;"
+    "border-radius:4px;"
+)
 
 _SS_BTN_NAV = """
 QPushButton {
@@ -846,6 +919,135 @@ def _pulse(bar):
         bar.setValue(v + 1)
     # acima de 30% só avança se tqdm emitir valor real
 
+class TrainingPlotWindow(QDialog):
+    """Curvas de treino ao vivo (Etapa 5).
+
+    Le as MESMAS linhas que ja vao para o Execution Log — nao ha canal novo
+    entre o processo filho e a interface, nem alteracao no pipeline_train.
+    As linhas de validacao seguem o formato de pipeline_train.train._linha:
+
+        Val   -> total=...  recon=...  kl=...  |  atom=...  posNLL=...
+                 posMAE=...A  focal=...  exist=...  bond=...  stop=...
+                 charge=...  fcharge=...
+
+    Dois eixos y: o esquerdo traz val total e recon (mesma ordem de
+    grandeza); o direito, o KL e a metrica escolhida pelo usuario, que
+    costumam ficar uma a duas ordens abaixo e, dividindo o eixo com o
+    total, virariam linhas achatadas no zero.
+    """
+
+    METRICAS = ["atom", "posNLL", "posMAE", "focal", "exist",
+                "bond", "stop", "charge", "fcharge"]
+
+    _RE_EPOCH = _re.compile(r"Epoch\s+(\d+)\s*/\s*(\d+)")
+    _RE_VAL   = _re.compile(r"Val\s*[^=]*?\u2192\s*(.*)$")
+    _RE_KV    = _re.compile(r"([A-Za-z_]+)\s*=\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+
+    def __init__(self, idioma_getter, parent=None):
+        super().__init__(parent)
+        self._idioma_getter = idioma_getter
+        self.setWindowTitle(i18n.t("s5_plot_title", idioma_getter()))
+        self.setMinimumSize(780, 500)
+        # Nao-modal: o treino dura horas e o usuario precisa seguir usando a
+        # interface (e lendo o Execution Log) com a janela aberta.
+        self.setModal(False)
+
+        self._epoch = 0
+        self._dados = {}
+
+        lay = QVBoxLayout(self)
+        topo = QHBoxLayout()
+        self.lbl_metric = QLabel(i18n.t("s5_plot_metric", idioma_getter()))
+        self.cb_metric = QComboBox()
+        self.cb_metric.addItems(self.METRICAS)
+        self.cb_metric.setCurrentText("posMAE")
+        self.cb_metric.currentIndexChanged.connect(lambda _=None: self._redesenhar())
+        topo.addWidget(self.lbl_metric)
+        topo.addWidget(self.cb_metric)
+        topo.addStretch()
+        lay.addLayout(topo)
+
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _Canvas
+        self._fig = Figure(figsize=(7.6, 4.6), facecolor="#0D1B2A")
+        self._canvas = _Canvas(self._fig)
+        lay.addWidget(self._canvas, 1)
+        self._ax1 = self._fig.add_subplot(111)
+        self._ax2 = self._ax1.twinx()
+        self._redesenhar()
+
+    # ── Entrada de dados ──────────────────────────────────────────────
+    def reset(self):
+        """Zera as series — chamado a cada novo Run."""
+        self._epoch = 0
+        self._dados = {}
+        self._redesenhar()
+
+    def feed_line(self, linha: str):
+        m = self._RE_EPOCH.search(linha)
+        if m:
+            self._epoch = int(m.group(1))
+            return
+        mv = self._RE_VAL.search(linha)
+        if not mv:
+            return
+        vals = {k: float(v) for k, v in self._RE_KV.findall(mv.group(1))}
+        if not vals:
+            return
+        for k, v in vals.items():
+            self._dados.setdefault(k, []).append((self._epoch, v))
+        self._redesenhar()
+
+    # ── Desenho ───────────────────────────────────────────────────────
+    def _redesenhar(self):
+        ax1, ax2 = self._ax1, self._ax2
+        ax1.clear(); ax2.clear()
+        for ax in (ax1, ax2):
+            ax.set_facecolor("#0D1B2A")
+            ax.tick_params(colors="#C9D1D9", labelsize=8)
+            for sp in ax.spines.values():
+                sp.set_color("#2A3F5F")
+
+        idioma = self._idioma_getter()
+        ax1.set_xlabel(i18n.t("s5_plot_xlabel", idioma), color="#C9D1D9", fontsize=9)
+        ax1.set_ylabel(i18n.t("s5_plot_ylabel_left", idioma), color="#C9D1D9", fontsize=9)
+        ax2.set_ylabel(i18n.t("s5_plot_ylabel_right", idioma), color="#C9D1D9", fontsize=9)
+
+        def _serie(nome):
+            d = self._dados.get(nome, [])
+            return [e for e, _ in d], [v for _, v in d]
+
+        linhas = []
+        for nome, cor in (("total", "#58A6FF"), ("recon", "#3FB950")):
+            x, y = _serie(nome)
+            if x:
+                linhas += ax1.plot(x, y, color=cor, lw=1.8, label=f"val {nome}")
+        x, y = _serie("kl")
+        if x:
+            linhas += ax2.plot(x, y, color="#E3B341", lw=1.4, ls="--", label="kl")
+        sel = self.cb_metric.currentText()
+        x, y = _serie(sel)
+        if x:
+            linhas += ax2.plot(x, y, color="#F778BA", lw=1.4, ls=":", label=sel)
+
+        if linhas:
+            leg = ax1.legend(linhas, [l.get_label() for l in linhas],
+                             loc="upper right", fontsize=8,
+                             facecolor="#0D1B2A", edgecolor="#2A3F5F")
+            for t in leg.get_texts():
+                t.set_color("#C9D1D9")
+        else:
+            ax1.text(0.5, 0.5, i18n.t("s5_plot_waiting", idioma),
+                     ha="center", va="center", transform=ax1.transAxes,
+                     color="#6E8CA8", fontsize=10)
+        ax1.grid(True, alpha=0.15, color="#2A3F5F")
+        try:
+            self._fig.tight_layout()
+        except Exception:
+            pass
+        self._canvas.draw_idle()
+
+
 def _connect_worker(worker, log_box, prog_bar, btn_run, btn_stop, done_cb, idioma_getter=None):
     """Conecta sinais do PipelineWorker aos widgets da aba.
 
@@ -1082,13 +1284,14 @@ class MainWindow(QMainWindow):
         self._tr("app_titulo", self.setWindowTitle)
         self.setStyleSheet(_SS_MAIN)
         sc = QGuiApplication.primaryScreen().availableGeometry()
-        self.resize(int(sc.width()*0.50), int(sc.height()*0.60))
-        self.move((sc.width()-self.width())//2, (sc.height()-self.height())//2)
+        self.resize(int(sc.width()*0.50), int(sc.height()*0.50))
+        self._center_on_screen()
 
         self.dp_dir: str = str(Path(__file__).parent)
         self.job_dir: str = ""
         self._workers: dict = {}          # tag → worker ativo
         self._applying_job_state = False
+        self._terminal_viewer_proc = None
 
         self._build_menu()
         self._build_hw_monitor()
@@ -1098,6 +1301,7 @@ class MainWindow(QMainWindow):
         self._init_tab_state_specs()
         self._connect_state_autosave()
         self._refresh_previous_jobs()
+        QTimer.singleShot(0, self._center_on_screen)
 
     def _tr(self, chave, apply_fn, **kwargs):
         """Registra apply_fn (ex.: label.setText, btn.setToolTip, lambda txt:
@@ -1187,6 +1391,22 @@ class MainWindow(QMainWindow):
             lay.addWidget(b, alignment=align)
         return lay
 
+    @staticmethod
+    def _wrap_scroll_widget(content_widget):
+        """Mantém o conteúdo real ancorado no topo do QScrollArea.
+
+        Quando o viewport fica mais alto do que o conteúdo, o espaço extra deve
+        aparecer depois do último grupo/campo, e não ser redistribuído dentro do
+        próprio conteúdo.
+        """
+        wrapper = QWidget()
+        wl = QVBoxLayout(wrapper)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(0)
+        wl.addWidget(content_widget)
+        wl.addStretch(1)
+        return wrapper
+
     def _definir_idioma(self, idioma):
         if idioma == self._idioma:
             return
@@ -1224,6 +1444,15 @@ class MainWindow(QMainWindow):
 
         if current_min < required_width:
             button.setMinimumWidth(required_width)
+
+    def _center_on_screen(self):
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
 
     # ── Fechamento da janela ───────────────────────────────────────────────
     def closeEvent(self, event):
@@ -1357,7 +1586,7 @@ class MainWindow(QMainWindow):
             "step5": [
                 "cb_train_phase", "sp_epochs", "sp_batch", "sp_latent", "sp_hidden",
                 "sp_gnn_layers", "dsb_lr", "dsb_beta", "sp_warmup",
-                "dsb_pos_weight", "dsb_stop_weight", "dsb_dropout",
+                "dsb_pos_weight", "dsb_stop_weight", "dsb_focal_weight", "dsb_dropout",
                 "dsb_weight_decay", "dsb_grad_clip",
                 "sp_patience", "cb_train_device", "ed_resume", "chk_freeze_enc",
                 "ed_ckpt_out",
@@ -1664,18 +1893,46 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(idx)
         combo.blockSignals(False)
 
+    def _sync_step1_job_mode_checks(self):
+        sender = self.sender()
+
+        if sender is self.rb_job_new and self.rb_job_new.isChecked():
+            self.rb_job_load.blockSignals(True)
+            self.rb_job_load.setChecked(False)
+            self.rb_job_load.blockSignals(False)
+        elif sender is self.rb_job_load and self.rb_job_load.isChecked():
+            self.rb_job_new.blockSignals(True)
+            self.rb_job_new.setChecked(False)
+            self.rb_job_new.blockSignals(False)
+
+        if not self.rb_job_new.isChecked() and not self.rb_job_load.isChecked():
+            self.rb_job_new.blockSignals(True)
+            self.rb_job_new.setChecked(True)
+            self.rb_job_new.blockSignals(False)
+
+    def _apply_step1_job_mode_styles(self):
+        for widget in (
+            getattr(self, "ed_job_name", None),
+            getattr(self, "dt_job_stamp", None),
+            getattr(self, "cb_prev_job", None),
+        ):
+            if widget is None:
+                continue
+            widget.setStyleSheet("" if widget.isEnabled() else _SS_STEP1_JOB_FIELD_DISABLED)
+
     def _sync_step1_job_mode(self):
         is_load = getattr(self, "rb_job_load", None) is not None and self.rb_job_load.isChecked()
         if hasattr(self, "ed_job_name"):
             self.ed_job_name.setEnabled(not is_load)
         if hasattr(self, "dt_job_stamp"):
-            self.dt_job_stamp.setEnabled(True)
+            self.dt_job_stamp.setEnabled(not is_load)
             if not is_load:
                 self.dt_job_stamp.setDateTime(QDateTime.currentDateTime())
         if hasattr(self, "cb_prev_job"):
             self.cb_prev_job.setEnabled(is_load)
             if is_load:
                 self._refresh_previous_jobs()
+        self._apply_step1_job_mode_styles()
         self._update_job_id()
 
     @staticmethod
@@ -2153,7 +2410,6 @@ class MainWindow(QMainWindow):
             ("BioPython",       "Bio",              "__version__"),
             ("PySCF",           "pyscf",            "__version__"),
             ("CuPy",            "cupy",             "__version__"),
-            ("psutil",          "psutil",           "__version__"),
             ("tqdm",            "tqdm",             "__version__"),
         ]
         for display, mod_name, attr in libs:
@@ -2196,7 +2452,7 @@ class MainWindow(QMainWindow):
             _xtb = _req.detect_xtb()
         except Exception:
             _xtb = _sh.which("xtb")
-        rows.append(("xtb", f"installed ({_xtb})" if _xtb else "not installed"))
+        rows.append(("xtb", "installed" if _xtb else "not installed"))
 
         _java = _sh.which("java")
         if _java:
@@ -2257,13 +2513,16 @@ class MainWindow(QMainWindow):
     # ── Construção da aba Home ─────────────────────────────────────────────
     def _tab_home(self):
         w = QWidget()
-        # Scroll para acomodar os quadros de hardware
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        inner = QWidget(); lay = QVBoxLayout(inner)
-        lay.setContentsMargins(36,32,36,24); lay.setSpacing(16)
-        scroll.setWidget(inner)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # ── Cabeçalho ─────────────────────────────────────────────────────
+        # ── Cabeçalho fixo ───────────────────────────────────────────────
+        header = QWidget()
+        hl = QVBoxLayout(header)
+        hl.setContentsMargins(36, 32, 36, 16)
+        hl.setSpacing(16)
+
         _logo_path = Path(__file__).resolve().parent / "ICONS" / "CODEEP2.png"
         hdr = QLabel()
         hdr.setAlignment(Qt.AlignCenter)
@@ -2279,13 +2538,21 @@ class MainWindow(QMainWindow):
             hdr.setText("CODEEP")
             hdr.setStyleSheet(
                 "font-size:42pt;font-weight:bold;color:#2ECC71;letter-spacing:8px;")
-        lay.addWidget(hdr)
+        hl.addWidget(hdr)
         tagline = self._trL("home_tagline")
         tagline.setAlignment(Qt.AlignCenter)
         tagline.setStyleSheet("font-size:13pt;color:#95A5A6;")
-        lay.addWidget(tagline)
+        hl.addWidget(tagline)
 
-        lay.addWidget(_mk_separator())
+        hl.addWidget(_mk_separator())
+        outer.addWidget(header)
+
+        # ── Miolo elástico: apenas os grupos crescem/encolhem ───────────
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        middle = QWidget()
+        lay = QVBoxLayout(middle)
+        lay.setContentsMargins(36, 16, 36, 16)
+        lay.setSpacing(0)
 
         # ── Linha dupla: Hardware Specs CPU | Hardware Specs GPU ───────────
         hw_row = QHBoxLayout(); hw_row.setSpacing(14)
@@ -2323,6 +2590,7 @@ class MainWindow(QMainWindow):
         hw_row.addWidget(gpu_grp, 1)
 
         lay.addLayout(hw_row)
+        lay.addStretch(1)
 
         # ── Software Specs ─────────────────────────────────────────────────
         sw_grp = CollapsibleGroupBox()
@@ -2343,8 +2611,9 @@ class MainWindow(QMainWindow):
             lbl_ver.setTextInteractionFlags(Qt.TextSelectableByMouse)
             sw_grid.addWidget(lbl_lib, row, col*2)
             sw_grid.addWidget(lbl_ver, row, col*2+1)
-        sw_grp.set_collapsed(True)
+        sw_grp.set_collapsed(False)
         lay.addWidget(sw_grp)
+        lay.addStretch(1)
 
         # ── Pipeline — Steps ───────────────────────────────────────────────
         pipe_grp = CollapsibleGroupBox()
@@ -2370,10 +2639,18 @@ class MainWindow(QMainWindow):
             desc_lbl.setStyleSheet("color:#6E8CA8;font-size:9pt;")
             pipe_lay.addWidget(name_lbl, i, 0)
             pipe_lay.addWidget(desc_lbl, i, 1)
-        pipe_grp.set_collapsed(True)
+        pipe_grp.set_collapsed(False)
         lay.addWidget(pipe_grp)
+        scroll.setWidget(middle)
+        outer.addWidget(scroll, 1)
 
-        lay.addWidget(_mk_separator())
+        # ── Rodapé fixo ──────────────────────────────────────────────────
+        footer = QWidget()
+        fl = QVBoxLayout(footer)
+        fl.setContentsMargins(36, 16, 36, 24)
+        fl.setSpacing(16)
+
+        fl.addWidget(_mk_separator())
 
         # ── Botões de ação — sem ícones ────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -2385,21 +2662,23 @@ class MainWindow(QMainWindow):
         btn_req.clicked.connect(self._show_requirements)
         if not _REQ_MODULE_OK:
             btn_req.setEnabled(False)
+        btn_terminal = self._mk_btn_tr("home_btn_terminal", _SS_BTN_SECONDARY, 160)
+        btn_terminal.setFixedHeight(38)
+        btn_terminal.clicked.connect(self._open_terminal)
         btn_row.addStretch()
         btn_row.addWidget(btn_start)
         btn_row.addSpacing(14)
         btn_row.addWidget(btn_req)
+        btn_row.addSpacing(14)
+        btn_row.addWidget(btn_terminal)
         btn_row.addStretch()
-        lay.addLayout(btn_row)
+        fl.addLayout(btn_row)
 
         ver = QLabel(f"v{VERSAO}  ·  © 2024–2026 CEB/UFPR  ·  {LICENCA_CURTA}")
         ver.setAlignment(Qt.AlignCenter)
         ver.setStyleSheet("font-size:8pt;color:#6E8CA8;margin-top:6px;")
-        lay.addWidget(ver)
-
-        # Empacota scroll na aba
-        outer = QVBoxLayout(w); outer.setContentsMargins(0,0,0,0)
-        outer.addWidget(scroll)
+        fl.addWidget(ver)
+        outer.addWidget(footer)
         return w
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2419,31 +2698,32 @@ class MainWindow(QMainWindow):
         grp_dir = QGroupBox(); self._tr("s1_grp_root", grp_dir.setTitle)
         grp_dir.setStyleSheet(_SS_GROUPBOX_NO_BG)
         dl = QVBoxLayout(grp_dir)
-        self.ed_root = QLineEdit(self.dp_dir); self.ed_root.setReadOnly(True)
-        dl.addWidget(self.ed_root)
+        self.ed_root = QLineEdit(self.dp_dir); self.ed_root.setReadOnly(True); self.ed_root.setFixedSize(400, 30)
+        self.ed_root.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        #dl.addStretch(4)
+        dl.addWidget(self.ed_root, alignment=Qt.AlignmentFlag.AlignCenter)
         btn_br = self._mk_btn_tr("btn_browse", _SS_BTN_SECONDARY, 100)
         btn_br.clicked.connect(self._browse_root)
-        dl.addWidget(btn_br, alignment=Qt.AlignLeft)
+        dl.addWidget(btn_br, alignment=Qt.AlignmentFlag.AlignCenter)
+        #dl.addStretch(4)
 
         # ── Identificação do Job ───────────────────────────────────────────
         grp_job = QGroupBox(); self._tr("s1_grp_job_id", grp_job.setTitle)
         grp_job.setStyleSheet(_SS_GROUPBOX_NO_BG)
         jf = QFormLayout(grp_job); jf.setHorizontalSpacing(20)
-        self.rb_job_new = QRadioButton()
+        self.rb_job_new = QCheckBox()
         self._tr("s1_rb_new_project", self.rb_job_new.setText)
         self.rb_job_new.setChecked(True)
-        self.rb_job_load = QRadioButton()
+        self.rb_job_load = QCheckBox()
         self._tr("s1_rb_load_project", self.rb_job_load.setText)
         mode_row = QWidget(); mode_l = QHBoxLayout(mode_row); mode_l.setContentsMargins(0,0,0,0)
         mode_l.addWidget(self.rb_job_new)
         mode_l.addWidget(self.rb_job_load)
         mode_l.addStretch(1)
-        self.bg_job_mode = QButtonGroup(self)
-        self.bg_job_mode.addButton(self.rb_job_new)
-        self.bg_job_mode.addButton(self.rb_job_load)
 
         self.cb_prev_job = QComboBox()
         self.cb_prev_job.setEnabled(False)
+        self.cb_prev_job.setMaximumWidth(340)
         self._tr("s1_tooltip_prev_job", self.cb_prev_job.setToolTip)
         self.ed_job_name = QLineEdit()
         self._tr("s1_ph_job_name", self.ed_job_name.setPlaceholderText)
@@ -2458,6 +2738,8 @@ class MainWindow(QMainWindow):
         self.lbl_job_id = QLabel("—")
         self.lbl_job_id.setStyleSheet("font-weight:bold;color:#2ECC71;")
         self.ed_job_name.textChanged.connect(self._update_job_id)
+        self.rb_job_new.toggled.connect(self._sync_step1_job_mode_checks)
+        self.rb_job_load.toggled.connect(self._sync_step1_job_mode_checks)
         self.rb_job_new.toggled.connect(self._sync_step1_job_mode)
         self.rb_job_load.toggled.connect(self._sync_step1_job_mode)
         self.cb_prev_job.currentIndexChanged.connect(self._update_job_id)
@@ -2475,19 +2757,19 @@ class MainWindow(QMainWindow):
         sl.addWidget(self._mk_section_tr("s1_sec_org_terms"))
         self.te_org_terms = QTextEdit()
         self._tr("s1_ph_org_terms", self.te_org_terms.setPlaceholderText)
-        self.te_org_terms.setFixedHeight(72)
+        self.te_org_terms.setFixedHeight(150)
         sl.addWidget(self.te_org_terms)
 
         sl.addWidget(self._mk_section_tr("s1_sec_desc_terms"))
         self.te_desc_terms = QTextEdit()
         self._tr("s1_ph_desc_terms", self.te_desc_terms.setPlaceholderText)
-        self.te_desc_terms.setFixedHeight(72)
+        self.te_desc_terms.setFixedHeight(150)
         sl.addWidget(self.te_desc_terms)
 
         sl.addWidget(self._mk_section_tr("s1_sec_p3_ids"))
         self.te_phase3_ids = QTextEdit()
         self._tr("s1_ph_p3_ids", self.te_phase3_ids.setPlaceholderText)
-        self.te_phase3_ids.setFixedHeight(60)
+        self.te_phase3_ids.setFixedHeight(150)
         sl.addWidget(self.te_phase3_ids)
 
         top_row = QHBoxLayout()
@@ -2515,7 +2797,8 @@ class MainWindow(QMainWindow):
         _sep.setStyleSheet("color:#2ECC71;font-size:9pt;margin-top:4px;")
         pf.addRow(_sep)
         for key, label, sub in global_paths:
-            lbl = QLabel("—"); lbl.setStyleSheet("font-size:9pt;color:#C9D1D9;")
+            lbl = QLabel("—"); lbl.setStyleSheet("font-size:9pt;color:#2ECC71;font-weight:bold;")
+            lbl.setWordWrap(True)
             lbl.setTextFormat(Qt.RichText)
             self._path_labels[key] = (lbl, sub, "global")
             pf.addRow(label, lbl)
@@ -2536,7 +2819,8 @@ class MainWindow(QMainWindow):
             ("job_phase3_ckpt", "checkpoints/phase3/", os.path.join("checkpoints", "phase3")),
         ]
         for key, label, sub in job_paths:
-            lbl = QLabel("—"); lbl.setStyleSheet("font-size:9pt;color:#C9D1D9;")
+            lbl = QLabel("—"); lbl.setStyleSheet("font-size:9pt;color:#5DADE2;font-weight:bold;")
+            lbl.setWordWrap(True)
             lbl.setTextFormat(Qt.RichText)
             self._path_labels[key] = (lbl, sub, "job")
             pf.addRow(label, lbl)
@@ -2599,16 +2883,16 @@ class MainWindow(QMainWindow):
         if not root:
             return
 
-        def _fmt(p: str) -> str:
-            """Formata o caminho com ícone e contagem de arquivos relevantes."""
+        def _fmt(p: str, kind: str) -> str:
+            """Formata apenas os valores/contagens do caminho detectado."""
             from pathlib import Path as _P
 
             path = _P(p)
             exists = path.exists()
-            color = "#27AE60" if exists else "#E74C3C"
+            color = "#2ECC71" if kind == "global" else "#5DADE2"
             icon = "✔" if exists else "✘"
 
-            count = ""
+            value_text = "0"
             if exists and path.is_dir():
                 pdbs = len(list(path.rglob("*.pdb")))
                 sdfs = len(list(path.rglob("*.sdf")))
@@ -2636,9 +2920,14 @@ class MainWindow(QMainWindow):
                         parts.append(" | ".join(sub_parts))
 
                 if parts:
-                    count = f"  <span style='color:#6E8CA8;font-size:8pt;'>({'; '.join(parts)})</span>"
+                    value_text = "; ".join(parts)
 
-            return f'<span style="color:{color};">{icon}  {p}</span>{count}'
+            if not exists:
+                color = "#E74C3C"
+                value_text = icon
+                return f'<span style="color:{color};font-size:9pt;font-weight:bold;">{value_text}</span>'
+
+            return f'<span style="color:{color};font-size:9pt;font-weight:bold;">{value_text}</span>'
 
         job_id  = self.lbl_job_id.text().strip()
         has_job = bool(job_id and job_id != "—")
@@ -2654,7 +2943,7 @@ class MainWindow(QMainWindow):
                     _ph = i18n.t("s1_placeholder_no_job", self._idioma)
                     lbl.setText(f'<span style="color:#BDC3C7;">{_ph}</span>')
                     continue
-            lbl.setText(_fmt(full))
+            lbl.setText(_fmt(full, kind))
 
     def _job_run(self):
         root = self.ed_root.text().strip()
@@ -2802,7 +3091,8 @@ class MainWindow(QMainWindow):
     def _populate_pipeline_body(self, lay, params_widget, run_fn_getter,
                                 worker_key, log_height, error_parent,
                                 params_min_height=420,
-                                shared_log_box=None, all_run_buttons=None):
+                                shared_log_box=None, all_run_buttons=None,
+                                on_worker=None):
         """Monta o corpo comum a toda aba/grupo de pipeline (parâmetros + progresso + Run/Stop,
         e log colapsável PRÓPRIO quando shared_log_box não é passado) dentro do layout `lay` já
         existente — compartilhado por _build_pipeline_tab (aba inteira, com título/navegação
@@ -2831,7 +3121,8 @@ class MainWindow(QMainWindow):
         compartilhado só faz sentido mostrando UMA ação de cada vez)."""
         # Painel de parâmetros (scroll) — único item com stretch, ver nota acima.
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setWidget(params_widget); scroll.setMinimumHeight(params_min_height)
+        scroll.setWidget(self._wrap_scroll_widget(params_widget))
+        scroll.setMinimumHeight(params_min_height)
         lay.addWidget(scroll, 1)
 
         # Log de execução em tempo real — próprio (colapsável) ou compartilhado com outros
@@ -2859,9 +3150,7 @@ class MainWindow(QMainWindow):
         btn_run  = self._mk_btn_tr("btn_run",  _SS_BTN_PRIMARY, 150)
         btn_stop = self._mk_btn_tr("btn_stop", _SS_BTN_DANGER,  100)
         btn_stop.setEnabled(False)
-        btn_row.addStretch()
         btn_row.addWidget(btn_run); btn_row.addWidget(btn_stop)
-        btn_row.addStretch()
         lay.addLayout(btn_row)
 
         if all_run_buttons is not None:
@@ -2891,6 +3180,15 @@ class MainWindow(QMainWindow):
                     if b is not btn_run:
                         b.setEnabled(False)
             worker = PipelineWorker(fn, args, kwargs)
+            # Gancho para quem quer acompanhar o worker recém-criado — usado
+            # pela Etapa 5 para abrir a janela de curvas ao vivo e ligá-la ao
+            # log_signal. Fica aqui, e não em _connect_worker, porque este é o
+            # único ponto que conhece o worker ANTES de ele começar.
+            if on_worker is not None:
+                try:
+                    on_worker(worker)
+                except Exception as _e:
+                    log.warning(f"on_worker falhou (seguindo sem ele): {_e}")
 
             def _on_done(ok):
                 if all_run_buttons is not None:
@@ -2907,7 +3205,7 @@ class MainWindow(QMainWindow):
 
     def _build_pipeline_tab(self, title_key, params_widget, run_fn_getter,
                             worker_key, prev_idx, next_idx,
-                            log_height=280):
+                            log_height=280, on_worker=None):
         """Constrói o layout padrão de uma aba de pipeline inteira (título + parâmetros +
         log colapsável + progresso + Run/Stop + navegação) — ver _populate_pipeline_body para
         o corpo compartilhado com _build_pipeline_group.
@@ -2922,7 +3220,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(_mk_separator())
 
         self._populate_pipeline_body(lay, params_widget, run_fn_getter, worker_key,
-                                     log_height, error_parent=w)
+                                     log_height, error_parent=w,
+                                     on_worker=on_worker)
 
         lay.addLayout(self._mk_nav_row_tr(
             lambda: self.tabs.setCurrentIndex(prev_idx),
@@ -2998,13 +3297,16 @@ class MainWindow(QMainWindow):
         grp_collection  = self._grp_data_collection(shared_log_box, all_run_buttons)
         grp_curation    = self._grp_data_curation(shared_log_box, all_run_buttons)
         grp_exploration = self._grp_data_exploration(shared_log_box, all_run_buttons)
+        exp_wrap = QWidget(); exp_l = QHBoxLayout(exp_wrap)
+        exp_l.setContentsMargins(0, 0, 0, 0); exp_l.setSpacing(0)
+        exp_l.addStretch(1); exp_l.addWidget(grp_exploration); exp_l.addStretch(1)
         grid.addWidget(grp_collection,   0, 0)
         grid.addWidget(grp_curation,     0, 1)
-        grid.addWidget(grp_exploration,  1, 0, 1, 2)   # ocupa as duas colunas
+        grid.addWidget(exp_wrap,         1, 0, 1, 2)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
 
-        scroll.setWidget(inner)
+        scroll.setWidget(self._wrap_scroll_widget(inner))
         outer.addWidget(scroll, 1)   # único widget com stretch — é o que cresce/encolhe
 
         # ── Rodapé fixo: log compartilhado + navegação — FORA do scroll ─────────────────────
@@ -3220,57 +3522,65 @@ class MainWindow(QMainWindow):
     def _grp_data_exploration(self, shared_log_box=None, all_run_buttons=None):
         """Grupo "Data Exploration" dentro da aba fundida Step2/"Data Management"
         (ver _tab_step2) — conteúdo da antiga Step 4 standalone, agora um QGroupBox."""
-        params = QWidget(); pf = QVBoxLayout(params)
-        lbl = self._trL("s2exp_lbl_desc")
-        lbl.setStyleSheet("color:#6E8CA8;font-size:9pt;"); lbl.setWordWrap(True)
-        pf.addWidget(lbl)
+        grp = QGroupBox()
+        grp.setFixedWidth(300)
+        grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
+        self._tr("s2exp_grp_title", grp.setTitle)
+        lay = QVBoxLayout(grp)
+        lay.setContentsMargins(12, 18, 12, 12); lay.setSpacing(8)
 
-        # Botão para visualizar o dashboard gerado
+        params = QWidget(); pf = QVBoxLayout(params)
+        pf.setContentsMargins(0, 0, 0, 0)
+        pf.setSpacing(8)
+        # lbl = self._trL("s2exp_lbl_desc")
+        # lbl.setStyleSheet("color:#6E8CA8;font-size:9pt;"); lbl.setWordWrap(True)
+        # pf.addWidget(lbl)
+
+        # O próprio botão gera/atualiza o dashboard e em seguida o abre; não há etapa
+        # separada de Run/Stop para este grupo.
         self.btn_view_dash = self._mk_btn_tr("s2exp_btn_view_dash", _SS_BTN_SECONDARY, 160)
         self.btn_view_dash.clicked.connect(self._view_explore_dashboard)
 
-        pf.addWidget(self._trL("lbl_phase"))
         self.cb_explore_phase = QComboBox()
         self.cb_explore_phase.addItems(["1", "2", "3"])
-        pf.addWidget(self.cb_explore_phase)
         
-        pf.addWidget(self.btn_view_dash, Qt.AlignCenter)
-        pf.addStretch()        
-
-        def run_fn():
-            import MODULES.pipeline_explore as m
-            root  = Path(self.ed_root.text().strip())
-            job   = Path(self.job_dir) if self.job_dir else root
-            phase = self.cb_explore_phase.currentText()
-
-            if phase == "1":
-                curated_dir  = root / "data" / "curated"
-                metadata_csv = root / "data" / "curated_metadata.csv"
-                fig_dir      = root / "data" / "figures"
-            elif phase == "2":
-                curated_dir  = job / "data" / "curated" / "phase2"
-                metadata_csv = job / "data" / "curated" / "phase2_metadata.csv"
-                fig_dir      = job / "data" / "figures" / "phase2"
-            else:
-                curated_dir  = job / "data" / "curated" / "phase3"
-                metadata_csv = job / "data" / "curated" / "phase3_metadata.csv"
-                fig_dir      = job / "data" / "figures" / "phase3"
-
-            return m.main, (), dict(
-                curated_dir  = curated_dir,
-                metadata_csv = metadata_csv,
-                fig_dir      = fig_dir,
-            )
-
-        return self._build_pipeline_group("s2exp_grp_title", params, run_fn, "explore",
-                                          shared_log_box=shared_log_box,
-                                          all_run_buttons=all_run_buttons)
+        phase_dash_row = QWidget(); dvl = QHBoxLayout(phase_dash_row); dvl.setContentsMargins(0,0,0,0)
+        dvl.addWidget(self._trL("lbl_phase")); dvl.addWidget(self.cb_explore_phase); dvl.addWidget(self.btn_view_dash)
+        pf.addWidget(phase_dash_row, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(params)
+        return grp
 
     # ══════════════════════════════════════════════════════════════════════
     # TAB 3 — STEP 3: VOXELIZAÇÃO
     # ══════════════════════════════════════════════════════════════════════
     def _tab_step3(self):
-        params = QWidget(); pf = QFormLayout(params); pf.setSpacing(10)
+        params = QWidget()
+        pv = QVBoxLayout(params)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(0)
+
+        cols = QWidget()
+        cl = QHBoxLayout(cols)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(22)
+
+        col_phase = QWidget()
+        pf_phase = QFormLayout(col_phase)
+        pf_phase.setContentsMargins(0, 0, 0, 0)
+        pf_phase.setSpacing(10)
+
+        col_vox = QWidget()
+        pf_vox = QFormLayout(col_vox)
+        pf_vox.setContentsMargins(0, 0, 0, 0)
+        pf_vox.setSpacing(10)
+
+        col_qm = QWidget()
+        pf_qm = QFormLayout(col_qm)
+        pf_qm.setContentsMargins(0, 0, 0, 0)
+        pf_qm.setSpacing(10)
+
+        for col in (col_phase, col_vox, col_qm):
+            col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.ed_vox_pair = QLineEdit()
         self._tr("s3_ph_pair", self.ed_vox_pair.setPlaceholderText)
@@ -3334,19 +3644,29 @@ class MainWindow(QMainWindow):
             "rhf_sto3g_fragments", "gfn_xtb_fragments", "heuristic",
         ]
 
-        pf.addRow(self._trL("lbl_phase"), self.cb_vox_phase)
-        pf.addRow(self._trL("s3_lbl_pair"),    self.ed_vox_pair)
-        pf.addRow(self._trL("lbl_workers_auto"), self.sp_vox_workers)
-        pf.addRow("", self.chk_vox_parallel_pairs)
-        pf.addRow(self._trL("s3_lbl_grid"),   self.sp_grid)
-        pf.addRow(self._trL("s3_lbl_padding"),      self.sp_vox_pad)
-        pf.addRow(self._trL("s3_lbl_max_qm"),     self.sp_max_qm)
-        pf.addRow(self._trL("s3_lbl_batch"),   self.sp_vox_batch)
-        pf.addRow(self._trL("s3_lbl_qm_basis"),         self.cb_qm_basis)
-        pf.addRow("",                  self.chk_ecfp4)
-        pf.addRow("",                  self.chk_protonate_site)
-        pf.addRow(self._trL("s3_lbl_site_ph"),          self.dsb_site_ph)
-        pf.addRow(self._trL("s3_lbl_site_qm_method"), self.cb_site_qm_method)
+        pf_phase.addRow(self._trL("lbl_phase"), self.cb_vox_phase)
+        pf_phase.addRow(self._trL("s3_lbl_pair"), self.ed_vox_pair)
+        pf_phase.addRow(self._trL("lbl_workers_auto"), self.sp_vox_workers)
+        pf_phase.addRow("", self.chk_vox_parallel_pairs)
+
+        pf_vox.addRow(self._trL("s3_lbl_grid"), self.sp_grid)
+        pf_vox.addRow(self._trL("s3_lbl_padding"), self.sp_vox_pad)
+        pf_vox.addRow(self._trL("s3_lbl_max_qm"), self.sp_max_qm)
+        pf_vox.addRow(self._trL("s3_lbl_batch"), self.sp_vox_batch)
+
+        pf_qm.addRow(self._trL("s3_lbl_qm_basis"), self.cb_qm_basis)
+        pf_qm.addRow("", self.chk_ecfp4)
+        pf_qm.addRow("", self.chk_protonate_site)
+        pf_qm.addRow(self._trL("s3_lbl_site_ph"), self.dsb_site_ph)
+        pf_qm.addRow(self._trL("s3_lbl_site_qm_method"), self.cb_site_qm_method)
+
+        cl.addWidget(col_phase, 1)
+        cl.addWidget(col_vox, 1)
+        cl.addWidget(col_qm, 1)
+        cl.setStretch(0, 1)
+        cl.setStretch(1, 1)
+        cl.setStretch(2, 1)
+        pv.addWidget(cols)
 
         def run_fn():
             import MODULES.pipeline_voxelize as m
@@ -3871,7 +4191,42 @@ class MainWindow(QMainWindow):
     # TAB 7 — STEP 7: TREINAMENTO
     # ══════════════════════════════════════════════════════════════════════
     def _tab_step5(self):
-        params = QWidget(); pf = QFormLayout(params); pf.setSpacing(8)
+        # Layout em TRES COLUNAS alinhadas, mesmo padrao da Etapa 3: de Phase
+        # ate Device os campos sao escalares curtos e cabem lado a lado, o que
+        # evita a coluna unica de 17 linhas que obrigava a rolar o painel.
+        # Os campos largos (Retomar de / Salvar checkpoint em) e o checkbox de
+        # congelar encoder ficam abaixo, em largura total: um caminho de
+        # arquivo espremido em um terco da largura fica ilegivel.
+        params = QWidget()
+        pv = QVBoxLayout(params)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(10)
+
+        cols = QWidget()
+        cl3 = QHBoxLayout(cols)
+        cl3.setContentsMargins(0, 0, 0, 0)
+        cl3.setSpacing(22)
+
+        col_cap = QWidget()
+        pf_cap = QFormLayout(col_cap)
+        pf_cap.setContentsMargins(0, 0, 0, 0); pf_cap.setSpacing(10)
+
+        col_opt = QWidget()
+        pf_opt = QFormLayout(col_opt)
+        pf_opt.setContentsMargins(0, 0, 0, 0); pf_opt.setSpacing(10)
+
+        col_reg = QWidget()
+        pf_reg = QFormLayout(col_reg)
+        pf_reg.setContentsMargins(0, 0, 0, 0); pf_reg.setSpacing(10)
+
+        for _c in (col_cap, col_opt, col_reg):
+            _c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            cl3.addWidget(_c)
+        pv.addWidget(cols)
+
+        pf = QFormLayout()          # cauda de largura total
+        pf.setSpacing(8)
+        pv.addLayout(pf)
 
         self.cb_train_phase = QComboBox()
         self.cb_train_phase.addItems(["1", "2", "3"])
@@ -3906,6 +4261,10 @@ class MainWindow(QMainWindow):
         self.dsb_stop_weight.setDecimals(2); self.dsb_stop_weight.setRange(0.0, 20.0)
         self.dsb_stop_weight.setSingleStep(0.25); self.dsb_stop_weight.setValue(1.00)
         self._tr("s5_tooltip_stop_weight", self.dsb_stop_weight.setToolTip)
+        self.dsb_focal_weight = QDoubleSpinBox()
+        self.dsb_focal_weight.setDecimals(2); self.dsb_focal_weight.setRange(0.0, 20.0)
+        self.dsb_focal_weight.setSingleStep(0.25); self.dsb_focal_weight.setValue(1.00)
+        self._tr("s5_tooltip_focal_weight", self.dsb_focal_weight.setToolTip)
         self.dsb_dropout   = QDoubleSpinBox()
         self.dsb_dropout.setDecimals(2); self.dsb_dropout.setRange(0,0.9); self.dsb_dropout.setValue(0.20)
         self.dsb_weight_decay = QDoubleSpinBox()
@@ -3937,23 +4296,32 @@ class MainWindow(QMainWindow):
         cl.addWidget(self.ed_ckpt_out); cl.addWidget(btn_ckpt)
         btn_ckpt.clicked.connect(self._browse_ckpt_out)
 
+        # Agrupamento por natureza: capacidade do modelo | otimizacao e
+        # pesos da perda | regularizacao e execucao.
+        for _form, _linhas in (
+            (pf_cap, [("lbl_phase",           self.cb_train_phase),
+                      ("s5_lbl_epochs",       self.sp_epochs),
+                      ("s5_lbl_batch",        self.sp_batch),
+                      ("s5_lbl_latent",       self.sp_latent),
+                      ("s5_lbl_hidden",       self.sp_hidden),
+                      ("s5_lbl_gnn_layers",   self.sp_gnn_layers)]),
+            (pf_opt, [("s5_lbl_lr",           self.dsb_lr),
+                      ("s5_lbl_beta_max",     self.dsb_beta),
+                      ("s5_lbl_beta_warmup",  self.sp_warmup),
+                      ("s5_lbl_pos_weight",   self.dsb_pos_weight),
+                      ("s5_lbl_stop_weight",  self.dsb_stop_weight),
+                      ("s5_lbl_focal_weight", self.dsb_focal_weight)]),
+            (pf_reg, [("s5_lbl_dropout",      self.dsb_dropout),
+                      ("s5_lbl_weight_decay", self.dsb_weight_decay),
+                      ("s5_lbl_grad_clip",    self.dsb_grad_clip),
+                      ("s5_lbl_patience",     self.sp_patience),
+                      ("s5_lbl_device",       self.cb_train_device)]),
+        ):
+            for _lk, _w in _linhas:
+                _w.setMinimumWidth(110)
+                _form.addRow(self._trL(_lk), _w)
+
         for label_key, widget in [
-            ("lbl_phase",          self.cb_train_phase),
-            ("s5_lbl_epochs",      self.sp_epochs),
-            ("s5_lbl_batch",       self.sp_batch),
-            ("s5_lbl_latent",      self.sp_latent),
-            ("s5_lbl_hidden",      self.sp_hidden),
-            ("s5_lbl_gnn_layers",  self.sp_gnn_layers),
-            ("s5_lbl_lr",          self.dsb_lr),
-            ("s5_lbl_beta_max",    self.dsb_beta),
-            ("s5_lbl_beta_warmup", self.sp_warmup),
-            ("s5_lbl_pos_weight",  self.dsb_pos_weight),
-            ("s5_lbl_stop_weight", self.dsb_stop_weight),
-            ("s5_lbl_dropout",     self.dsb_dropout),
-            ("s5_lbl_weight_decay", self.dsb_weight_decay),
-            ("s5_lbl_grad_clip",   self.dsb_grad_clip),
-            ("s5_lbl_patience",    self.sp_patience),
-            ("s5_lbl_device",      self.cb_train_device),
             ("s5_lbl_resume",      resume_row),
             (None,                 self.chk_freeze_enc),
             ("s5_lbl_ckpt_out",    ckpt_row),
@@ -4022,6 +4390,7 @@ class MainWindow(QMainWindow):
                 beta_warmup=self.sp_warmup.value(),
                 pos_weight=self.dsb_pos_weight.value(),
                 stop_weight=self.dsb_stop_weight.value(),
+                focal_weight=self.dsb_focal_weight.value(),
                 dropout=self.dsb_dropout.value(),
                 weight_decay=self.dsb_weight_decay.value(),
                 grad_clip=self.dsb_grad_clip.value(),
@@ -4035,8 +4404,24 @@ class MainWindow(QMainWindow):
 
         return self._build_pipeline_tab(
             "title_step5",
-            params, run_fn, "train", 4, 6, log_height=320
+            params, run_fn, "train", 4, 6, log_height=320,
+            on_worker=self._open_training_plot,
         )
+
+    def _open_training_plot(self, worker):
+        """Abre (ou reaproveita) a janela de curvas e a liga ao worker do treino.
+
+        A ligacao e feita no log_signal: o mesmo fluxo de linhas que alimenta
+        o Execution Log alimenta o grafico, sem canal adicional entre
+        processo filho e interface.
+        """
+        dlg = getattr(self, "_training_plot", None)
+        if dlg is None:
+            dlg = TrainingPlotWindow(lambda: self._idioma, parent=self)
+            self._training_plot = dlg
+        dlg.reset()
+        worker.log_signal.connect(dlg.feed_line)
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
 
     def _browse_resume(self):
         p, _ = QFileDialog.getOpenFileName(
@@ -4512,28 +4897,52 @@ class MainWindow(QMainWindow):
         dlg.exec_()
 
     def _view_explore_dashboard(self):
-        """Abre o dashboard da fase selecionada no grupo Data Exploration (Step 2)."""
+        """Gera/atualiza e abre o dashboard da fase selecionada no grupo Data Exploration."""
         phase = self.cb_explore_phase.currentText()
-        root  = self.ed_root.text().strip()
-        job   = self.job_dir or root
+        root = Path(self.ed_root.text().strip())
+        job = Path(self.job_dir) if self.job_dir else root
 
         if phase == "1":
-            fig_dir = os.path.join(root, "data", "figures")
+            curated_dir = root / "data" / "curated"
+            metadata_csv = root / "data" / "curated_metadata.csv"
+            fig_dir = root / "data" / "figures"
         elif phase == "2":
-            fig_dir = os.path.join(job, "data", "figures", "phase2")
+            curated_dir = job / "data" / "curated" / "phase2"
+            metadata_csv = job / "data" / "curated" / "phase2_metadata.csv"
+            fig_dir = job / "data" / "figures" / "phase2"
         else:
-            fig_dir = os.path.join(job, "data", "figures", "phase3")
+            curated_dir = job / "data" / "curated" / "phase3"
+            metadata_csv = job / "data" / "curated" / "phase3_metadata.csv"
+            fig_dir = job / "data" / "figures" / "phase3"
+
+        try:
+            import MODULES.pipeline_explore as m
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            m.main(
+                curated_dir=curated_dir,
+                metadata_csv=metadata_csv,
+                fig_dir=fig_dir,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                i18n.t("msg_config_error_title", self._idioma),
+                str(exc),
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
 
         for ext in ("png", "svg"):
-            path = os.path.join(fig_dir, f"summary_dashboard.{ext}")
-            if os.path.isfile(path):
+            path = fig_dir / f"summary_dashboard.{ext}"
+            if path.is_file():
                 self._view_fig_path(
-                    path, i18n.t("msg_summary_dashboard_title", self._idioma, phase=phase))
+                    str(path), i18n.t("msg_summary_dashboard_title", self._idioma, phase=phase))
                 return
 
         QMessageBox.information(
             self, i18n.t("msg_figure_not_found", self._idioma),
-            i18n.t("msg_run_dataexp_first", self._idioma, phase=phase, fig_dir=fig_dir)
+            i18n.t("msg_run_dataexp_first", self._idioma, phase=phase, fig_dir=str(fig_dir))
         )
 
     def _view_eval_fig(self, stem: str, title: str):
@@ -4570,6 +4979,30 @@ class MainWindow(QMainWindow):
         self._req_win = RequirementsInstaller(None)
         self._req_win.setWindowModality(Qt.ApplicationModal)
         self._req_win.show(); self._req_win.activateWindow(); self._req_win.raise_()
+
+    def _open_terminal(self):
+        """Abre um visualizador do log de terminal da sessão atual do CODEEP."""
+        if self._terminal_viewer_proc is not None and self._terminal_viewer_proc.poll() is None:
+            return
+
+        log_path = str(_APP_TERMINAL_LOG)
+        candidates = [
+            ["x-terminal-emulator", "-e", "tail", "-n", "+1", "-F", log_path],
+            ["gnome-terminal", "--", "tail", "-n", "+1", "-F", log_path],
+            ["konsole", "-e", "tail", "-n", "+1", "-F", log_path],
+            ["xfce4-terminal", "--title=CODEEP Terminal", "--command", f"tail -n +1 -F '{log_path}'"],
+            ["xterm", "-T", "CODEEP Terminal", "-e", "tail", "-n", "+1", "-F", log_path],
+        ]
+        for cmd in candidates:
+            try:
+                self._terminal_viewer_proc = subprocess.Popen(cmd, cwd=str(_APP_DIR))
+                return
+            except Exception:
+                continue
+        QMessageBox.warning(
+            self, i18n.t("msg_warning_title", self._idioma),
+            i18n.t("home_msg_terminal_unavailable", self._idioma),
+        )
 
     def _show_about(self):
         QMessageBox.about(

@@ -159,11 +159,16 @@ _TEXTOS = {
     },
     "home_btn_start": {"en": "Start", "pt": "Iniciar"},
     "home_btn_install": {"en": "Install Requirements", "pt": "Instalar Dependências"},
+    "home_btn_terminal": {"en": "View Terminal", "pt": "Ver Terminal"},
+    "home_msg_terminal_unavailable": {
+        "en": "No supported terminal emulator was found on this system.",
+        "pt": "Nenhum emulador de terminal compatível foi encontrado neste sistema.",
+    },
 
     # ---------------------------------------------------------------- Generic / reused across tabs
     "lbl_phase": {"en": "Phase:", "pt": "Fase:"},
     "lbl_workers_auto": {"en": "Workers (0=auto):", "pt": "Trabalhadores (0=auto):"},
-    "btn_browse": {"en": "Browse...", "pt": "Procurar..."},
+    "btn_browse": {"en": "Browse", "pt": "Procurar"},
     "msg_warning_title": {"en": "Warning", "pt": "Atenção"},
     "msg_error_title": {"en": "Error", "pt": "Erro"},
     "dlg_checkpoints_folder": {"en": "Checkpoints folder", "pt": "Pasta de checkpoints"},
@@ -358,12 +363,12 @@ _TEXTOS = {
     "s2exp_grp_title": {
         "en": "Data Exploration", "pt": "Exploração de Dados",
     },
-    "s2exp_lbl_desc": {
-        "en": "Generates statistics and the exploration dashboard from the curated dataset.\n"
-              "Saves summary_dashboard.png and .svg to data/figures/.",
-        "pt": "Gera estatísticas e o painel de exploração a partir do dataset curado.\nSalva "
-              "summary_dashboard.png e .svg em data/figures/.",
-    },
+    # "s2exp_lbl_desc": {
+    #     "en": "Generates statistics and the exploration dashboard from the curated dataset.\n"
+    #           "Saves summary_dashboard.png and .svg to data/figures/.",
+    #     "pt": "Gera estatísticas e o painel de exploração a partir do dataset curado.\nSalva "
+    #           "summary_dashboard.png e .svg em data/figures/.",
+    # },
     "s2exp_btn_view_dash": {"en": "View Dashboard", "pt": "Ver Painel"},
 
     # ---------------------------------------------------------------- STEP 3 — Voxelization
@@ -379,8 +384,8 @@ _TEXTOS = {
               "'Paralelizar pares' abaixo estiver marcado (0/1 = sequencial de qualquer jeito).",
     },
     "s3_chk_parallel_pairs": {
-        "en": "Parallelize pairs (experimental)",
-        "pt": "Paralelizar pares (experimental)",
+        "en": "Parallelize pairs",
+        "pt": "Paralelizar pares",
     },
     "s3_tooltip_parallel_pairs": {
         "en": "Off (default) = today's validated behavior: one pair at a time. On = "
@@ -501,7 +506,7 @@ _TEXTOS = {
     },
     "s3_lbl_site_ph": {"en": "Site pH:", "pt": "pH do sítio:"},
     "s3_lbl_site_qm_method": {
-        "en": "Site channels 3-4 method:", "pt": "Método dos canais 3-4 do sítio:",
+        "en": "Site channels\n 3-4 method:", "pt": "Método dos canais\n 3-4 do sítio:",
     },
 
     # ---------------------------------------------------------------- STEP 4 — Hyperparameter optimization
@@ -665,20 +670,24 @@ _TEXTOS = {
     "s5_lbl_beta_warmup": {"en": "Beta warmup:", "pt": "Beta warmup:"},
     "s5_lbl_pos_weight": {"en": "Position weight:", "pt": "Peso da posição:"},
     "s5_tooltip_pos_weight": {
-        "en": "Weight of the 3D position term in the reconstruction loss "
-              "(recon = stop_w·L_stop + L_atom + L_bond + L_exist + "
-              "pos_w·L_pos + 0.5·L_charge).\n\n"
-              "At the default of 2.0 this term alone accounts for about 78% "
-              "of recon — it is the model's declared bottleneck. Raising it "
-              "buys geometric accuracy at the cost of chemistry; lowering it "
+        "en": "Weight of the 3D position term in the reconstruction loss:\n"
+              "recon = stop_w·L_stop + L_atom + L_bond + L_exist + "
+              "pos_w·L_pos + 0.5·L_charge + focal_w·L_focal + 0.5·L_fcharge\n\n"
+              "L_pos is the negative log-likelihood of the position mixture "
+              "(MDN), not an error in ångström — it is dimensionless and may "
+              "go negative when the fit is good. For the actual geometric "
+              "error in Å, watch posMAE in the training log.\n\n"
+              "Raising it prioritises geometry over chemistry; lowering it "
               "does the reverse.",
-        "pt": "Peso do termo de posição 3D na perda de reconstrução "
-              "(recon = stop_w·L_stop + L_atom + L_bond + L_exist + "
-              "pos_w·L_pos + 0,5·L_charge).\n\n"
-              "No default de 2,0 esse termo sozinho responde por cerca de "
-              "78% da recon — é o gargalo declarado do modelo. Aumentar "
-              "compra precisão geométrica ao custo da química; diminuir faz "
-              "o inverso.",
+        "pt": "Peso do termo de posição 3D na perda de reconstrução:\n"
+              "recon = stop_w·L_stop + L_atom + L_bond + L_exist + "
+              "pos_w·L_pos + 0,5·L_charge + focal_w·L_focal + 0,5·L_fcharge\n\n"
+              "L_pos é a −log-verossimilhança da mistura de posição (MDN), "
+              "não um erro em ångström — é adimensional e pode ficar "
+              "negativa quando o ajuste é bom. Para o erro geométrico de "
+              "verdade, em Å, acompanhe posMAE no log do treino.\n\n"
+              "Aumentar prioriza geometria sobre química; diminuir faz o "
+              "inverso.",
     },
     "s5_lbl_stop_weight": {"en": "Stop weight:", "pt": "Peso da parada:"},
     "s5_tooltip_stop_weight": {
@@ -692,6 +701,39 @@ _TEXTOS = {
               "Controla a distribuição de tamanhos das moléculas geradas: "
               "baixo demais gera ligantes que não param de crescer, alto "
               "demais gera fragmentos.",
+    },
+    "s5_lbl_focal_weight": {"en": "Focal weight:", "pt": "Peso do foco:"},
+    "s5_tooltip_focal_weight": {
+        "en": "Weight of the focal-atom term: the cross-entropy of choosing, "
+              "among the atoms already placed, the one the next atom grows "
+              "from.\n\n"
+              "The focal atom is the anchor of the position — the MDN "
+              "predicts a displacement relative to it. A poorly trained "
+              "focal head anchors the next atom in the wrong place, so the "
+              "geometry degrades even with a good position head.",
+        "pt": "Peso do termo de átomo focal: a entropia cruzada da escolha, "
+              "entre os átomos já colocados, daquele a partir do qual o "
+              "próximo cresce.\n\n"
+              "O focal é a âncora da posição — a MDN prevê um deslocamento "
+              "relativo a ele. Uma cabeça de foco mal treinada ancora o "
+              "próximo átomo no lugar errado, e a geometria piora mesmo com "
+              "uma boa cabeça de posição.",
+    },
+    # ── Janela de curvas ao vivo (Etapa 5) ────────────────────────────
+    "s5_plot_title": {
+        "en": "Training — live curves", "pt": "Treinamento — curvas ao vivo",
+    },
+    "s5_plot_metric": {"en": "Third metric:", "pt": "Terceira métrica:"},
+    "s5_plot_xlabel": {"en": "Epoch", "pt": "Época"},
+    "s5_plot_ylabel_left": {
+        "en": "val total / recon", "pt": "val total / recon",
+    },
+    "s5_plot_ylabel_right": {
+        "en": "KL / selected metric", "pt": "KL / métrica escolhida",
+    },
+    "s5_plot_waiting": {
+        "en": "Waiting for the first validation epoch…",
+        "pt": "Aguardando a primeira época de validação…",
     },
     "s5_lbl_dropout": {"en": "Dropout:", "pt": "Dropout:"},
     "s5_lbl_weight_decay": {"en": "Weight decay:", "pt": "Weight decay:"},
