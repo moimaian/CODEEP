@@ -839,6 +839,47 @@ _TEXTOS = {
     "s7_lbl_ref_ligand": {"en": "Ref. ligand:", "pt": "Ligante de ref.:"},
     "s7_lbl_n_samples": {"en": "No. samples:", "pt": "Nº de amostras:"},
     "s7_lbl_temperature": {"en": "Temperature:", "pt": "Temperatura:"},
+    "s7_lbl_stop_threshold": {"en": "Stop threshold:", "pt": "Limiar de parada:"},
+    "s7_tooltip_stop_threshold": {
+        "en": "Confidence the model must reach to end a molecule.\n\n"
+              "Raise it (0.6-0.7) for LARGER ligands: the model then needs to "
+              "be more certain before stopping. Lower it for smaller ones. "
+              "Unlike the training-time stop weight, this biases length "
+              "directly and needs no retraining.",
+        "pt": "Confiança que o modelo precisa atingir para encerrar a "
+              "molécula.\n\n"
+              "Aumente (0,6-0,7) para ligantes MAIORES: o modelo passa a "
+              "precisar de mais certeza antes de parar. Reduza para menores. "
+              "Diferente do peso da parada no treino, este viesa o tamanho "
+              "diretamente e não exige retreinar.",
+    },
+    "s7_lbl_bond_threshold": {"en": "Bond threshold:", "pt": "Limiar de ligação:"},
+    "s7_tooltip_bond_threshold": {
+        "en": "Minimum probability to accept a bond BEYOND the anchor bond "
+              "to the focal atom.\n\n"
+              "Lowering it favours ring closure (a ring needs the new atom to "
+              "bond to two already-placed atoms), at the risk of spurious "
+              "bonds. The empirical chemistry filter rejects impossible ones "
+              "regardless.",
+        "pt": "Probabilidade mínima para aceitar uma ligação ALÉM da âncora "
+              "com o átomo focal.\n\n"
+              "Reduzir favorece o fechamento de anéis (um anel exige que o "
+              "átomo novo se ligue a dois já colocados), ao risco de ligações "
+              "espúrias. O filtro empírico de química rejeita as impossíveis "
+              "de qualquer forma.",
+    },
+    "s7_tooltip_temperature": {
+        "en": "Sampling diversity. Also flattens the ATOM TYPE distribution: "
+              "at 1.0 the measured generation over-represents P by 5x, F by "
+              "6x and S by 4x relative to the training set, while carbon "
+              "drops from 67% to 44%. Lowering to ~0.7 sharpens towards the "
+              "training composition.",
+        "pt": "Diversidade da amostragem. Também achata a distribuição de "
+              "TIPOS ATÔMICOS: em 1,0 a geração medida super-representa P em "
+              "5x, F em 6x e S em 4x em relação ao treino, enquanto o carbono "
+              "cai de 67% para 44%. Reduzir para ~0,7 aproxima da composição "
+              "da base.",
+    },
     "s7_lbl_cutoff": {"en": "Site cutoff (Å):", "pt": "Cutoff do sítio (Å):"},
     "s7_lbl_top_n": {"en": "Top N report:", "pt": "Relatório Top N:"},
     "s7_lbl_min_atoms": {"en": "Min. site atoms:", "pt": "Átomos mín. do sítio:"},

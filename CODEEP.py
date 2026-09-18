@@ -1595,6 +1595,7 @@ class MainWindow(QMainWindow):
             "step7": [
                 "cb_gen_phase", "ed_gen_pdb", "ed_gen_site_pdb", "ed_gen_ckpt",
                 "ed_gen_out", "ed_ligand_ref", "sp_n_samples", "dsb_temp",
+                "dsb_stop_thr", "dsb_bond_thr",
                 "sp_cutoff_gen", "sp_top_n", "sp_min_atoms_gen", "chk_gen_protonate_site",
                 "dsb_gen_ph", "cb_gen_site_qm_method", "cb_gen_qm_basis", "cb_final_ff",
                 "chk_induced_fit", "chk_use_site_center", "dsb_site_x", "dsb_site_y",
@@ -4620,6 +4621,15 @@ class MainWindow(QMainWindow):
         self.sp_n_samples  = QSpinBox(); self.sp_n_samples.setRange(1,10000); self.sp_n_samples.setValue(200)
         self.dsb_temp      = QDoubleSpinBox()
         self.dsb_temp.setDecimals(2); self.dsb_temp.setRange(0.1,5.0); self.dsb_temp.setValue(1.0)
+        self._tr("s7_tooltip_temperature", self.dsb_temp.setToolTip)
+        self.dsb_stop_thr  = QDoubleSpinBox()
+        self.dsb_stop_thr.setDecimals(2); self.dsb_stop_thr.setRange(0.05, 0.95)
+        self.dsb_stop_thr.setSingleStep(0.05); self.dsb_stop_thr.setValue(0.50)
+        self._tr("s7_tooltip_stop_threshold", self.dsb_stop_thr.setToolTip)
+        self.dsb_bond_thr  = QDoubleSpinBox()
+        self.dsb_bond_thr.setDecimals(2); self.dsb_bond_thr.setRange(0.05, 0.95)
+        self.dsb_bond_thr.setSingleStep(0.05); self.dsb_bond_thr.setValue(0.50)
+        self._tr("s7_tooltip_bond_threshold", self.dsb_bond_thr.setToolTip)
         self.sp_cutoff_gen = QDoubleSpinBox()
         self.sp_cutoff_gen.setDecimals(1); self.sp_cutoff_gen.setRange(3.0,15.0); self.sp_cutoff_gen.setValue(6.0)
         self.sp_top_n      = QSpinBox(); self.sp_top_n.setRange(1,200); self.sp_top_n.setValue(20)
@@ -4738,6 +4748,8 @@ class MainWindow(QMainWindow):
             ("s7_lbl_ref_ligand",    ref_row),
             ("s7_lbl_n_samples",     self.sp_n_samples),
             ("s7_lbl_temperature",   self.dsb_temp),
+            ("s7_lbl_stop_threshold", self.dsb_stop_thr),
+            ("s7_lbl_bond_threshold", self.dsb_bond_thr),
             ("s7_lbl_cutoff",        self.sp_cutoff_gen),
             ("s7_lbl_top_n",         self.sp_top_n),
             ("s7_lbl_min_atoms",     self.sp_min_atoms_gen),
@@ -4795,6 +4807,8 @@ class MainWindow(QMainWindow):
                 ckpt        = ckpt,
                 n_samples   = self.sp_n_samples.value(),
                 temperature = self.dsb_temp.value(),
+                stop_threshold = self.dsb_stop_thr.value(),
+                bond_threshold = self.dsb_bond_thr.value(),
                 cutoff      = self.sp_cutoff_gen.value(),
                 min_atoms   = self.sp_min_atoms_gen.value(),
                 top_n       = self.sp_top_n.value(),

@@ -811,6 +811,22 @@ def load_model(
     # significam outra coisa e faltam três cabeças. Carregar com
     # strict=False produziria um modelo que roda e gera lixo silenciosamente
     # — daí o erro explícito em vez de um aviso.
+    # Química empírica da base em que o modelo foi treinado (ver
+    # pipeline_train.compute_bond_stats). Carregada do próprio checkpoint
+    # para que geração e treino nunca discordem sobre o que é uma ligação
+    # possível — mesma lógica da voxel_config.
+    _stats = cfg.get("bond_stats") or {}
+    if _stats:
+        BOND_STATS.clear(); BOND_STATS.update(_stats)
+        log.info(f"  Química da base herdada do checkpoint: "
+                 f"{len(_stats)} pares (elemento, elemento, ordem)")
+    else:
+        log.warning(
+            "  Checkpoint sem bond_stats: a montagem cai no critério plano de "
+            "distância (2,15 A) e NAO rejeita pares inexistentes na base "
+            "(O-O, O-F, N-F...). Retreine para obter o filtro completo."
+        )
+
     ckpt_arch = int(cfg.get("arch_version", 1))
     cur_arch  = int(getattr(mod, "ARCH_VERSION", 1))
     if ckpt_arch != cur_arch:
@@ -918,9 +934,52 @@ BOND_ORDER_BUDGET = {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# QUÍMICA EMPÍRICA DA BASE DE TREINO
+# ══════════════════════════════════════════════════════════════════════════════
+# Tabela medida sobre as ligações reais dos ligantes curados: frequência,
+# comprimento médio e p99 por (elemento, elemento, ordem). Preenchida por
+# load_model a partir do checkpoint — assim a geração usa a MESMA química da
+# base em que o modelo foi treinado, sem depender de caminho externo.
+#
+# Substitui dois critérios frouxos da versão anterior:
+#   1. distância: o limite plano de 2,15 Å para qualquer ligação simples dava
+#      0,5-0,65 Å de folga sobre o real (C–C p99 = 1,62 Å; C–O = 1,50 Å) e
+#      admitia contatos 1,3 como se fossem ligação — origem dos anéis de 3
+#      membros espúrios;
+#   2. composição: nada impedia pares que a base não contém. Medido em 41.721
+#      ligações: O–O, O–F, N–F, P–F e S–F não ocorrem NENHUMA vez, e ainda
+#      assim 70 moléculas geradas trouxeram 68 peróxidos.
+BOND_STATS: dict = {}
+BOND_PAIR_MIN_FREQ = 1e-4      # 0,01% — abaixo disso o par é considerado inexistente
+BOND_DIST_TOL      = 0.12      # Å de folga sobre o p99 medido
+
+_BOND_ORDER_KEY = {
+    BondType.SINGLE: "1", BondType.DOUBLE: "2",
+    BondType.TRIPLE: "3", BondType.AROMATIC: "ar",
+}
+
+
+def _pair_key(sym_i: str, sym_j: str, bond_type: BondType) -> str:
+    e1, e2 = sorted([sym_i.upper(), sym_j.upper()])
+    return f"{e1}-{e2}-{_BOND_ORDER_KEY.get(bond_type, '1')}"
+
+
 def _bond_distance_ok(sym_i: str, sym_j: str, bond_type: BondType, dist: float) -> bool:
+    """Aceita a ligação se o par existir na base E a distância for compatível.
+
+    Sem BOND_STATS carregada (checkpoint antigo), cai no critério plano
+    anterior — frouxo, mas melhor que recusar tudo.
+    """
     if dist <= 0.9:
         return False
+
+    if BOND_STATS:
+        info = BOND_STATS.get(_pair_key(sym_i, sym_j, bond_type))
+        if info is None or info.get("freq", 0.0) < BOND_PAIR_MIN_FREQ:
+            return False
+        return dist <= float(info.get("p99", 1.8)) + BOND_DIST_TOL
+
     limit = {
         BondType.SINGLE: 2.15,
         BondType.DOUBLE: 1.90,
@@ -930,6 +989,23 @@ def _bond_distance_ok(sym_i: str, sym_j: str, bond_type: BondType, dist: float) 
     if {sym_i.upper(), sym_j.upper()} & {"S", "P", "FE", "ZN", "MG", "CL", "BR", "I"}:
         limit += 0.25
     return dist <= limit
+
+
+def _has_implausible_ring(mol: "Chem.Mol") -> bool:
+    """Anel de 3-4 membros com 2+ heteroátomos.
+
+    Epóxido e aziridina (1 heteroátomo) existem e são aceitos; anéis como o
+    p1oo1 observado na geração — fósforo e dois oxigênios num ciclo de 3 —
+    não ocorrem em química de fármacos. Na base de treino anéis de 3 são
+    1,4% do total, contra 94% dos gerados.
+    """
+    for ring in mol.GetRingInfo().AtomRings():
+        if len(ring) <= 4:
+            het = sum(1 for i in ring
+                      if mol.GetAtomWithIdx(i).GetSymbol().upper() != "C")
+            if het >= 2:
+                return True
+    return False
 
 
 def _sanitize_generated_mol(mol: "Chem.Mol") -> "Chem.Mol | None":
@@ -1947,6 +2023,8 @@ def preds_to_mol(
             return None
         if len(Chem.GetMolFrags(mol)) != 1:
             return None
+        if _has_implausible_ring(mol):
+            return None
         return _relax_generated_geometry(
             mol, site_coords=site_coords, site_elements=site_elements,
             site_mol=site_mol, site_is_backbone=site_is_backbone,
@@ -1966,6 +2044,8 @@ def generate_candidates(
     tensor_dir: Path,
     n_samples: int = 200,
     temperature: float = 1.0,
+    stop_threshold: float = 0.5,
+    bond_threshold: float = 0.5,
     voxel_size: float = 1.0,
     ref_mol = None,   # não usado mais aqui (era o template) — mantido por
                        # compatibilidade de assinatura; a similaridade de
@@ -2008,6 +2088,11 @@ def generate_candidates(
         samples = model.sample(
             tensor, n_samples=n_samples, temperature=temperature,
             voxel_sizes=voxel_sizes_gen, max_atoms=max_atoms,
+            stop_threshold=stop_threshold, bond_threshold=bond_threshold,
+            # Química da base, herdada do checkpoint (ver load_model): faz o
+            # rollback geométrico saber qual distância é aceitável para cada
+            # par de elementos, em vez de uma janela genérica.
+            bond_stats=BOND_STATS or None,
         )
 
     # ── Referencial das posições geradas ──────────────────────────────────
@@ -2354,8 +2439,17 @@ def rank_candidates(
                  + 0.2 * sa_norm
                  + 0.15 * float(c["lipinski"])
                  + 0.10 * float(c["veber"])
-                 + 0.05 * float(mw_ok and logp_ok and tpsa_ok and rot_ok and clash_ok)
+                 + 0.05 * float(mw_ok and logp_ok and tpsa_ok and rot_ok)
                  + (0.10 * tanimoto if tanimoto else 0.0))
+
+        # Colisão com o sítio é violação FÍSICA, não item de checklist.
+        # Antes entrava diluída no termo de peso 0,05 acima, junto de outros
+        # quatro booleanos: um candidato com 35 colisões perdia no máximo
+        # 0,05 e ainda assim apareceu em 2º lugar no top-20. Agora multiplica
+        # o escore, de modo que QED alto não compensa encaixe impossível.
+        n_clash = c.get("n_pocket_clashes") or 0
+        if not clash_ok:
+            score *= max(0.15, 1.0 - 0.05 * float(n_clash))
 
         rows.append({
             "raw_index": c.get("idx"),
@@ -2572,6 +2666,12 @@ Exemplos:
     )
     parser.add_argument("--n-samples",   type=int,   default=200,
                         help="Número de amostras a gerar (default: 200)")
+    parser.add_argument("--stop-threshold", type=float, default=0.5,
+                        help="Confiança mínima para encerrar a molécula. "
+                             "Acima de 0,5 gera ligantes maiores (default: 0.5)")
+    parser.add_argument("--bond-threshold", type=float, default=0.5,
+                        help="Probabilidade mínima para aceitar uma ligação "
+                             "além da âncora (default: 0.5)")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperatura de amostragem — >1 mais diverso (default: 1.0)")
     parser.add_argument("--cutoff",      type=float, default=6.0,
@@ -2738,6 +2838,8 @@ Exemplos:
         tensor_dir=tensor_dir,
         n_samples=args.n_samples,
         temperature=args.temperature,
+        stop_threshold=args.stop_threshold,
+        bond_threshold=args.bond_threshold,
         voxel_size=voxel_size,              # ← passar o valor real do sítio
         site_coords=site_coords, site_elements=site_elements,
         site_mol=site_mol, site_is_backbone=site_is_backbone,

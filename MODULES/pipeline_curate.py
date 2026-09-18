@@ -72,14 +72,74 @@ CURATE_CONFIG = {
     # Deve ser consistente com min_heavy_atoms do script 01.
     "min_heavy_atoms": 7,
 
+    # Rejeita ligante ligado COVALENTEMENTE à proteína. É a regra GERAL que
+    # captura resíduos modificados (MSE, PTR, TPO, SEP, CME, CSO...) e
+    # glicosilações (NAG ligado a Asn) sem depender de lista: se algum átomo
+    # pesado do "ligante" está a menos de covalent_cutoff_A de um átomo
+    # pesado da proteína, ele não é um ligante — é parte da cadeia.
+    # Medido na base atual: MSE 2,25%, PTR 1,34%, TPO 1,25%, SEP 0,79%,
+    # NAG 7,97% — mais de 13% dos pares eram isto.
+    "reject_covalent": True,
+    "covalent_cutoff_A": 1.9,
+
+    # Exclui nucleotídeos e cofatores. São ligantes legítimos de muitas
+    # enzimas, mas concentram o fósforo (12,2% dos ligantes da base contêm P,
+    # contra ~0% dos fármacos aprovados) e o núcleo purina, enviesando a
+    # composição elementar do modelo. Desligue se o alvo for justamente uma
+    # enzima dependente de nucleotídeo.
+    "exclude_cofactors": True,
+
     # Solventes/íons residuais que podem aparecer como HETATM no PDB
     # mesmo após filtragem pelo script 01 (ex: íons de empacotamento cristalino)
     "excluded_ligands": {
-        "HOH", "DOD", "GOL", "EDO", "PEG", "DMS", "MPD",
-        "BME", "DTT", "EPE", "MES", "TRS", "FMT", "ACT", "ACE",
+        # ── Água, íons e solventes ─────────────────────────────────────
+        "HOH", "DOD", "GOL", "EDO", "DMS", "MPD", "MRD", "IPA", "EOH", "MOH",
         "NA", "K", "CA", "MG", "ZN", "FE", "MN", "CU", "CO",
         "NI", "CD", "HG", "PB", "CL", "BR", "IOD", "F",
-        "PO4", "SO4", "NO3", "NO2",
+        "PO4", "SO4", "NO3", "NO2", "CO3", "BCT", "AZI", "SCN", "NH4",
+        "UNX", "UNL", "UNK",
+
+        # ── Tampões e aditivos de cristalização ────────────────────────
+        "EPE", "MES", "TRS", "BTB", "BIS", "CAC", "PIN", "NHE", "TAU",
+        "BME", "DTT", "FMT", "ACT", "ACE", "ACY", "BCN", "IMD",
+        "CIT", "FLC", "TLA", "TAR", "MLI", "MLA", "AKG", "SUC", "POP", "PPV",
+
+        # ── PEG, detergentes e lipídios ────────────────────────────────
+        "PEG", "PG4", "PGE", "P6G", "1PE", "7PE", "PG0", "PE4", "PE8",
+        "2PE", "12P", "15P", "XPE", "TRT", "LDA", "SDS", "DDQ", "LMU",
+        "BOG", "BNG", "LMT", "C8E", "HTG",
+        "OLA", "OLC", "PLM", "MYR", "STE", "DAO", "LAU", "2CV", "78N",
+        "Y01", "CLR", "CHD", "HEX", "HEZ", "PEE", "PCW", "D10", "D12",
+
+        # ── Açúcares e glicosilação ────────────────────────────────────
+        "NAG", "NDG", "BMA", "MAN", "BGC", "GLC", "GAL", "GLA", "FUC",
+        "FUL", "XYS", "XYP", "SIA", "NGA", "A2G", "RIB", "RAM", "ARA",
+        "LAT", "TRE", "MAL", "MLT", "G6P", "F6P", "G1P", "PRP", "IPT",
+
+        # ── Resíduos modificados (também pegos pela regra covalente,
+        #    listados por redundância barata) ───────────────────────────
+        "MSE", "PTR", "TPO", "SEP", "CAS", "KCX", "CME", "CSO", "CSD",
+        "CSX", "CAF", "OCS", "TYS", "MLY", "M3L", "ALY", "LLP", "PLG",
+        "PCA", "SAC", "HIC", "CGU", "CSS", "CSW", "SNC", "NEP", "HIP",
+        "SCY", "YCM", "CMT", "OMT", "MHO", "SMC", "FME", "MLZ", "AGM",
+
+        # ── Aminoácidos livres (quase sempre do tampão) ────────────────
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS",
+        "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP",
+        "TYR", "VAL",
+
+        # ── Compostos de átomo pesado (fasagem cristalográfica) ────────
+        "MBO", "PHG", "HGB", "MMC", "TBR", "IRI", "PT4", "AU1",
+    },
+
+    # Nucleotídeos e cofatores — aplicados só quando exclude_cofactors=True
+    "cofactor_ligands": {
+        "ADP", "ATP", "AMP", "GDP", "GTP", "GMP", "UDP", "UTP", "UMP",
+        "CDP", "CTP", "CMP", "IMP", "IDP", "ITP", "TTP", "DTP",
+        "ANP", "ACP", "AGS", "APC", "ADN", "GNP", "GSP",
+        "NAD", "NAI", "NAP", "NDP", "FAD", "FMN", "FDA",
+        "SAM", "SAH", "COA", "ACO", "TPP", "PLP", "PMP",
+        "GSH", "GDS", "BTN", "HEM", "HEC", "SF4", "FES", "F3S",
     },
 }
 
@@ -196,8 +256,28 @@ def get_ligands(structure, config: dict) -> list[dict]:
     carbonos mesmo quando o campo está ausente.
     """
     ligands = []
-    excluded  = config["excluded_ligands"]
+    excluded  = set(config["excluded_ligands"])
+    if config.get("exclude_cofactors", True):
+        excluded |= set(config.get("cofactor_ligands", ()))
     min_heavy = config["min_heavy_atoms"]
+
+    # ── Árvore dos átomos pesados da PROTEÍNA (resíduos padrão) ───────────
+    # Usada para detectar ligação covalente ligante-proteína. Construída uma
+    # vez por estrutura: a alternativa (varrer todos os pares por ligante)
+    # seria quadrática à toa.
+    reject_cov = config.get("reject_covalent", True)
+    cov_cut    = float(config.get("covalent_cutoff_A", 1.9))
+    prot_tree  = None
+    if reject_cov:
+        prot_xyz = [
+            a.get_coord()
+            for ch in structure[0] for res in ch
+            if res.get_id()[0] == " "
+            for a in res.get_atoms()
+            if _infer_element(a) not in ("H", "D", "X", "")
+        ]
+        if prot_xyz:
+            prot_tree = cKDTree(np.asarray(prot_xyz, dtype=float))
 
     for chain in structure[0]:
         for residue in chain:
@@ -227,6 +307,21 @@ def get_ligands(structure, config: dict) -> list[dict]:
                 log.debug(f"  {resname}: rejeitado — sem carbono "
                             f"(elementos: {set(e for _,e in heavy_atoms)})")
                 continue
+
+            # ── Ligação covalente com a proteína ──────────────────────────
+            # Regra geral, independente de lista: resíduo modificado
+            # (selenometionina, fosfotirosina, cisteína oxidada...) e
+            # glicosilação (NAG em Asn) são parte da cadeia, não ligantes.
+            # Um ligante de verdade faz apenas contatos não-covalentes, a
+            # >= 2,7 Å (ponte de hidrogênio) do átomo proteico mais próximo.
+            if prot_tree is not None:
+                lig_xyz = np.asarray([a.get_coord() for a, _ in heavy_atoms],
+                                     dtype=float)
+                d_min = float(prot_tree.query(lig_xyz)[0].min())
+                if d_min < cov_cut:
+                    log.debug(f"  {resname}: rejeitado — ligado covalentemente "
+                              f"à proteína (d_min={d_min:.2f} Å < {cov_cut} Å)")
+                    continue
 
             ligands.append({
                 "chain":      chain.get_id(),
