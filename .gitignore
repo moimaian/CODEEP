@@ -8,7 +8,7 @@ ANTIGOS/
 packaging/dist/
 data/
 checkpoints/
-CODEEP.py.bak-antes-hpo
+*.bak-*
 TEST/DiffSBDD-main.zip
 TEST/LiGAN-master.zip
 TEST/Pocket2Mol-main.zip
@@ -23,7 +23,6 @@ TEST/pilot_crossdocked10_config.json
 TEST/pilot_crossdocked10_targets.tsv
 TEST/receptores/
 TEST/run_benchmark_common_targets.sh
-TEST/run_benchmark_common_targets.sh.bak-antes-estratificacao
 TEST/split_by_name.pt
 hpo/
 regen_ligand_graphs.py
