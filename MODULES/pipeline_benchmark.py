@@ -200,7 +200,7 @@ def _run_single_target(
 
     t0 = time.perf_counter()
     (site_tensor, origin, voxel_size, site_coords, site_elements,
-     site_mol, site_is_backbone) = gen.pdb_to_site_tensor(
+     site_mol, site_is_backbone, _site_residues) = gen.pdb_to_site_tensor(
         pdb_path,
         config.get("cutoff", 6.0),
         config.get("min_atoms", 5),

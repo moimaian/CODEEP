@@ -242,7 +242,8 @@ from datetime import datetime
 from typing import Optional
 
 # ── PyQt5 ─────────────────────────────────────────────────────────────────
-from PyQt5.QtCore    import Qt, QThread, pyqtSignal, QTimer, QDateTime, QSettings, QSize
+from PyQt5.QtCore    import (Qt, QThread, pyqtSignal, QTimer, QDateTime,
+                             QSettings, QSize, QLocale)
 from PyQt5.QtGui     import QPixmap, QGuiApplication, QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QRadioButton, QWidget, QTabWidget,
@@ -919,8 +920,64 @@ def _pulse(bar):
         bar.setValue(v + 1)
     # acima de 30% só avança se tqdm emitir valor real
 
-class TrainingPlotWindow(QDialog):
-    """Curvas de treino ao vivo (Etapa 5).
+class LocaleAwareDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox que aceita vírgula E ponto como separador decimal.
+
+    O QDoubleSpinBox comum usa o locale do sistema: numa máquina em pt_BR,
+    digitar "12.5" é recusado pelo validador — o caractere sequer aparece no
+    campo. Como coordenadas de PDB vêm quase sempre com ponto, copiar um
+    valor do PyMOL ou de um arquivo exigia converter à mão, e um descuido
+    aqui coloca o bolso no lugar errado sem erro nenhum.
+
+    Aqui os dois separadores são SEMPRE aceitos na entrada; o que muda com o
+    idioma da interface é apenas o separador exibido — inglês usa ponto,
+    português do Brasil usa vírgula (ver set_idioma, chamada também na troca
+    de idioma em tempo de execução).
+
+    OmitGroupSeparator é essencial: sem ele, o locale pt_BR usaria o PONTO
+    como separador de milhar, colidindo com o ponto que acabamos de aceitar
+    como decimal.
+    """
+
+    def __init__(self, parent=None, idioma: str = "pt"):
+        super().__init__(parent)
+        self.set_idioma(idioma)
+
+    def set_idioma(self, idioma: str):
+        loc = (QLocale(QLocale.English, QLocale.UnitedStates)
+               if str(idioma).lower().startswith("en")
+               else QLocale(QLocale.Portuguese, QLocale.Brazil))
+        loc.setNumberOptions(QLocale.OmitGroupSeparator)
+        valor = self.value()
+        self.setLocale(loc)
+        self.setValue(valor)      # reexibe com o separador novo
+
+    def _normalizar(self, texto: str) -> str:
+        """Troca o separador 'estrangeiro' pelo do locale corrente."""
+        sep = self.locale().decimalPoint()
+        outro = "." if sep == "," else ","
+        return texto.replace(outro, sep)
+
+    def validate(self, texto, pos):
+        # Devolve o texto JÁ normalizado: o QAbstractSpinBox usa a string
+        # retornada por validate(), entao digitar "." num campo em pt-BR
+        # resulta em "," aparecendo no campo, em vez de tecla ignorada.
+        return super().validate(self._normalizar(texto), pos)
+
+    def fixup(self, texto):
+        return super().fixup(self._normalizar(texto))
+
+    def valueFromText(self, texto):
+        return super().valueFromText(self._normalizar(texto))
+
+
+class TrainingPlotPanel(QWidget):
+    """Curvas de treino ao vivo (Etapa 5) — painel EMBUTIDO na aba.
+
+    Era um QDialog separado; virou painel para ficar acima do Execution
+    Log, colapsável pelo mesmo cabeçalho (_mk_collapsible_log_header) e
+    com stretch, de modo que o espaço liberado ao fechar o log vá para o
+    gráfico.
 
     Le as MESMAS linhas que ja vao para o Execution Log — nao ha canal novo
     entre o processo filho e a interface, nem alteracao no pipeline_train.
@@ -946,16 +1003,14 @@ class TrainingPlotWindow(QDialog):
     def __init__(self, idioma_getter, parent=None):
         super().__init__(parent)
         self._idioma_getter = idioma_getter
-        self.setWindowTitle(i18n.t("s5_plot_title", idioma_getter()))
-        self.setMinimumSize(780, 500)
-        # Nao-modal: o treino dura horas e o usuario precisa seguir usando a
-        # interface (e lendo o Execution Log) com a janela aberta.
-        self.setModal(False)
+        self.setMinimumHeight(240)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self._epoch = 0
         self._dados = {}
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
         topo = QHBoxLayout()
         self.lbl_metric = QLabel(i18n.t("s5_plot_metric", idioma_getter()))
         self.cb_metric = QComboBox()
@@ -971,6 +1026,8 @@ class TrainingPlotWindow(QDialog):
         from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _Canvas
         self._fig = Figure(figsize=(7.6, 4.6), facecolor="#0D1B2A")
         self._canvas = _Canvas(self._fig)
+        self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._canvas.setMinimumHeight(200)
         lay.addWidget(self._canvas, 1)
         self._ax1 = self._fig.add_subplot(111)
         self._ax2 = self._ax1.twinx()
@@ -1008,10 +1065,20 @@ class TrainingPlotWindow(QDialog):
             for sp in ax.spines.values():
                 sp.set_color("#2A3F5F")
 
+        # ax2 e um twinx: no momento da criacao o matplotlib ja poe os ticks
+        # e o rotulo dele a DIREITA, mas .clear() devolve tudo ao padrao
+        # (esquerda). Sem reaplicar a cada redesenho, o rotulo do eixo
+        # direito era desenhado por cima do eixo vertical esquerdo.
+        ax2.yaxis.tick_right()
+        ax2.yaxis.set_label_position("right")
+
         idioma = self._idioma_getter()
         ax1.set_xlabel(i18n.t("s5_plot_xlabel", idioma), color="#C9D1D9", fontsize=9)
         ax1.set_ylabel(i18n.t("s5_plot_ylabel_left", idioma), color="#C9D1D9", fontsize=9)
-        ax2.set_ylabel(i18n.t("s5_plot_ylabel_right", idioma), color="#C9D1D9", fontsize=9)
+        # rotation=270 + labelpad afastam o texto dos numeros do eixo direito,
+        # que e' onde ele encostava mesmo depois de ir para o lado certo.
+        ax2.set_ylabel(i18n.t("s5_plot_ylabel_right", idioma), color="#C9D1D9",
+                       fontsize=9, rotation=270, labelpad=14, va="bottom")
 
         def _serie(nome):
             d = self._dados.get(nome, [])
@@ -1040,11 +1107,20 @@ class TrainingPlotWindow(QDialog):
             ax1.text(0.5, 0.5, i18n.t("s5_plot_waiting", idioma),
                      ha="center", va="center", transform=ax1.transAxes,
                      color="#6E8CA8", fontsize=10)
-        ax1.grid(True, alpha=0.15, color="#2A3F5F")
-        try:
-            self._fig.tight_layout()
-        except Exception:
-            pass
+        # Grade: uma unica camada, na mesma intensidade nos dois sentidos.
+        # ax2 herdava grade propria do rcParams apos o clear(), e as linhas
+        # horizontais dele somavam-se as de ax1 — duas camadas translucidas
+        # sobrepostas resultavam em horizontais visivelmente mais fortes que
+        # as verticais.
+        ax1.set_axisbelow(True)
+        ax1.grid(True, which="major", axis="both",
+                 alpha=0.12, color="#2A3F5F", linewidth=0.7)
+        ax2.grid(False)
+
+        # Margens fixas em vez de tight_layout: o tight_layout estava dentro
+        # de um try/except silencioso e, quando falhava, nao sobrava espaco
+        # para o rotulo da direita. Aqui a reserva e' deterministica.
+        self._fig.subplots_adjust(left=0.10, right=0.89, top=0.96, bottom=0.13)
         self._canvas.draw_idle()
 
 
@@ -1161,7 +1237,9 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
                        cutoff, min_atoms, top_n, out, ligand_ref, site_pdb,
                        site_config_overrides=None, final_ff="mmff_uff",
                        induced_fit=False, site_center=None, site_radius=10.0,
-                       heuristic_search=False, pocket_rank=1):
+                       heuristic_search=False, pocket_rank=1,
+                       stop_threshold=0.5, bond_threshold=0.5,
+                       min_heavy_atoms=7):
     """Função de módulo (pickle-safe) que executa a geração no processo filho.
 
     Definição do sítio, em ordem de precedência:
@@ -1170,6 +1248,13 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
                           score) e devolve o centro;
       site_center       → centro informado pelo usuário;
       nenhum            → detecção pelo ligante co-cristalizado do PDB.
+
+    min_heavy_atoms: filtro de tamanho aplicado ao FINAL, depois do
+    ranqueamento e antes do top_n — ver
+    pipeline_generate.filter_candidates_by_size. Mesmo limiar da Etapa 2
+    (Data Validation and Curation), aplicado aos ligantes de treino;
+    nenhum deles tem menos átomos pesados que isso, mas nada impedia a
+    geração de produzir candidatos menores.
     """
     import MODULES.pipeline_generate as m
     from pathlib import Path as _P
@@ -1221,7 +1306,7 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
         project_dir=_P(root))           # ver Problema 3
 
     (site_tensor, origin, voxel_size, site_coords, site_elements,
-     site_mol, site_is_backbone) = m.pdb_to_site_tensor(
+     site_mol, site_is_backbone, site_residues) = m.pdb_to_site_tensor(
         pdb_path, cutoff, min_atoms, site_pdb=site_pdb_path,
         project_dir=_P(root),           # ver Problema 3
         config_overrides=m.resolve_site_config_overrides(
@@ -1231,6 +1316,15 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
         out_dir / "site_tensor.npz",
         tensor=site_tensor, origin=origin,
         voxel_size=np.array([voxel_size]))
+
+    # Sítio decidido INTERNAMENTE (raio+centro, P2Rank ou ligante
+    # co-cristalizado) em vez de fornecido pronto pelo usuário via
+    # site_pdb: grava os resíduos REALMENTE usados para montar o tensor,
+    # com as coordenadas originais do PDB de entrada — sem isso o usuário
+    # não tem como conferir se o sítio capturado é o esperado, nem ajustar
+    # Site Radius/Pocket to use com base em algo concreto.
+    if not site_pdb_path:
+        m.write_site_pdb(site_residues, out_dir / "site_residues_used.pdb")
 
     ref_mol = None
     if ligand_ref:
@@ -1242,6 +1336,7 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
         model, mod, site_tensor,
         tensor_dir=_P(root) / "data" / "tensors",
         n_samples=n_samples, temperature=temperature,
+        stop_threshold=stop_threshold, bond_threshold=bond_threshold,
         voxel_size=voxel_size,
         ref_mol=ref_mol,               # ← voxel_size retornado por pdb_to_site_tensor
         site_coords=site_coords, site_elements=site_elements,
@@ -1255,6 +1350,12 @@ def _pipeline_generate(root, job_dir, pdb, ckpt, n_samples, temperature,
         raise RuntimeError("Nenhum candidato válido gerado.")
 
     df = m.rank_candidates(candidates, ref_mol=ref_mol)
+    df = m.filter_candidates_by_size(df, min_heavy_atoms)
+    if df.empty:
+        raise RuntimeError(
+            f"Nenhum candidato com ≥{min_heavy_atoms} átomos pesados "
+            "sobrou após o filtro de tamanho mínimo (Min. heavy atoms). "
+            "Reduza o limiar ou gere mais candidatos.")
     df.drop(columns=["_mol"], errors="ignore").to_csv(out_dir / "candidates.csv")
     m.save_sdf(df, out_dir / f"top{top_n}_candidates.sdf", top_n)
     m.save_grid_image(df, out_dir / f"top{top_n}_candidates.png", top_n)
@@ -1298,6 +1399,21 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self._build_tabs()
+
+        # Tamanho mínimo da janela = o necessário para a aba Home caber sem
+        # precisar rolar (ver _minimum_size_sem_scroll_home). Aplicado só
+        # AGORA porque depende dos widgets da Home já existirem. Se o
+        # tamanho inicial (50% da tela, definido acima) ficou menor que
+        # esse mínimo, a janela cresce até ele — nunca abre precisando
+        # rolar a Home por causa do tamanho de abertura escolhido.
+        _minimo = self._minimum_size_sem_scroll_home()
+        if _minimo is not None:
+            _min_w, _min_h = _minimo
+            self.setMinimumSize(_min_w, _min_h)
+            if self.width() < _min_w or self.height() < _min_h:
+                self.resize(max(self.width(), _min_w), max(self.height(), _min_h))
+                self._center_on_screen()
+
         self._init_tab_state_specs()
         self._connect_state_autosave()
         self._refresh_previous_jobs()
@@ -1412,6 +1528,13 @@ class MainWindow(QMainWindow):
             return
         self._idioma = idioma
         QSettings("CODEEP", "CODEEP").setValue("idioma", idioma)
+        # Separador decimal de TODOS os campos numericos de uma vez: varre a
+        # arvore de widgets em vez de exigir um registro por campo (eram ~20,
+        # espalhados por quatro abas — um esquecido passaria despercebido ate
+        # alguem digitar um ponto no idioma errado).
+        for _sp in self.findChildren(LocaleAwareDoubleSpinBox):
+            _sp.set_idioma(self._idioma)
+
         for chave, apply_fn, kwargs in self._i18n_registry:
             apply_fn(i18n.t(chave, self._idioma, **kwargs))
             # A tradução para PT costuma ser mais longa que o texto original em EN — botões com
@@ -1444,6 +1567,39 @@ class MainWindow(QMainWindow):
 
         if current_min < required_width:
             button.setMinimumWidth(required_width)
+
+    def _minimum_size_sem_scroll_home(self):
+        """Altura/largura mínimas da JANELA para que a aba Home caiba inteira
+        sem precisar da barra de rolagem do seu QScrollArea (ver _tab_home).
+
+        A área elástica da Home (header fixo + miolo rolável + rodapé fixo)
+        rola em vez de crescer justamente para a janela poder ficar menor que
+        o conteúdo quando o usuário quiser — mas isso também significa que o
+        sizeHint() do QScrollArea NÃO reflete o tamanho natural do conteúdo
+        (QAbstractScrollArea.sizeHint() é um valor fixo pequeno, ~256×192,
+        alheio ao que está dentro), então a janela nunca "sabe" sozinha
+        quanto precisa para não rolar. Medimos aqui, direto, o sizeHint() do
+        widget QUE FICA DENTRO do scroll (self._home_middle) — esse sim
+        reflete o conteúdo real, porque só é lido depois de tudo construído.
+
+        Chamado uma vez, logo após _build_tabs() (constrói a Home e as
+        demais abas) — cedo demais e os widgets ainda não existem."""
+        header = getattr(self, "_home_header", None)
+        middle = getattr(self, "_home_middle", None)
+        footer = getattr(self, "_home_footer", None)
+        if header is None or middle is None or footer is None:
+            return None   # aba Home falhou ao construir (ver _tab_load_error) — sem mínimo
+
+        altura = (header.sizeHint().height()
+                 + middle.sizeHint().height()
+                 + footer.sizeHint().height()
+                 + self.menuBar().sizeHint().height()
+                 + self.tabs.tabBar().sizeHint().height()
+                 + 4)   # folga p/ arredondamento de fontes/DPI entre plataformas
+        largura = max(header.sizeHint().width(),
+                     middle.sizeHint().width(),
+                     footer.sizeHint().width())
+        return largura, altura
 
     def _center_on_screen(self):
         screen = self.screen() or QGuiApplication.primaryScreen()
@@ -1588,6 +1744,7 @@ class MainWindow(QMainWindow):
                 "sp_gnn_layers", "dsb_lr", "dsb_beta", "sp_warmup",
                 "dsb_pos_weight", "dsb_stop_weight", "dsb_focal_weight", "dsb_dropout",
                 "dsb_weight_decay", "dsb_grad_clip",
+                "dsb_ss_max", "sp_ss_start", "sp_ss_ramp",
                 "sp_patience", "cb_train_device", "ed_resume", "chk_freeze_enc",
                 "ed_ckpt_out",
             ],
@@ -1596,7 +1753,8 @@ class MainWindow(QMainWindow):
                 "cb_gen_phase", "ed_gen_pdb", "ed_gen_site_pdb", "ed_gen_ckpt",
                 "ed_gen_out", "ed_ligand_ref", "sp_n_samples", "dsb_temp",
                 "dsb_stop_thr", "dsb_bond_thr",
-                "sp_cutoff_gen", "sp_top_n", "sp_min_atoms_gen", "chk_gen_protonate_site",
+                "sp_cutoff_gen", "sp_top_n", "sp_min_atoms_gen", "sp_min_heavy_gen",
+                "chk_gen_protonate_site",
                 "dsb_gen_ph", "cb_gen_site_qm_method", "cb_gen_qm_basis", "cb_final_ff",
                 "chk_induced_fit", "chk_use_site_center", "dsb_site_x", "dsb_site_y",
                 "dsb_site_z", "dsb_site_radius", "chk_heuristic_search", "sp_pocket_rank",
@@ -2547,6 +2705,7 @@ class MainWindow(QMainWindow):
 
         hl.addWidget(_mk_separator())
         outer.addWidget(header)
+        self._home_header = header   # guardado para _minimum_size_sem_scroll_home
 
         # ── Miolo elástico: apenas os grupos crescem/encolhem ───────────
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
@@ -2642,6 +2801,7 @@ class MainWindow(QMainWindow):
             pipe_lay.addWidget(desc_lbl, i, 1)
         pipe_grp.set_collapsed(False)
         lay.addWidget(pipe_grp)
+        self._home_middle = middle   # sizeHint natural (sem o scroll) — ver abaixo
         scroll.setWidget(middle)
         outer.addWidget(scroll, 1)
 
@@ -2680,6 +2840,7 @@ class MainWindow(QMainWindow):
         ver.setStyleSheet("font-size:8pt;color:#6E8CA8;margin-top:6px;")
         fl.addWidget(ver)
         outer.addWidget(footer)
+        self._home_footer = footer
         return w
 
     # ══════════════════════════════════════════════════════════════════════
@@ -3093,7 +3254,8 @@ class MainWindow(QMainWindow):
                                 worker_key, log_height, error_parent,
                                 params_min_height=420,
                                 shared_log_box=None, all_run_buttons=None,
-                                on_worker=None):
+                                on_worker=None, with_plot=False,
+                                start_collapsed=False):
         """Monta o corpo comum a toda aba/grupo de pipeline (parâmetros + progresso + Run/Stop,
         e log colapsável PRÓPRIO quando shared_log_box não é passado) dentro do layout `lay` já
         existente — compartilhado por _build_pipeline_tab (aba inteira, com título/navegação
@@ -3119,12 +3281,60 @@ class MainWindow(QMainWindow):
         uma única vez fora/abaixo de todos os grupos da aba, ver _mk_collapsible_log_header ali).
         all_run_buttons: lista compartilhada entre os grupos de uma mesma aba fundida — este
         botão Run se registra nela e desabilita os das OUTRAS ações enquanto roda (o log
-        compartilhado só faz sentido mostrando UMA ação de cada vez)."""
-        # Painel de parâmetros (scroll) — único item com stretch, ver nota acima.
+        compartilhado só faz sentido mostrando UMA ação de cada vez).
+        start_collapsed: True para as curvas ao vivo e o log PRÓPRIO (não afeta shared_log_box,
+        que já é posicionado uma única vez por quem chama _build_pipeline_group) começarem
+        fechados — usado pela Etapa 5, cujo painel de curvas somado ao log abriam a aba já alta
+        o bastante para forçar a janela principal a crescer ao iniciar. Também tira do scroll de
+        parâmetros o stretch que o deixava mais alto que seu próprio conteúdo (ver logo abaixo):
+        com as duas seções escondidas de saída, o scroll passava a ser o ÚNICO item visível com
+        stretch>0 e herdava TODO o espaço sobrando na aba — sobra essa que aparecia como um vão
+        fixo entre o último campo de parâmetros e o cabeçalho "Training Curves", em vez de ir
+        para as curvas (que é o que o stretch=2 delas faria se estivessem visíveis). Quem herda
+        essa sobra é um addStretch(1) inserido logo ANTES do bloco do log (ver abaixo) — não
+        depois da navegação: Execution Log, barra de progresso e os botões Run/Stop devem ficar
+        colados na parte inferior da janela, não soltos no meio dela."""
+        # Painel de parâmetros (scroll) — único item com stretch, EXCETO quando start_collapsed:
+        # aí ele fica com stretch=0 (tamanho justo ao conteúdo) — a sobra vai para o
+        # addStretch(1) entre as curvas e o log, ver abaixo.
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setWidget(self._wrap_scroll_widget(params_widget))
         scroll.setMinimumHeight(params_min_height)
-        lay.addWidget(scroll, 1)
+        lay.addWidget(scroll, 0 if start_collapsed else 1)
+
+        # Painel de curvas ao vivo (só a Etapa 5 pede). Vem ANTES do log e
+        # com stretch maior que o painel de parâmetros: ao colapsar o
+        # Execution Log, o espaço liberado vai majoritariamente para cá.
+        btn_curvas = None
+        if with_plot:
+            self._training_plot = TrainingPlotPanel(lambda: self._idioma, parent=None)
+            btn_curvas = self._mk_collapsible_log_header(
+                self._training_plot, chave="sec_training_plot",
+                start_expanded=not start_collapsed)
+            lay.addWidget(btn_curvas)
+            lay.addWidget(self._training_plot, 2)
+
+        if start_collapsed:
+            # Toda a sobra de espaço da janela se acumula AQUI — entre as
+            # curvas e o log — em vez de no scroll de parâmetros (stretch=0
+            # acima) ou depois da navegação. Log, progresso e Run/Stop ficam
+            # assim colados na parte inferior da janela.
+            lay.addStretch(1)
+            _idx_espaco = lay.count() - 1
+            if btn_curvas is not None:
+                # Sem isto, o espaço sobrando ficaria PERMANENTEMENTE
+                # dividido 2:1 entre o gráfico e este espaçador (ver
+                # addWidget(self._training_plot, 2) acima) — com as curvas
+                # expandidas, o 1/3 que sobrava para o espaçador aparecia
+                # como um vão morto entre o gráfico e o Execution Log,
+                # cobrindo o rótulo do eixo X (Epoch). Zerar o espaçador
+                # quando as curvas estão abertas devolve TODA a sobra para
+                # o gráfico; reabilitá-lo quando fecham volta a empurrar
+                # log/progresso/Run-Stop para o rodapé.
+                def _ajusta_espaco(aberto, _lay=lay, _idx=_idx_espaco):
+                    _lay.setStretch(_idx, 0 if aberto else 1)
+                btn_curvas.toggled.connect(_ajusta_espaco)
+                _ajusta_espaco(btn_curvas.isChecked())
 
         # Log de execução em tempo real — próprio (colapsável) ou compartilhado com outros
         # grupos da mesma aba (ver shared_log_box acima).
@@ -3132,7 +3342,8 @@ class MainWindow(QMainWindow):
             log_box = shared_log_box
         else:
             log_box = _mk_log_box(log_height)
-            lay.addWidget(self._mk_collapsible_log_header(log_box))
+            lay.addWidget(self._mk_collapsible_log_header(
+                log_box, start_expanded=not start_collapsed))
             lay.addWidget(log_box)
 
         # Barra de progresso
@@ -3206,7 +3417,8 @@ class MainWindow(QMainWindow):
 
     def _build_pipeline_tab(self, title_key, params_widget, run_fn_getter,
                             worker_key, prev_idx, next_idx,
-                            log_height=280, on_worker=None):
+                            log_height=280, on_worker=None, with_plot=False,
+                            start_collapsed=False, params_min_height=420):
         """Constrói o layout padrão de uma aba de pipeline inteira (título + parâmetros +
         log colapsável + progresso + Run/Stop + navegação) — ver _populate_pipeline_body para
         o corpo compartilhado com _build_pipeline_group.
@@ -3222,7 +3434,9 @@ class MainWindow(QMainWindow):
 
         self._populate_pipeline_body(lay, params_widget, run_fn_getter, worker_key,
                                      log_height, error_parent=w,
-                                     on_worker=on_worker)
+                                     params_min_height=params_min_height,
+                                     on_worker=on_worker, with_plot=with_plot,
+                                     start_collapsed=start_collapsed)
 
         lay.addLayout(self._mk_nav_row_tr(
             lambda: self.tabs.setCurrentIndex(prev_idx),
@@ -3438,12 +3652,12 @@ class MainWindow(QMainWindow):
         self.sp_cur_workers = QSpinBox()
         self.sp_cur_workers.setRange(0,64); self.sp_cur_workers.setValue(0)
         self._tr("s2cur_tooltip_workers", self.sp_cur_workers.setToolTip)
-        self.sp_cutoff = QDoubleSpinBox()
+        self.sp_cutoff = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.sp_cutoff.setRange(3.0,12.0); self.sp_cutoff.setValue(6.0)
         self.sp_cutoff.setSingleStep(0.5)
         self.sp_min_site = QSpinBox()
         self.sp_min_site.setRange(1,50); self.sp_min_site.setValue(5)
-        self.sp_max_mw = QDoubleSpinBox()
+        self.sp_max_mw = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.sp_max_mw.setRange(100,2000); self.sp_max_mw.setValue(800)
         self.sp_min_heavy = QSpinBox()
         self.sp_min_heavy.setRange(1,30); self.sp_min_heavy.setValue(7)
@@ -3600,7 +3814,7 @@ class MainWindow(QMainWindow):
         self._tr("s3_tooltip_parallel_pairs", self.chk_vox_parallel_pairs.setToolTip)
         self.sp_grid = QSpinBox()
         self.sp_grid.setRange(16,64); self.sp_grid.setValue(32)
-        self.sp_vox_pad = QDoubleSpinBox()
+        self.sp_vox_pad = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.sp_vox_pad.setRange(0.5,8.0); self.sp_vox_pad.setValue(3.0)
         self.sp_max_qm = QSpinBox()
         self.sp_max_qm.setRange(10,200); self.sp_max_qm.setValue(60)
@@ -3632,7 +3846,7 @@ class MainWindow(QMainWindow):
         self._tr("s3_chk_protonate_site", self.chk_protonate_site.setText)
         self.chk_protonate_site.setChecked(True)
         self._tr("s3_tooltip_protonate_site", self.chk_protonate_site.setToolTip)
-        self.dsb_site_ph = QDoubleSpinBox()
+        self.dsb_site_ph = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_site_ph.setDecimals(1); self.dsb_site_ph.setRange(0.0, 14.0)
         self.dsb_site_ph.setValue(7.4); self.dsb_site_ph.setSingleStep(0.5)
         self._tr("s3_tooltip_site_ph", self.dsb_site_ph.setToolTip)
@@ -3772,7 +3986,7 @@ class MainWindow(QMainWindow):
         self.sp_opt_trials.setRange(2, 10000); self.sp_opt_trials.setValue(40)
         self.sp_opt_epochs = QSpinBox()
         self.sp_opt_epochs.setRange(1, 500);   self.sp_opt_epochs.setValue(15)
-        self.dsb_opt_subset = QDoubleSpinBox()
+        self.dsb_opt_subset = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_opt_subset.setDecimals(2); self.dsb_opt_subset.setRange(0.01, 1.0)
         self.dsb_opt_subset.setSingleStep(0.05); self.dsb_opt_subset.setValue(0.20)
         self.sp_opt_seed = QSpinBox()
@@ -4192,12 +4406,15 @@ class MainWindow(QMainWindow):
     # TAB 7 — STEP 7: TREINAMENTO
     # ══════════════════════════════════════════════════════════════════════
     def _tab_step5(self):
-        # Layout em TRES COLUNAS alinhadas, mesmo padrao da Etapa 3: de Phase
-        # ate Device os campos sao escalares curtos e cabem lado a lado, o que
-        # evita a coluna unica de 17 linhas que obrigava a rolar o painel.
-        # Os campos largos (Retomar de / Salvar checkpoint em) e o checkbox de
-        # congelar encoder ficam abaixo, em largura total: um caminho de
-        # arquivo espremido em um terco da largura fica ilegivel.
+        # Layout em TRES COLUNAS alinhadas, mesmo padrao da Etapa 3: capacidade |
+        # otimizacao | regularizacao, 6 linhas cada. Patience e Device SAIRAM da
+        # coluna de regularizacao (que ficaria mais alta que as outras duas) e
+        # foram para duas linhas largas logo abaixo, ao lado de Retomar de / Salvar
+        # checkpoint em — na proporcao 2:1 que reproduz a largura de
+        # capacidade+otimizacao vs. regularizacao. O checkbox de congelar encoder
+        # fica por ultimo, em largura total (um caminho de arquivo espremido em um
+        # terco da largura ficaria ilegivel, dai as duas linhas largas em vez de
+        # uma quarta coluna).
         params = QWidget()
         pv = QVBoxLayout(params)
         pv.setContentsMargins(0, 0, 0, 0)
@@ -4225,10 +4442,6 @@ class MainWindow(QMainWindow):
             cl3.addWidget(_c)
         pv.addWidget(cols)
 
-        pf = QFormLayout()          # cauda de largura total
-        pf.setSpacing(8)
-        pv.addLayout(pf)
-
         self.cb_train_phase = QComboBox()
         self.cb_train_phase.addItems(["1", "2", "3"])
         # Defaults revisados nesta sessão: os valores antigos (epochs=100,
@@ -4246,33 +4459,43 @@ class MainWindow(QMainWindow):
         self.sp_latent     = QSpinBox(); self.sp_latent.setRange(2,1024); self.sp_latent.setValue(256)
         self.sp_hidden     = QSpinBox(); self.sp_hidden.setRange(16,4096);self.sp_hidden.setValue(256)
         self.sp_gnn_layers = QSpinBox(); self.sp_gnn_layers.setRange(1,12);self.sp_gnn_layers.setValue(4)
-        self.dsb_lr        = QDoubleSpinBox()
+        self.dsb_lr        = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_lr.setDecimals(6); self.dsb_lr.setRange(1e-6,1.0); self.dsb_lr.setValue(4e-4)
-        self.dsb_beta      = QDoubleSpinBox()
+        self.dsb_beta      = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_beta.setDecimals(3); self.dsb_beta.setRange(0,10); self.dsb_beta.setValue(0.5)
         self.sp_warmup     = QSpinBox(); self.sp_warmup.setRange(1,500); self.sp_warmup.setValue(30)
         # Pesos das cabeças da loss e regularização/estabilidade do otimizador.
         # Defaults idênticos aos de pipeline_train.train() — mudar um lado sem
         # o outro faria a interface mentir sobre o que o treino vai usar.
-        self.dsb_pos_weight = QDoubleSpinBox()
+        self.dsb_pos_weight = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_pos_weight.setDecimals(2); self.dsb_pos_weight.setRange(0.0, 20.0)
         self.dsb_pos_weight.setSingleStep(0.25); self.dsb_pos_weight.setValue(2.00)
         self._tr("s5_tooltip_pos_weight", self.dsb_pos_weight.setToolTip)
-        self.dsb_stop_weight = QDoubleSpinBox()
+        self.dsb_stop_weight = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_stop_weight.setDecimals(2); self.dsb_stop_weight.setRange(0.0, 20.0)
         self.dsb_stop_weight.setSingleStep(0.25); self.dsb_stop_weight.setValue(1.00)
         self._tr("s5_tooltip_stop_weight", self.dsb_stop_weight.setToolTip)
-        self.dsb_focal_weight = QDoubleSpinBox()
+        self.dsb_focal_weight = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_focal_weight.setDecimals(2); self.dsb_focal_weight.setRange(0.0, 20.0)
         self.dsb_focal_weight.setSingleStep(0.25); self.dsb_focal_weight.setValue(1.00)
         self._tr("s5_tooltip_focal_weight", self.dsb_focal_weight.setToolTip)
-        self.dsb_dropout   = QDoubleSpinBox()
+        self.dsb_dropout   = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_dropout.setDecimals(2); self.dsb_dropout.setRange(0,0.9); self.dsb_dropout.setValue(0.20)
-        self.dsb_weight_decay = QDoubleSpinBox()
+        self.dsb_weight_decay = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_weight_decay.setDecimals(6); self.dsb_weight_decay.setRange(0.0, 1.0)
         self.dsb_weight_decay.setSingleStep(1e-5); self.dsb_weight_decay.setValue(1e-4)
         self._tr("s5_tooltip_weight_decay", self.dsb_weight_decay.setToolTip)
-        self.dsb_grad_clip = QDoubleSpinBox()
+        self.dsb_ss_max = LocaleAwareDoubleSpinBox(idioma=self._idioma)
+        self.dsb_ss_max.setDecimals(2); self.dsb_ss_max.setRange(0.0, 1.0)
+        self.dsb_ss_max.setSingleStep(0.05); self.dsb_ss_max.setValue(0.25)
+        self._tr("s5_tooltip_ss_max", self.dsb_ss_max.setToolTip)
+        self.sp_ss_start = QSpinBox(); self.sp_ss_start.setRange(0, 500)
+        self.sp_ss_start.setValue(20)
+        self._tr("s5_tooltip_ss_start", self.sp_ss_start.setToolTip)
+        self.sp_ss_ramp = QSpinBox(); self.sp_ss_ramp.setRange(1, 500)
+        self.sp_ss_ramp.setValue(40)
+        self._tr("s5_tooltip_ss_ramp", self.sp_ss_ramp.setToolTip)
+        self.dsb_grad_clip = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_grad_clip.setDecimals(2); self.dsb_grad_clip.setRange(0.01, 100.0)
         self.dsb_grad_clip.setSingleStep(0.1); self.dsb_grad_clip.setValue(0.50)
         self._tr("s5_tooltip_grad_clip", self.dsb_grad_clip.setToolTip)
@@ -4315,19 +4538,45 @@ class MainWindow(QMainWindow):
             (pf_reg, [("s5_lbl_dropout",      self.dsb_dropout),
                       ("s5_lbl_weight_decay", self.dsb_weight_decay),
                       ("s5_lbl_grad_clip",    self.dsb_grad_clip),
-                      ("s5_lbl_patience",     self.sp_patience),
-                      ("s5_lbl_device",       self.cb_train_device)]),
+                      ("s5_lbl_ss_max",       self.dsb_ss_max),
+                      ("s5_lbl_ss_start",     self.sp_ss_start),
+                      ("s5_lbl_ss_ramp",      self.sp_ss_ramp)]),
         ):
             for _lk, _w in _linhas:
                 _w.setMinimumWidth(110)
                 _form.addRow(self._trL(_lk), _w)
 
-        for label_key, widget in [
-            ("s5_lbl_resume",      resume_row),
-            (None,                 self.chk_freeze_enc),
-            ("s5_lbl_ckpt_out",    ckpt_row),
-        ]:
-            pf.addRow(self._trL(label_key) if label_key else "", widget)
+        # Resume from / Save ckpt to ficam ao lado de Patience / Device,
+        # ocupando juntos a mesma linha — em vez de abaixo das 3 colunas em
+        # largura total, o que deixava Patience/Device (única sobra da
+        # coluna de regularização, mais alta que as outras duas) isolados
+        # numa linha vazia por baixo de capacidade/otimização.
+        def _linha_larga(chave_larga, campo_largo, chave_estreita, campo_estreito):
+            linha = QWidget()
+            hl = QHBoxLayout(linha)
+            hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(22)
+            w_larga = QWidget(); f_larga = QFormLayout(w_larga)
+            f_larga.setContentsMargins(0, 0, 0, 0); f_larga.setSpacing(10)
+            f_larga.addRow(self._trL(chave_larga), campo_largo)
+            w_estreita = QWidget(); f_estreita = QFormLayout(w_estreita)
+            f_estreita.setContentsMargins(0, 0, 0, 0); f_estreita.setSpacing(10)
+            campo_estreito.setMinimumWidth(110)
+            f_estreita.addRow(self._trL(chave_estreita), campo_estreito)
+            for _c in (w_larga, w_estreita):
+                _c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            hl.addWidget(w_larga, 2)     # largura de capacidade + otimização
+            hl.addWidget(w_estreita, 1)  # largura de regularização
+            return linha
+
+        pv.addWidget(_linha_larga("s5_lbl_resume",   resume_row,
+                                  "s5_lbl_patience", self.sp_patience))
+        pv.addWidget(_linha_larga("s5_lbl_ckpt_out", ckpt_row,
+                                  "s5_lbl_device",   self.cb_train_device))
+
+        pf = QFormLayout()          # cauda de largura total — só o checkbox
+        pf.setSpacing(8)
+        pf.addRow("", self.chk_freeze_enc)
+        pv.addLayout(pf)
 
         def run_fn():
             import MODULES.pipeline_train as m
@@ -4395,6 +4644,9 @@ class MainWindow(QMainWindow):
                 dropout=self.dsb_dropout.value(),
                 weight_decay=self.dsb_weight_decay.value(),
                 grad_clip=self.dsb_grad_clip.value(),
+                ss_max=self.dsb_ss_max.value(),
+                ss_start=self.sp_ss_start.value(),
+                ss_ramp=self.sp_ss_ramp.value(),
                 patience=self.sp_patience.value(),
                 checkpoint_dir=str(ckpt_out),
                 tensor_dir=str(tensor_dir),
@@ -4406,23 +4658,28 @@ class MainWindow(QMainWindow):
         return self._build_pipeline_tab(
             "title_step5",
             params, run_fn, "train", 4, 6, log_height=320,
-            on_worker=self._open_training_plot,
+            on_worker=self._open_training_plot, with_plot=True,
+            start_collapsed=True,
+            # Piso menor que o default de 420: com Patience/Device fora da
+            # coluna de regularização (ver reorganização acima), as 3 colunas
+            # ficaram simétricas (6 linhas) e o conteúdo real mede ~334px —
+            # um piso de 420 forçaria o scroll a ficar mais alto que isso e
+            # reabriria o mesmo vão que start_collapsed acabou de fechar.
+            params_min_height=300,
         )
 
     def _open_training_plot(self, worker):
-        """Abre (ou reaproveita) a janela de curvas e a liga ao worker do treino.
+        """Liga o worker do treino ao painel de curvas embutido na aba.
 
         A ligacao e feita no log_signal: o mesmo fluxo de linhas que alimenta
         o Execution Log alimenta o grafico, sem canal adicional entre
         processo filho e interface.
         """
-        dlg = getattr(self, "_training_plot", None)
-        if dlg is None:
-            dlg = TrainingPlotWindow(lambda: self._idioma, parent=self)
-            self._training_plot = dlg
-        dlg.reset()
-        worker.log_signal.connect(dlg.feed_line)
-        dlg.show(); dlg.raise_(); dlg.activateWindow()
+        painel = getattr(self, "_training_plot", None)
+        if painel is None:
+            return
+        painel.reset()
+        worker.log_signal.connect(painel.feed_line)
 
     def _browse_resume(self):
         p, _ = QFileDialog.getOpenFileName(
@@ -4619,21 +4876,24 @@ class MainWindow(QMainWindow):
         rl2.addWidget(self.ed_ligand_ref); rl2.addWidget(btn_ref)
 
         self.sp_n_samples  = QSpinBox(); self.sp_n_samples.setRange(1,10000); self.sp_n_samples.setValue(200)
-        self.dsb_temp      = QDoubleSpinBox()
+        self.dsb_temp      = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_temp.setDecimals(2); self.dsb_temp.setRange(0.1,5.0); self.dsb_temp.setValue(1.0)
         self._tr("s7_tooltip_temperature", self.dsb_temp.setToolTip)
-        self.dsb_stop_thr  = QDoubleSpinBox()
+        self.dsb_stop_thr  = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_stop_thr.setDecimals(2); self.dsb_stop_thr.setRange(0.05, 0.95)
         self.dsb_stop_thr.setSingleStep(0.05); self.dsb_stop_thr.setValue(0.50)
         self._tr("s7_tooltip_stop_threshold", self.dsb_stop_thr.setToolTip)
-        self.dsb_bond_thr  = QDoubleSpinBox()
+        self.dsb_bond_thr  = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_bond_thr.setDecimals(2); self.dsb_bond_thr.setRange(0.05, 0.95)
         self.dsb_bond_thr.setSingleStep(0.05); self.dsb_bond_thr.setValue(0.50)
         self._tr("s7_tooltip_bond_threshold", self.dsb_bond_thr.setToolTip)
-        self.sp_cutoff_gen = QDoubleSpinBox()
+        self.sp_cutoff_gen = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.sp_cutoff_gen.setDecimals(1); self.sp_cutoff_gen.setRange(3.0,15.0); self.sp_cutoff_gen.setValue(6.0)
         self.sp_top_n      = QSpinBox(); self.sp_top_n.setRange(1,200); self.sp_top_n.setValue(20)
         self.sp_min_atoms_gen = QSpinBox(); self.sp_min_atoms_gen.setRange(1,30); self.sp_min_atoms_gen.setValue(5)
+        self.sp_min_heavy_gen = QSpinBox(); self.sp_min_heavy_gen.setRange(1,30)
+        self.sp_min_heavy_gen.setValue(7)
+        self._tr("s7_tooltip_min_heavy", self.sp_min_heavy_gen.setToolTip)
 
         # ── Definição do sítio sem ligante co-cristalizado ──────────────────
         # Quando a proteína não tem HETATM, extract_site_from_pdb recorreria
@@ -4641,11 +4901,17 @@ class MainWindow(QMainWindow):
         # Os dois caminhos abaixo cobrem esse caso: coordenadas informadas
         # pelo usuário, ou busca heurística pelo P2Rank. São mutuamente
         # exclusivos — marcar a busca desabilita os campos de coordenada.
-        self.dsb_site_x = QDoubleSpinBox(); self.dsb_site_y = QDoubleSpinBox()
-        self.dsb_site_z = QDoubleSpinBox()
+        # Coordenadas do centro do sítio: aceitam ponto e vírgula, com o
+        # separador exibido seguindo o idioma da interface (ver
+        # LocaleAwareDoubleSpinBox). Coordenadas de PDB vêm com ponto.
+        self.dsb_site_x = LocaleAwareDoubleSpinBox(idioma=self._idioma)
+        self.dsb_site_y = LocaleAwareDoubleSpinBox(idioma=self._idioma)
+        self.dsb_site_z = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         for _sp in (self.dsb_site_x, self.dsb_site_y, self.dsb_site_z):
             _sp.setDecimals(3); _sp.setRange(-9999.0, 9999.0); _sp.setValue(0.0)
             _sp.setSingleStep(0.5)
+        # O locale e' reaplicado na troca de idioma pelo gancho global em
+        # _definir_idioma, que varre todos os LocaleAwareDoubleSpinBox.
 
         self.chk_use_site_center = QCheckBox()
         self._tr("s7_chk_use_site_center", self.chk_use_site_center.setText)
@@ -4658,7 +4924,7 @@ class MainWindow(QMainWindow):
                           ("Z:", self.dsb_site_z)):
             crl.addWidget(QLabel(_lbl)); crl.addWidget(_sp)
 
-        self.dsb_site_radius = QDoubleSpinBox()
+        self.dsb_site_radius = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_site_radius.setDecimals(1); self.dsb_site_radius.setRange(4.0, 25.0)
         self.dsb_site_radius.setValue(10.0); self.dsb_site_radius.setSingleStep(0.5)
         self._tr("s7_tooltip_site_radius", self.dsb_site_radius.setToolTip)
@@ -4707,7 +4973,7 @@ class MainWindow(QMainWindow):
         self.chk_gen_protonate_site = QCheckBox()
         self._tr("s7_chk_protonate_site", self.chk_gen_protonate_site.setText)
         self.chk_gen_protonate_site.setChecked(True)
-        self.dsb_gen_ph = QDoubleSpinBox()
+        self.dsb_gen_ph = LocaleAwareDoubleSpinBox(idioma=self._idioma)
         self.dsb_gen_ph.setDecimals(1); self.dsb_gen_ph.setRange(0.0, 14.0)
         self.dsb_gen_ph.setValue(7.4); self.dsb_gen_ph.setSingleStep(0.5)
         self.cb_gen_site_qm_method = self._mk_combo_tr(
@@ -4753,6 +5019,7 @@ class MainWindow(QMainWindow):
             ("s7_lbl_cutoff",        self.sp_cutoff_gen),
             ("s7_lbl_top_n",         self.sp_top_n),
             ("s7_lbl_min_atoms",     self.sp_min_atoms_gen),
+            ("s7_lbl_min_heavy",     self.sp_min_heavy_gen),
             (None,                   self.chk_use_site_center),
             ("s7_lbl_site_center",   center_row),
             ("s7_lbl_site_radius",   self.dsb_site_radius),
@@ -4811,6 +5078,7 @@ class MainWindow(QMainWindow):
                 bond_threshold = self.dsb_bond_thr.value(),
                 cutoff      = self.sp_cutoff_gen.value(),
                 min_atoms   = self.sp_min_atoms_gen.value(),
+                min_heavy_atoms = self.sp_min_heavy_gen.value(),
                 top_n       = self.sp_top_n.value(),
                 out         = self.ed_gen_out.text().strip() or None,
                 ligand_ref  = self.ed_ligand_ref.text().strip() or None,

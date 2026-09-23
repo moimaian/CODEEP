@@ -537,11 +537,41 @@ _BOND_ORDER = torch.tensor([1.0, 2.0, 3.0, 1.5], dtype=torch.float32)
 #:       ligações) e anéis de 5/6 membros que nunca fechavam (o modelo não
 #:       tinha como aprender "ligue quando estiver a 1,4 Å"). Agora o par
 #:       carrega uma expansão RBF da distância e o tipo dos DOIS átomos.
+#:   4 — as cabeças de TIPO ATÔMICO e de CARGA passam a ver o átomo FOCAL.
+#:       Até a v3 head_atom_type, head_charge e head_fcharge recebiam só
+#:       ctx = [pool(grafo parcial) ; z] — um vetor por MOLÉCULA. Decidiam
+#:       "qual é o próximo elemento" sem saber a que átomo ele vai se
+#:       ligar, qual elemento é esse vizinho nem quanta valência ele ainda
+#:       tem. Na v4 a escolha do focal passa a acontecer ANTES (é
+#:       independente do tipo: head_focal só pontua átomos já colocados) e
+#:       as três cabeças recebem [ctx ; h_focal ; one-hot do elemento
+#:       focal ; valência livre do focal]. Mesma decomposição do
+#:       Pocket2Mol/PocketFlow, onde o elemento é amostrado condicionado
+#:       ao ponto de crescimento.
+#:       O QUE A MEDIÇÃO MOSTRA (v3, checkpoint da epoch 128): sob teacher
+#:       forcing, com grafo parcial REAL, as cabeças da v3 já estavam bem
+#:       calibradas — 71,6% de C previsto contra 70,6% real, 12,0% de O
+#:       contra 12,2%, 1,4% de F contra 1,7%; e no primeiro átomo (t=0,
+#:       onde só existe z) 47,9% contra 48,3% real. O desvio grosseiro
+#:       (35% C, 33% O, 12% F, 10% S) aparece SÓ no rollout livre, e já a
+#:       partir dos primeiros átomos. Ou seja: o problema medido não é a
+#:       cabeça prever a marginal em vez da condicional — é a condicional
+#:       ser avaliada num grafo parcial AUTOGERADO, fora da distribuição
+#:       (exposure bias, amplificado aqui porque as features dos nós
+#:       incluem a geometria gerada, com posMAE ~1 Å). O condicionamento
+#:       da v4 é uma medida de ROBUSTEZ — troca parte da dependência de um
+#:       pooling do grafo inteiro (que a deriva corrompe) por um sinal
+#:       local de baixa dimensão (elemento e valência livre do focal), que
+#:       a deriva corrompe menos. A informação que esse sinal carrega por
+#:       si só é modesta: H(tipo)=0,964 nats cai para H(tipo | elemento
+#:       focal, valência livre)=0,879 (−9%). A correção direta do modo de
+#:       falha medido seria treinar com amostragem programada (scheduled
+#:       sampling), não implementada.
 #: Checkpoints da versão 1 são estruturalmente incompatíveis: os mesmos
 #: campos do vetor de features têm outro significado, então carregá-los
 #: com strict=False produziria um modelo silenciosamente errado. Ver
 #: pipeline_generate.load_model.
-ARCH_VERSION = 3
+ARCH_VERSION = 4
 
 #: Nº de componentes gaussianas da MDN de posição (Pocket2Mol usa a mesma
 #: ideia com n_component configurável em models/position.py).
@@ -752,12 +782,25 @@ class GNNDecoder(nn.Module):
             nn.Linear(ctx_dim, hidden_dim // 2), nn.GELU(),
             nn.Linear(hidden_dim // 2, 1)
         )
+        # ── Entrada das cabeças de tipo/carga: contexto + ÁTOMO FOCAL ─────
+        # ctx é um vetor por MOLÉCULA: um mean-pool do grafo parcial mais
+        # z. O elemento do próximo átomo depende de ONDE ele vai — um
+        # vizinho de C aromático com uma valência livre não é a mesma
+        # distribuição que um vizinho de S saturado — e é exatamente essa
+        # identidade que o mean-pool dilui. Daí a concatenação de
+        # [h_focal ; one-hot do elemento focal ; valência livre do focal].
+        # Ganho de informação medido no dataset: H(tipo) 0,964 → 0,879
+        # nats condicionando no focal (ver a nota de ARCH_VERSION, que
+        # também registra o que isto NÃO resolve).
+        self.focal_extra_dim = hidden_dim + n_atom_types + 1
+        atom_in_dim = ctx_dim + self.focal_extra_dim
+
         self.head_atom_type = nn.Sequential(
-            nn.Linear(ctx_dim, hidden_dim // 2), nn.GELU(),
+            nn.Linear(atom_in_dim, hidden_dim // 2), nn.GELU(),
             nn.Linear(hidden_dim // 2, n_atom_types)
         )
         self.head_charge = nn.Sequential(
-            nn.Linear(ctx_dim, 64), nn.GELU(),
+            nn.Linear(atom_in_dim, 64), nn.GELU(),
             nn.Linear(64, 1)
         )
         # ── Carga FORMAL (−1/0/+1) ────────────────────────────────────────
@@ -765,8 +808,11 @@ class GNNDecoder(nn.Module):
         # que não serve para Chem.Atom.SetFormalCharge. Esta cabeça prevê a
         # carga formal de verdade, que a montagem da molécula precisa para
         # que grupos legitimamente carregados sobrevivam à sanitização.
+        # Também condicionada ao focal: carga formal é uma propriedade
+        # LOCAL (um N+ é quaternário ou piridínio; um O− está num
+        # carboxilato) e ctx sozinho não tem como saber disso.
         self.head_fcharge = nn.Sequential(
-            nn.Linear(ctx_dim, 64), nn.GELU(),
+            nn.Linear(atom_in_dim, 64), nn.GELU(),
             nn.Linear(64, 3)
         )
 
@@ -846,15 +892,16 @@ class GNNDecoder(nn.Module):
 
     def forward_step(self, z_input, partial_x, partial_edge_index,
                       partial_batch_vec, n_active, partial_edge_attr=None):
-        """Prediz parar/tipo/carga/carga formal do PRÓXIMO átomo e pontua
-        cada átomo já colocado como candidato a FOCAL, para as n_active
-        moléculas ativas neste passo. Retorna também (h, ctx) — necessários
-        para predict_bonds e para a MDN de posição.
+        """Prediz PARAR e pontua cada átomo já colocado como candidato a
+        FOCAL, para as n_active moléculas ativas neste passo. Retorna
+        também (h, ctx) — necessários para as demais cabeças.
 
-        A posição NÃO sai daqui: ela depende de qual átomo focal foi
-        escolhido, e essa escolha difere entre treino (focal real, vindo da
-        ordem de construção) e geração (focal amostrado sob máscara de
-        valência). Ver position_mdn().
+        Só estas duas saídas dependem exclusivamente do grafo parcial. O
+        TIPO, a CARGA e a POSIÇÃO do próximo átomo saíram daqui na v4/v2:
+        todos dependem de qual focal foi escolhido, e essa escolha difere
+        entre treino (focal real, vindo da ordem de construção) e geração
+        (focal amostrado sob máscara de valência). Ver predict_next_atom()
+        e position_mdn().
         """
         h, ctx = self._encode_partial(
             z_input, partial_x, partial_edge_index, partial_batch_vec,
@@ -868,11 +915,53 @@ class GNNDecoder(nn.Module):
             focal_logits = h.new_zeros((0,))
         return {
             "stop_logit":       self.head_stop(ctx).squeeze(-1),
-            "atom_type_logits": self.head_atom_type(ctx),
-            "charge":           self.head_charge(ctx).squeeze(-1),
-            "fcharge_logits":   self.head_fcharge(ctx),
             "focal_logits":     focal_logits,
             "_h": h, "_ctx": ctx,
+        }
+
+    def _focal_context(self, h, ctx_sel, focal_node_idx, focal_type,
+                       focal_val_free):
+        """Monta [ctx ; h_focal ; one-hot(elemento focal) ; valência livre].
+
+        focal_node_idx/focal_type valem −1 quando a molécula não tem focal
+        neste passo (primeiro átomo, ou reinício de fragmento): aí entra
+        `no_focal_embed` no lugar de h_focal e o one-hot fica todo zero —
+        a mesma convenção usada pela MDN de posição, nos dois lados
+        (treino e geração).
+        """
+        m = ctx_sel.shape[0]
+        h_focal = self._focal_feature(h, focal_node_idx, m)
+        oh = ctx_sel.new_zeros((m, self.n_atom_types))
+        valid = focal_type >= 0
+        if bool(valid.any()):
+            oh[valid] = F.one_hot(
+                focal_type[valid].clamp(0, self.n_atom_types - 1),
+                self.n_atom_types,
+            ).to(oh.dtype)
+        return torch.cat(
+            [ctx_sel, h_focal, oh, focal_val_free.view(m, 1).to(ctx_sel.dtype)],
+            dim=-1,
+        )
+
+    def predict_next_atom(self, h, ctx_sel, focal_node_idx, focal_type,
+                          focal_val_free):
+        """Tipo, carga de Gasteiger e carga formal do próximo átomo,
+        CONDICIONADOS ao átomo focal (a novidade da v4).
+
+        Args:
+            h: nós do grafo parcial de todas as moléculas do passo.
+            ctx_sel: (m, ctx_dim) contexto SÓ das m moléculas que têm um
+                próximo átomo neste passo.
+            focal_node_idx: (m,) índice do focal em h, ou −1.
+            focal_type: (m,) tipo atômico do focal, ou −1.
+            focal_val_free: (m,) valência ainda livre no focal, /6.
+        """
+        feat = self._focal_context(h, ctx_sel, focal_node_idx, focal_type,
+                                   focal_val_free)
+        return {
+            "atom_type_logits": self.head_atom_type(feat),
+            "charge":           self.head_charge(feat).squeeze(-1),
+            "fcharge_logits":   self.head_fcharge(feat),
         }
 
     def _focal_feature(self, h, focal_node_idx, n_active):
@@ -980,7 +1069,8 @@ class GNNDecoder(nn.Module):
 
     # ── Treino: teacher forcing completo, todos os passos, todo o batch ────
     def forward_teacher_forcing(self, z: torch.Tensor, graphs: list,
-                                 ecfp4_batch: "torch.Tensor | None" = None) -> dict:
+                                 ecfp4_batch: "torch.Tensor | None" = None,
+                                 ss_prob: float = 0.0) -> dict:
         """z: (B, latent_dim), um por molécula, na MESMA ordem de `graphs`.
         graphs: lista de PyGData (um por molécula), cada um com .x
         (n_i,37), .edge_index (2,E_i), .edge_attr (E_i,8), .pos (n_i,3),
@@ -996,6 +1086,36 @@ class GNNDecoder(nn.Module):
         """
         device = z.device
         B = len(graphs)
+
+        # ── Amostragem programada (scheduled sampling) ───────────────────
+        # ss_prob é a probabilidade de, ao COLOCAR cada átomo no grafo
+        # parcial, mostrar ao decoder o elemento que ele próprio previu em
+        # vez do elemento real. Os ALVOS continuam sendo os reais — só a
+        # ENTRADA fica parcialmente autogerada.
+        #
+        # Por que o canal de tipo, e só ele: ablação de canal sobre o
+        # checkpoint v3 (151 moléculas do val, um passo por átomo,
+        # substituindo um canal por vez no grafo parcial):
+        #     tudo real              71,0% C   13,2% O   1,0% F
+        #     posições autogeradas   72,4% C   11,9% O   0,7% F   (sem efeito)
+        #     tipos autogerados      55,2% C   19,2% O   4,2% F
+        #     ligações autogeradas   61,7% C   21,5% O   3,0% F
+        #     (alvo real             70,6% C   12,5% O   1,4% F)
+        # A geometria autogerada, com posMAE de ~1 Å, NÃO desloca a
+        # composição; os canais discretos deslocam. Daí corromper o tipo e
+        # não a posição — e daí não haver amostragem da MDN aqui dentro,
+        # que era o que tornaria o treino caro.
+        #
+        # Risco conhecido (Huszár, 2015): misturar as duas distribuições
+        # enviesa o objetivo — não é mais a verossimilhança da distribuição
+        # real. Por isso ss_prob entra só depois de o modelo já ter
+        # aprendido a tarefa e sobe devagar (ver o agendamento em train()).
+        tipos_vistos = None
+        n_ss = [0, 0]          # [substituídos, avaliados] — conferência no log
+        if ss_prob > 0.0:
+            tipos_vistos = [g.x[:, :ATOM_TYPE_DIM].argmax(dim=-1).clone()
+                            for g in graphs]
+
         n_atoms = [int(g.atom_order.shape[0]) for g in graphs]
         max_t = max(n_atoms) if n_atoms else 0
         adjacencies = [_build_adjacency(g) for g in graphs]
@@ -1021,7 +1141,7 @@ class GNNDecoder(nn.Module):
 
             xs, eis, eas, batch_vec_parts = [], [], [], []
             pos_parts, typ_parts = [], []      # geometria/tipos p/ cabeça de ligação (v3)
-            pos_maps, offsets = {}, {}
+            pos_maps, offsets, val_maps = {}, {}, {}
             offset = 0
             for local_i, orig_i in enumerate(active_stop):
                 g = graphs[orig_i]
@@ -1075,8 +1195,14 @@ class GNNDecoder(nn.Module):
                     eis.append(sub_ei_local + offset)
                     eas.append(torch.cat([bt_onehot, d_edge.clamp(0.0, 2.0)], dim=-1))
 
-                atom_type_t = g.x[order_t, :ATOM_TYPE_DIM].argmax(dim=-1)
+                atom_type_t = (g.x[order_t, :ATOM_TYPE_DIM].argmax(dim=-1)
+                               if tipos_vistos is None
+                               else tipos_vistos[orig_i][order_t])
                 charge_t    = g.x[order_t, 19]
+                # Valência já consumida no grafo PARCIAL, guardada para
+                # compor a valência livre do focal (entrada das cabeças de
+                # tipo/carga na v4).
+                val_maps[local_i] = valence_t
                 xs.append(_make_partial_features(
                     atom_type_t, charge_t, degree_t,
                     positions=pos_t, valence_used=valence_t, bond_counts=bcounts_t))
@@ -1132,24 +1258,17 @@ class GNNDecoder(nn.Module):
                 graphs[active_stop[jl]].pos[no] for jl, no in zip(anl_list, next_orig)
             ]).to(device)
 
-            acc["atom_logits"].append(step_out["atom_type_logits"][active_next_local])
-            acc["atom_targets"].append(next_feats[:, :ATOM_TYPE_DIM].argmax(dim=-1))
-            acc["charges"].append(step_out["charge"][active_next_local])
-            acc["charge_targets"].append(next_feats[:, 19])
-
-            # Carga FORMAL (slot 18 do vetor de features) discretizada em
-            # {−1, 0, +1} → classes {0, 1, 2}. Cargas fora dessa faixa são
-            # raras em ligantes depositados e são saturadas no extremo.
-            acc["fcharge_logits"].append(step_out["fcharge_logits"][active_next_local])
-            acc["fcharge_targets"].append(
-                (next_feats[:, 18].round().clamp(-1.0, 1.0) + 1.0).long())
-
-            # ── Átomo focal real e MDN de posição ─────────────────────────
+            # ── Átomo focal real ─────────────────────────────────────────
             # O focal do próximo átomo é o vizinho REAL dele que foi
             # colocado PRIMEIRO na ordem de construção. É a âncora que torna
             # a posição uma quantidade local (~1,5 Å) em vez de uma
-            # coordenada absoluta no referencial da grade.
+            # coordenada absoluta no referencial da grade — e, desde a v4,
+            # também o condicionamento das cabeças de tipo e carga. Por isso
+            # é calculado ANTES delas: na geração o focal é escolhido antes
+            # de se saber que elemento virá, e treino e inferência têm de
+            # ver a mesma ordem causal.
             focal_idx_list, focal_pos_list = [], []
+            focal_typ_list, focal_val_list = [], []
             for jl, no in zip(anl_list, next_orig):
                 orig_i = active_stop[jl]
                 g = graphs[orig_i]
@@ -1159,17 +1278,68 @@ class GNNDecoder(nn.Module):
                 if cand_local:
                     f_local = min(cand_local)          # o colocado mais cedo
                     f_orig  = int(g.atom_order[f_local])
+                    f_typ   = int(g.x[f_orig, :ATOM_TYPE_DIM].argmax()
+                                  if tipos_vistos is None
+                                  else tipos_vistos[orig_i][f_orig])
+                    vt      = val_maps.get(jl)
+                    usada   = float(vt[f_local]) if vt is not None else 0.0
+                    livre   = float(_ATOM_TYPE_MAXVAL[f_typ]) - usada
                     focal_idx_list.append(offsets[jl] + f_local)
                     focal_pos_list.append(g.pos[f_orig].float())
+                    focal_typ_list.append(f_typ)
+                    focal_val_list.append(min(max(livre / 6.0, 0.0), 1.0))
                 else:
                     # Primeiro átomo, ou reinício de fragmento: sem âncora.
-                    # A MDN prevê a posição absoluta (focal_pos = 0).
+                    # A MDN prevê a posição absoluta (focal_pos = 0) e as
+                    # cabeças de tipo/carga caem em no_focal_embed.
                     focal_idx_list.append(-1)
                     focal_pos_list.append(
                         torch.zeros(3, dtype=torch.float32, device=device))
+                    focal_typ_list.append(-1)
+                    focal_val_list.append(0.0)
 
             focal_idx_t = torch.tensor(focal_idx_list, dtype=torch.long, device=device)
             focal_pos_t = torch.stack(focal_pos_list).to(device)
+            focal_typ_t = torch.tensor(focal_typ_list, dtype=torch.long, device=device)
+            focal_val_t = torch.tensor(focal_val_list, dtype=torch.float32, device=device)
+
+            # ── Tipo e cargas, condicionados ao focal (v4) ───────────────
+            next_out = self.predict_next_atom(
+                step_out["_h"], step_out["_ctx"][active_next_local],
+                focal_idx_t, focal_typ_t, focal_val_t,
+            )
+            tipos_alvo = next_feats[:, :ATOM_TYPE_DIM].argmax(dim=-1)
+            acc["atom_logits"].append(next_out["atom_type_logits"])
+            acc["atom_targets"].append(tipos_alvo)
+
+            # ── Substituição da amostragem programada ────────────────────
+            # O alvo acima é sempre o elemento REAL. O que muda é o que o
+            # decoder vai VER deste átomo nos passos seguintes: com
+            # probabilidade ss_prob, o elemento que ele mesmo acabou de
+            # prever. A amostragem é multinomial (não argmax) para que o
+            # modelo veja a variedade de erros que de fato comete na
+            # geração, e vai sem gradiente — é entrada, não predição.
+            tipos_entrada = tipos_alvo
+            if tipos_vistos is not None:
+                with torch.no_grad():
+                    prev = torch.multinomial(
+                        next_out["atom_type_logits"].softmax(dim=-1), 1).squeeze(-1)
+                    troca = torch.rand(prev.shape[0], device=device) < ss_prob
+                    tipos_entrada = torch.where(troca, prev, tipos_alvo)
+                    n_ss[0] += int(troca.sum()); n_ss[1] += int(troca.shape[0])
+                    for k, jl in enumerate(anl_list):
+                        if bool(troca[k]):
+                            alvo_g = tipos_vistos[active_stop[jl]]
+                            alvo_g[next_orig[k]] = tipos_entrada[k].to(alvo_g.device)
+            acc["charges"].append(next_out["charge"])
+            acc["charge_targets"].append(next_feats[:, 19])
+
+            # Carga FORMAL (slot 18 do vetor de features) discretizada em
+            # {−1, 0, +1} → classes {0, 1, 2}. Cargas fora dessa faixa são
+            # raras em ligantes depositados e são saturadas no extremo.
+            acc["fcharge_logits"].append(next_out["fcharge_logits"])
+            acc["fcharge_targets"].append(
+                (next_feats[:, 18].round().clamp(-1.0, 1.0) + 1.0).long())
 
             mu, sigma, pi_logits = self.position_mdn(
                 step_out["_h"], step_out["_ctx"][active_next_local],
@@ -1199,7 +1369,10 @@ class GNNDecoder(nn.Module):
                 step_out["_h"], step_out["_ctx"], partial_batch_vec, active_next_local,
                 partial_pos=partial_pos, partial_types=partial_types,
                 new_pos=next_pos_t,
-                new_types=next_feats[:, :ATOM_TYPE_DIM].argmax(dim=-1),
+                # O elemento do átomo NOVO entra aqui como ENTRADA da
+                # cabeça de ligação — na geração ele é o tipo amostrado,
+                # então segue a mesma substituição.
+                new_types=tipos_entrada,
             )
             if bond_exist_logits.numel() > 0:
                 bond_exist_t, bond_type_t = [], []
@@ -1243,6 +1416,10 @@ class GNNDecoder(nn.Module):
             "bond_exist_targets": _cat("bond_exist_targets"),
             "bond_logits":        _cat("bond_logits", (self.n_bond_types,)),
             "bond_targets":       _cat("bond_targets").long(),
+            # Taxa de substituição efetivamente aplicada — serve para
+            # confirmar no log que a amostragem programada está agindo.
+            "ss_trocas":          n_ss[0],
+            "ss_total":           n_ss[1],
         }
 
 
@@ -1315,7 +1492,7 @@ class LigandCVAE(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, site_tensor: torch.Tensor, graphs: list,
-            voxel_sizes: torch.Tensor) -> dict:
+            voxel_sizes: torch.Tensor, ss_prob: float = 0.0) -> dict:
         """Passagem completa de treino — teacher forcing autorregressivo.
 
         graphs: lista de PyGData (um por molécula do batch, MESMA ordem das
@@ -1337,7 +1514,8 @@ class LigandCVAE(nn.Module):
         ):
             ecfp4_batch = torch.stack([g.ecfp4 for g in graphs]).to(z.device)
 
-        preds = self.decoder.forward_teacher_forcing(z, graphs, ecfp4_batch)
+        preds = self.decoder.forward_teacher_forcing(z, graphs, ecfp4_batch,
+                                                     ss_prob=ss_prob)
         preds["z_mean"]   = z_mean
         preds["z_logvar"] = z_logvar
         return preds
@@ -1485,10 +1663,14 @@ class LigandCVAE(nn.Module):
             if t == max_atoms - 1:
                 will_stop = torch.ones_like(will_stop)   # força parar no teto
 
-            type_probs = (step_out["atom_type_logits"] / max(temperature, 1e-3)).softmax(dim=-1)
-            next_type    = torch.multinomial(type_probs, 1).squeeze(-1)
-            next_charge  = step_out["charge"]
-            next_fcharge = step_out["fcharge_logits"].argmax(dim=-1) - 1   # {0,1,2} → {−1,0,+1}
+            # O tipo e as cargas do próximo átomo NÃO são decididos aqui:
+            # desde a v4 as cabeças que os preveem recebem o átomo focal, e
+            # o focal só é escolhido abaixo. Os vetores ficam com tamanho
+            # len(active) e são preenchidos nas posições de continue_local,
+            # para que o resto do laço continue indexando por `li`.
+            next_type    = torch.zeros(len(active), dtype=torch.long, device=device)
+            next_charge  = torch.zeros(len(active), dtype=torch.float32, device=device)
+            next_fcharge = torch.zeros(len(active), dtype=torch.long, device=device)
 
             maxval = _ATOM_TYPE_MAXVAL.to(device)
             border = _BOND_ORDER.to(device)
@@ -1499,6 +1681,7 @@ class LigandCVAE(nn.Module):
             # vez de forçar uma ligação impossível — mesma decisão do
             # choose_focal do PocketFlow.
             focal_local, focal_idx_list, focal_pos_list = {}, [], []
+            focal_typ_list, focal_val_list = [], []
             for li in range(len(active)):
                 if bool(will_stop[li]):
                     continue
@@ -1526,15 +1709,43 @@ class LigandCVAE(nn.Module):
                 if f < 0:
                     focal_idx_list.append(-1)
                     focal_pos_list.append(torch.zeros(3, device=device))
+                    focal_typ_list.append(-1)
+                    focal_val_list.append(0.0)
                 else:
                     focal_idx_list.append(offsets[li] + f)
                     focal_pos_list.append(torch.tensor(
                         positions[cand][f], dtype=torch.float32, device=device))
+                    f_typ = int(atom_types[cand][f])
+                    livre = float(maxval[f_typ]) - valence_used[cand][f]
+                    focal_typ_list.append(f_typ)
+                    focal_val_list.append(min(max(livre / 6.0, 0.0), 1.0))
 
             next_pos_map = {}
             bond_exist_probs = bond_type_pred = None
             if continue_local:
                 cl_t = torch.tensor(continue_local, dtype=torch.long, device=device)
+                focal_idx_t = torch.tensor(focal_idx_list, dtype=torch.long,
+                                           device=device)
+                focal_typ_t = torch.tensor(focal_typ_list, dtype=torch.long,
+                                           device=device)
+                focal_val_t = torch.tensor(focal_val_list, dtype=torch.float32,
+                                           device=device)
+
+                # ── Tipo e cargas, condicionados ao FOCAL (v4) ────────────
+                # Mesma ordem causal do treino: escolhe-se primeiro o ponto
+                # de crescimento, depois o elemento que vai ali. É aqui que
+                # o condicionamento importa mais: neste laço o grafo
+                # parcial é AUTOGERADO, e o elemento/valência do focal é o
+                # sinal que menos se degrada com a deriva.
+                next_out = self.decoder.predict_next_atom(
+                    step_out["_h"], step_out["_ctx"][cl_t],
+                    focal_idx_t, focal_typ_t, focal_val_t,
+                )
+                type_probs = (next_out["atom_type_logits"]
+                              / max(temperature, 1e-3)).softmax(dim=-1)
+                next_type[cl_t]    = torch.multinomial(type_probs, 1).squeeze(-1)
+                next_charge[cl_t]  = next_out["charge"]
+                next_fcharge[cl_t] = next_out["fcharge_logits"].argmax(dim=-1) - 1
 
                 # ── Posição AMOSTRADA da mistura, não promediada ──────────
                 # É aqui que a arquitetura 2 difere da 1: em vez de um
@@ -1543,8 +1754,7 @@ class LigandCVAE(nn.Module):
                 # componente da mistura e depois um ponto dentro dela.
                 mu, sigma, pi_logits = self.decoder.position_mdn(
                     step_out["_h"], step_out["_ctx"][cl_t],
-                    torch.tensor(focal_idx_list, dtype=torch.long, device=device),
-                    torch.stack(focal_pos_list),
+                    focal_idx_t, torch.stack(focal_pos_list),
                 )
                 pi = (pi_logits / max(temperature, 1e-3)).softmax(dim=-1)
                 ar = torch.arange(mu.shape[0], device=device)
@@ -1901,11 +2111,18 @@ def train_epoch(
     pos_weight:  float = 2.0,
     stop_weight: float = 1.0,
     focal_weight: float = 1.0,
+    # Amostragem programada: fração dos átomos do grafo parcial cujo
+    # ELEMENTO é o previsto pelo modelo em vez do real (ver
+    # forward_teacher_forcing). Vale só no treino — a validação roda
+    # sempre com 0, senão val_loss deixaria de ser comparável entre
+    # épocas e o early stopping perderia o sentido.
+    ss_prob:     float = 0.0,
 ) -> dict:
     model.train()
     totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos",
                                "pos_mae","focal","fcharge","charge","kl"]}
     n_batches = 0
+    ss_trocas = ss_total = 0
 
     for batch in tqdm(loader, desc="  Train", leave=False):
         if batch is None:
@@ -1915,7 +2132,9 @@ def train_epoch(
         voxel_sizes = batch["voxel_sizes"].to(device)
 
         optimizer.zero_grad()
-        preds  = model(site, graphs, voxel_sizes)
+        preds  = model(site, graphs, voxel_sizes, ss_prob=ss_prob)
+        ss_trocas += int(preds.get("ss_trocas", 0))
+        ss_total  += int(preds.get("ss_total", 0))
         losses = cvae_loss(preds, beta=beta,
                            pos_weight=pos_weight, stop_weight=stop_weight,
                            focal_weight=focal_weight)
@@ -1946,6 +2165,15 @@ def train_epoch(
         for k in totals:
             totals[k] += losses[k].item()
         n_batches += 1
+
+    # Taxa REAL de substituição, para conferir no log que a amostragem
+    # programada está agindo (e não silenciosamente em zero). Fica fora do
+    # dict devolvido: ele alimenta o histórico e o CSV, cujas colunas são
+    # as métricas de loss.
+    if ss_total:
+        log.info(f"  Amostragem programada: {100*ss_trocas/ss_total:.1f}% dos "
+                 f"átomos do grafo parcial com elemento autogerado "
+                 f"({ss_trocas}/{ss_total})")
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
 
@@ -2075,6 +2303,89 @@ def compute_bond_stats(dataset_dir, max_ligands: int = 3000, seed: int = 42) -> 
     return stats
 
 
+def compute_charge_stats(dataset_dir, max_ligands: int = 8000,
+                         seed: int = 42) -> dict:
+    """Frequência de cada padrão (elemento, carga formal, grau) real.
+
+    Contraparte de compute_bond_stats para a cabeça de carga formal. Vai
+    embutida no checkpoint e vira, na geração, o critério que decide se uma
+    carga prevista é possível naquele contexto local.
+
+    Motivo: head_fcharge recebe só o contexto da molécula — não sabe o
+    elemento nem o grau do átomo que está carregando. Sem verificação, ela
+    produz padrões que não existem na base: das nove combinações carregadas
+    observadas numa geração de diagnóstico, oito (F+1, C+1, O+1, S+1, S−1 …)
+    têm frequência ZERO nos 209 mil átomos do conjunto de treino, e são o
+    que gera [FH+], [OH2+], [SH2+] nos SMILES de saída. Comparar com esta
+    tabela e zerar o que não existe custa nada e não exige retreinar.
+
+    Cacheado em <dataset_dir>/charge_stats.json, como a de ligações.
+    """
+    import json as _json
+    from collections import Counter
+
+    dataset_dir = Path(dataset_dir)
+    cache = dataset_dir / "charge_stats.json"
+    if cache.exists():
+        try:
+            data = _json.loads(cache.read_text())
+            if data.get("patterns"):
+                log.info(f"  Estatística de carga formal lida de {cache} "
+                         f"({len(data['patterns'])} padrões)")
+                return data
+        except Exception as e:
+            log.warning(f"  charge_stats.json ilegível ({e}) — recalculando.")
+
+    try:
+        ds = SiteLigandDataset(tensor_dir=dataset_dir, split="train")
+    except Exception as e:
+        log.warning(f"  Não foi possível medir estatística de carga: {e}")
+        return {}
+
+    cnt = Counter(); tot = 0
+    passo = max(1, len(ds) // max(max_ligands, 1))
+    for i in range(0, len(ds), passo):
+        it = ds[i]
+        if it is None:
+            continue
+        g = it["graph"]
+        if g is None or g.x.shape[0] == 0:
+            continue
+        typ = g.x[:, :ATOM_TYPE_DIM].argmax(-1).tolist()
+        # Carga formal ocupa o slot 18 (valor cru, não normalizado); o grau
+        # vem do grafo e não do slot 21, que está dividido por 6.
+        fc = g.x[:, 18].round().long().tolist()
+        grau = [0] * g.x.shape[0]
+        if g.edge_index.shape[1] > 0:
+            ei = g.edge_index.numpy()
+            vistos = set()
+            for k in range(ei.shape[1]):
+                a, b = int(ei[0, k]), int(ei[1, k])
+                if (b, a) in vistos or a == b:
+                    continue
+                vistos.add((a, b))
+                grau[a] += 1; grau[b] += 1
+        for j in range(len(typ)):
+            cnt[f"{ATOM_TYPES_NAMES[typ[j]]}|{fc[j]}|{grau[j]}"] += 1
+            tot += 1
+
+    if tot == 0:
+        log.warning("  Nenhum átomo medido — estatística de carga vazia.")
+        return {}
+
+    stats = {"total_atoms": tot,
+             "patterns": {k: {"n": int(n), "freq": n / tot}
+                          for k, n in cnt.items()}}
+    try:
+        cache.write_text(_json.dumps(stats, indent=1))
+    except OSError:
+        pass
+    n_carregados = sum(1 for k in stats["patterns"] if k.split("|")[1] != "0")
+    log.info(f"  Estatística de carga formal medida: {len(cnt)} padrões "
+             f"({n_carregados} carregados), {tot} átomos → {cache}")
+    return stats
+
+
 def train(
     # Defaults revisados: eram calibrados para <1000 pares (ver comentário
     # em SiteEncoder — "Arquitetura reduzida para datasets pequenos").
@@ -2107,6 +2418,19 @@ def train(
     # (AdamW) e no default de train_epoch. Expostos pelo mesmo motivo.
     weight_decay:  float = 1e-4,
     grad_clip:     float = 0.5,
+    # ── Amostragem programada (scheduled sampling) ───────────────────────
+    # Combate o exposure bias medido: o decoder treina só sobre grafos
+    # parciais REAIS, mas na geração se alimenta dos próprios átomos. Sob
+    # teacher forcing o modelo v3 previa 71,6% de C contra 70,6% reais; em
+    # rollout livre caía para 35%. A ablação de canal (ver
+    # forward_teacher_forcing) mostrou que a culpa é do canal de TIPO, não
+    # da geometria — é esse que ss_max corrompe.
+    # ss_max=0 desliga. O agendamento é linear: nada nas primeiras
+    # ss_start épocas (o modelo precisa primeiro aprender a tarefa com
+    # entrada limpa), depois sobe até ss_max ao longo de ss_ramp épocas.
+    ss_max:        float = 0.25,
+    ss_start:      int   = 20,
+    ss_ramp:       int   = 40,
     # Callback opcional chamado ao fim de cada epoch com
     # (epoch, train_losses, val_losses). Usado pelo pipeline_optimize para
     # reportar métricas intermediárias ao Optuna e podar trials ruins — uma
@@ -2179,6 +2503,7 @@ def train(
     # para tensores gerados antes desta funcionalidade existir — nesse caso
     # a geração cai para o comportamento legado (config manual da UI).
     bond_stats_snapshot = compute_bond_stats(dataset_dir)
+    charge_stats_snapshot = compute_charge_stats(dataset_dir)
 
     voxel_config_snapshot = {}
     _vc_path = dataset_dir / "voxel_config.json"
@@ -2238,8 +2563,9 @@ def train(
                 f"  arquitetura do checkpoint : versão {_ck_arch}\n"
                 f"  arquitetura do código     : versão {ARCH_VERSION}\n\n"
                 "Fine-tuning a partir de outra arquitetura carregaria só "
-                "parte dos pesos e deixaria as cabeças de foco, posição "
-                "(MDN) e carga formal aleatórias.\n"
+                "parte dos pesos: as cabeças mudam de forma entre versões "
+                "(foco, posição por MDN, tipo atômico e cargas) e ficariam "
+                "aleatórias.\n"
                 "Deixe o campo 'Retomar de' VAZIO para treinar do zero, ou "
                 "aponte para um checkpoint da versão "
                 f"{ARCH_VERSION}."
@@ -2310,13 +2636,17 @@ def train(
     for epoch in range(1, epochs + 1):
         # KL annealing
         beta = min(beta_max, beta_max * epoch / beta_warmup)
+        ss_prob = (0.0 if (ss_max <= 0.0 or epoch <= ss_start)
+                   else min(ss_max, ss_max * (epoch - ss_start) / max(ss_ramp, 1)))
 
-        log.info(f"\nEpoch {epoch}/{epochs}  β={beta:.3f}  lr={scheduler.get_last_lr()[0]:.2e}")
+        log.info(f"\nEpoch {epoch}/{epochs}  β={beta:.3f}  "
+                 f"lr={scheduler.get_last_lr()[0]:.2e}"
+                 + (f"  ss={ss_prob:.2f}" if ss_max > 0.0 else ""))
 
         train_losses = train_epoch(model, train_loader, optimizer, device, beta,
                                    grad_clip=grad_clip,
                                    pos_weight=pos_weight, stop_weight=stop_weight,
-                                   focal_weight=focal_weight)
+                                   focal_weight=focal_weight, ss_prob=ss_prob)
         val_losses   = eval_epoch (model, val_loader,              device, beta,
                                    pos_weight=pos_weight, stop_weight=stop_weight,
                                    focal_weight=focal_weight)
@@ -2367,6 +2697,9 @@ def train(
                 "config": {
                     "arch_version":     ARCH_VERSION,
                     "bond_stats":       bond_stats_snapshot,
+                    "charge_stats":     charge_stats_snapshot,
+                    "scheduled_sampling": {"max": ss_max, "start": ss_start,
+                                           "ramp": ss_ramp},
                     "n_pos_components": N_POS_COMPONENTS,
                     "latent_dim":   latent_dim,
                     "hidden_dim":   hidden_dim,

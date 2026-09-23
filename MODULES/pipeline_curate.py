@@ -130,6 +130,19 @@ CURATE_CONFIG = {
 
         # ── Compostos de átomo pesado (fasagem cristalográfica) ────────
         "MBO", "PHG", "HGB", "MMC", "TBR", "IRI", "PT4", "AU1",
+
+        # ── 2ª revisão: o que sobrou no topo após a primeira exclusão ──
+        # Solventes orgânicos e crioprotetores
+        "DMF", "SGM", "BU3", "DIO", "GBL", "OXL", "PDO", "PGR", "MPO",
+        "TMA", "ETA", "BU1", "PEO", "P33", "PE3", "P3G", "PE5",
+        # Lipídios, fosfolipídios e detergentes
+        "MC3", "PX4", "OLB", "ACD", "POV", "78M", "M7U", "L6T", "PC1",
+        "PEF", "PIO", "LPP", "6PL", "PSC", "PLC", "HP6", "D1D",
+        # Açúcares e fosfoaçúcares metabólicos
+        "FRU", "MFU", "MMA", "S6P", "FBP", "G3P", "13P", "SOR", "XYL",
+        # Nucleosídeos/nucleotídeos e cofatores não cobertos antes
+        "DUP", "U5P", "A3P", "XMP", "AMZ", "GAR", "ADE", "RBF", "S4M",
+        "FPP", "URI", "THM", "DCM", "DGP", "DAD", "CTN", "GRP",
     },
 
     # Nucleotídeos e cofatores — aplicados só quando exclude_cofactors=True

@@ -177,6 +177,9 @@ _TEXTOS = {
     "nav_next": {"en": " NEXT >> ", "pt": " AVANÇAR >> "},
 
     # ---------------------------------------------------------------- Generic pipeline tab (_build_pipeline_tab)
+    "sec_training_plot": {
+        "en": "Training Curves", "pt": "Curvas de Treinamento",
+    },
     "sec_execution_log": {"en": "Execution Log", "pt": "Log de Execução"},
     "btn_run": {"en": "▶  Run", "pt": "▶  Executar"},
     "btn_stop": {"en": "⏹  Stop", "pt": "⏹  Parar"},
@@ -758,6 +761,48 @@ _TEXTOS = {
               "com NaN. Só vale mexer se o log acusar 'Gradiente NaN "
               "detectado' ou a loss divergir — nesse caso, reduza.",
     },
+    "s5_lbl_ss_max": {"en": "Scheduled sampling:", "pt": "Amostragem programada:"},
+    "s5_tooltip_ss_max": {
+        "en": "Maximum fraction of atoms in the partial graph shown to the "
+              "decoder with the element IT predicted instead of the real one. "
+              "0 disables.\n\n"
+              "Fights exposure bias: training only ever shows real partial "
+              "graphs, but generation feeds the decoder its own atoms. "
+              "Measured on the previous architecture: 71.6% C predicted under "
+              "teacher forcing (70.6% real), but 35% in free rollout. A "
+              "channel ablation showed the drift comes from the ELEMENT "
+              "channel, not from the generated geometry — that is the channel "
+              "this corrupts. Targets stay real; only the input changes.\n\n"
+              "It biases the objective (it is no longer the likelihood of the "
+              "real distribution), so keep it moderate: 0.2–0.3.",
+        "pt": "Fração máxima dos átomos do grafo parcial mostrados ao decoder "
+              "com o elemento que ELE previu, em vez do real. 0 desliga.\n\n"
+              "Combate o exposure bias: o treino só mostra grafos parciais "
+              "reais, mas a geração alimenta o decoder com os próprios "
+              "átomos. Medido na arquitetura anterior: 71,6% de C previsto "
+              "sob teacher forcing (70,6% real), mas 35% em rollout livre. A "
+              "ablação de canal mostrou que a deriva vem do canal de "
+              "ELEMENTO, não da geometria gerada — é esse o canal corrompido "
+              "aqui. Os alvos continuam reais; só a entrada muda.\n\n"
+              "Enviesa o objetivo (deixa de ser a verossimilhança da "
+              "distribuição real), então convém manter moderado: 0,2–0,3.",
+    },
+    "s5_lbl_ss_start": {"en": "Sched. sampling start:", "pt": "Início da am. programada:"},
+    "s5_tooltip_ss_start": {
+        "en": "Epochs of pure teacher forcing before the substitution starts.\n\n"
+              "The model has to learn the task on clean input first; "
+              "corrupting from epoch 1 slows convergence with no benefit.",
+        "pt": "Épocas de teacher forcing puro antes de a substituição começar.\n\n"
+              "O modelo precisa primeiro aprender a tarefa com entrada limpa; "
+              "corromper desde a época 1 atrasa a convergência sem ganho.",
+    },
+    "s5_lbl_ss_ramp": {"en": "Sched. sampling ramp:", "pt": "Rampa da am. programada:"},
+    "s5_tooltip_ss_ramp": {
+        "en": "Epochs taken to go from 0 to the maximum, linearly, after the "
+              "start epoch.",
+        "pt": "Épocas para ir de 0 até o máximo, linearmente, depois da época "
+              "de início.",
+    },
     "s5_lbl_patience": {"en": "Patience:", "pt": "Paciência:"},
     "s5_lbl_device": {"en": "Device:", "pt": "Dispositivo:"},
     "s5_lbl_resume": {"en": "Resume from:", "pt": "Retomar de:"},
@@ -883,6 +928,29 @@ _TEXTOS = {
     "s7_lbl_cutoff": {"en": "Site cutoff (Å):", "pt": "Cutoff do sítio (Å):"},
     "s7_lbl_top_n": {"en": "Top N report:", "pt": "Relatório Top N:"},
     "s7_lbl_min_atoms": {"en": "Min. site atoms:", "pt": "Átomos mín. do sítio:"},
+    "s7_lbl_min_heavy": {"en": "Min. heavy atoms:", "pt": "Átomos pesados mín.:"},
+    "s7_tooltip_min_heavy": {
+        "en": "Discards generated candidates with fewer HEAVY (non-H) atoms "
+              "than this, right before picking the Top N — same threshold, "
+              "same count, as \"Min. heavy atoms\" in Step 2 (Data Validation "
+              "and Curation), applied to the TRAINING ligands. No training "
+              "ligand has fewer than that; generated candidates could, "
+              "because nothing enforced it during generation.\n\n"
+              "Applied AFTER ranking, so Top N means \"the N best that pass "
+              "this filter\", not \"the N best, some possibly filtered out "
+              "later\". Set to 1 to disable.",
+        "pt": "Descarta candidatos gerados com menos átomos PESADOS (não-H) "
+              "que isto, logo antes de escolher o Top N — mesmo limiar, "
+              "mesma contagem, do \"Átomos pesados mín.\" da Etapa 2 (Data "
+              "Validation and Curation), aplicado aos ligantes de TREINO. "
+              "Nenhum ligante de treino tem menos que isso; candidatos "
+              "gerados podem ter, porque nada impedia isso durante a "
+              "geração.\n\n"
+              "Aplicado DEPOIS do ranqueamento, então Top N passa a "
+              "significar \"os N melhores que passam neste filtro\", não "
+              "\"os N melhores, alguns podendo ser descartados depois\". "
+              "Use 1 para desligar.",
+    },
 
     # -------------------------------------------- Fechamento com pipeline ativo
     "worker_collect":  {"en": "Collection",   "pt": "Coleta"},

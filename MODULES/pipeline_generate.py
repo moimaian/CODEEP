@@ -80,7 +80,7 @@ except ImportError:
     raise ImportError("RDKit obrigatório: pip install rdkit")
 
 try:
-    from Bio.PDB import PDBParser
+    from Bio.PDB import PDBParser, PDBIO, Select
     HAS_BIO = True
 except ImportError:
     HAS_BIO = False
@@ -534,6 +534,62 @@ def load_site_from_residues_pdb(
              f"{len(coords_arr)} átomos pesados ({len(residues)} resíduos)")
     return coords_arr, elements, charges, residues
 
+
+def write_site_pdb(residues: list, out_path: Path) -> bool:
+    """Grava um PDB contendo só os resíduos do sítio EFETIVAMENTE usados
+    para montar site_tensor.npz — com as coordenadas ORIGINAIS do arquivo
+    de entrada, antes de qualquer protonação.
+
+    Motivo de existir: quando o usuário fornece a PROTEÍNA COMPLETA (não um
+    --site-pdb já recortado), o sítio é decidido internamente — por raio ao
+    redor de um centro (extract_site_from_center), por P2Rank
+    (detect_pockets_p2rank + extract_site_from_center) ou pelo ligante
+    co-cristalizado (extract_site_from_pdb) — e o usuário não tem como
+    conferir, sem abrir o tensor, quais resíduos entraram de fato. Este
+    arquivo é essa conferência: se os resíduos não forem os esperados, dá
+    para ajustar Site Radius ou Pocket to use e rodar de novo.
+
+    `residues`: a MESMA lista de objetos Bio.PDB Residue devolvida por
+    extract_site_from_pdb/extract_site_from_center (ou carregada por
+    load_site_from_residues_pdb) — os resíduos REAIS da estrutura
+    analisada, não uma reconstrução a partir de coordenadas já
+    processadas. Por isso as coordenadas gravadas aqui são idênticas às do
+    PDB de entrada: nenhuma protonação, otimização ou capeamento com H
+    acontece antes deste ponto (essas etapas, em pdb_to_site_tensor, só
+    reatribuem site_coords/site_elements — `residues` nunca é tocado).
+
+    Retorna False (sem gravar nada) se `residues` vier vazio — não deveria
+    acontecer, mas silenciar em vez de escrever um PDB vazio é mais seguro.
+    """
+    if not residues:
+        log.warning("  write_site_pdb: lista de resíduos vazia — nada gravado.")
+        return False
+
+    ids_do_sitio = {id(r) for r in residues}
+
+    class _SelecionaSitio(Select):
+        def accept_residue(self, residue):
+            return id(residue) in ids_do_sitio
+
+    # Sobe até a Structure (Residue → Chain → Model → Structure) em vez de
+    # ficar no Model do primeiro resíduo: o sítio pode reunir resíduos de
+    # cadeias diferentes (interfaces, multímeros), e todas pertencem à
+    # MESMA Structure de origem — foi um único PDBParser.get_structure()
+    # que as produziu, em extract_site_from_pdb/extract_site_from_center.
+    estrutura = residues[0].get_parent().get_parent().get_parent()
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    io = PDBIO()
+    io.set_structure(estrutura)
+    io.save(str(out_path), select=_SelecionaSitio())
+
+    log.info(f"  PDB do sítio efetivamente usado salvo em: {out_path.name} "
+             f"({len(residues)} resíduos, coordenadas originais do PDB de entrada) "
+             f"— confira e ajuste Site Radius/Pocket to use se não for o esperado.")
+    return True
+
+
 def load_reference_ligand(ref_path: Path, out_dir: Path) -> tuple["Chem.Mol | None", "Path | None"]:
     """Carrega ligante de referência em SDF/PDB/MOL2 e normaliza para SDF.
 
@@ -617,13 +673,17 @@ def pdb_to_site_tensor(
 
     Returns:
         tensor, origin, voxel_size, site_coords, site_elements, site_mol,
-        site_is_backbone — os quatro últimos descrevem os átomos
-        protonados do sítio: coords (N,3)/elementos [N] em arrays soltos
-        (para a checagem de colisão estérica), site_mol (RDKit Mol único
-        com as ligações intra-resíduo reais preservadas, mesma ordem de
-        átomos) e site_is_backbone (bool por átomo — True para N/Cα/C/O,
-        usados pela minimização final em modo "induced-fit", ver
-        _minimize_complex_rdkit/_minimize_complex_gromacs).
+        site_is_backbone, site_residues — os quatro do meio descrevem os
+        átomos PROTONADOS do sítio: coords (N,3)/elementos [N] em arrays
+        soltos (para a checagem de colisão estérica), site_mol (RDKit Mol
+        único com as ligações intra-resíduo reais preservadas, mesma
+        ordem de átomos) e site_is_backbone (bool por átomo — True para
+        N/Cα/C/O, usados pela minimização final em modo "induced-fit", ver
+        _minimize_complex_rdkit/_minimize_complex_gromacs). site_residues
+        é a lista de objetos Bio.PDB Residue ANTES da protonação — as
+        coordenadas ORIGINAIS do PDB de entrada, úteis para conferência
+        (ver write_site_pdb) quando o sítio foi decidido internamente
+        (site_pdb=None) em vez de fornecido pronto pelo usuário.
     """
     # Carrega módulo de voxelização
     _proj = Path(project_dir) if project_dir else PROJECT_DIR
@@ -732,7 +792,8 @@ def pdb_to_site_tensor(
     # explícitos) também são retornados — usados na minimização conjunta
     # ligante+bolso (rígida ou induced-fit) e na checagem de colisão
     # estérica pós-geração (ver _relax_generated_geometry/_check_pocket_clashes).
-    return tensor, origin, voxel_size, site_coords, site_elements, site_mol, site_is_backbone
+    return (tensor, origin, voxel_size, site_coords, site_elements,
+            site_mol, site_is_backbone, site_residues)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -827,6 +888,30 @@ def load_model(
             "(O-O, O-F, N-F...). Retreine para obter o filtro completo."
         )
 
+    # Padrões de carga formal. Vem do checkpoint quando o treino que o
+    # gerou já os mediu; senão, do charge_stats.json ao lado dos tensores —
+    # assim o portão vale também para checkpoints treinados antes desta
+    # correção existir, sem exigir retreino.
+    _cst = cfg.get("charge_stats") or {}
+    if not _cst:
+        _cst_path = _proj / "data" / "tensors" / "charge_stats.json"
+        if _cst_path.exists():
+            try:
+                _cst = json.loads(_cst_path.read_text())
+                log.info(f"  Padrões de carga formal lidos de {_cst_path.name}")
+            except Exception as e:
+                log.warning(f"  charge_stats.json ilegível ({e}).")
+    if _cst:
+        CHARGE_STATS.clear(); CHARGE_STATS.update(_cst)
+        log.info(f"  Portão de carga formal ativo: "
+                 f"{len(_cst.get('patterns', {}))} padrões medidos")
+    else:
+        log.warning(
+            "  Sem estatística de carga formal: as cargas previstas serão "
+            "aplicadas SEM verificação — podem surgir padrões inexistentes "
+            "na base (F+1, C-1, O+1...)."
+        )
+
     ckpt_arch = int(cfg.get("arch_version", 1))
     cur_arch  = int(getattr(mod, "ARCH_VERSION", 1))
     if ckpt_arch != cur_arch:
@@ -834,11 +919,12 @@ def load_model(
             f"Checkpoint incompatível: {best_ckpt}\n"
             f"  arquitetura do checkpoint : versão {ckpt_arch}\n"
             f"  arquitetura do código     : versão {cur_arch}\n\n"
-            "A versão 2 ancora a posição num átomo focal e a modela por "
-            "mixture density network, dá geometria e valência ao decoder e "
-            "acrescenta as cabeças de foco e de carga formal. Pesos da "
-            "versão 1 não têm correspondência nessas camadas.\n"
-            "É necessário RETREINAR a Fase 1 (Etapa 7) com o código atual."
+            "Cada versão da arquitetura muda a FORMA e o SIGNIFICADO das "
+            "camadas do decoder (ver a nota de ARCH_VERSION em "
+            "pipeline_train.py): os pesos gravados não têm correspondência "
+            "nas camadas atuais, e carregá-los com strict=False daria um "
+            "modelo que roda e gera lixo em silêncio.\n"
+            "É necessário RETREINAR a Fase 1 com o código atual."
         )
 
     model = mod.LigandCVAE(
@@ -933,6 +1019,11 @@ BOND_ORDER_BUDGET = {
     BondType.AROMATIC: 1.5,
 }
 
+# Índice reverso de BOND_TYPE_MAP — usado pela montagem global (ver
+# _assemble_bonds_global) para converter o BondType escolhido de volta ao
+# código inteiro que o resto do pipeline (candidate["bonds"]) usa.
+_BOND_TYPE_IDX = {v: k for k, v in BOND_TYPE_MAP.items()}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # QUÍMICA EMPÍRICA DA BASE DE TREINO
@@ -953,6 +1044,94 @@ BOND_ORDER_BUDGET = {
 BOND_STATS: dict = {}
 BOND_PAIR_MIN_FREQ = 1e-4      # 0,01% — abaixo disso o par é considerado inexistente
 BOND_DIST_TOL      = 0.12      # Å de folga sobre o p99 medido
+
+# Padrões (elemento, carga formal, grau) medidos na base. A cabeça
+# head_fcharge recebe apenas o contexto da MOLÉCULA (ctx = [pool ; z]) —
+# não sabe em qual átomo está atribuindo a carga, nem o elemento nem o
+# grau. O resultado medido: dos nove padrões que ela produziu na geração,
+# OITO não ocorrem uma única vez em 209.649 átomos de treino (F+1, C-1,
+# C+1, O+1, S-1, S+1), e é daí que saem [FH+], [OH2+], [C-] e afins — o
+# RDKit recebe a carga, recalcula a valência e completa com hidrogênios.
+#
+# A base só tem dois padrões de fato: N+1 (amônio, graus 1-4) e O-1
+# (carboxilato/alcóxido, grau 1). Este portão aplica a carga prevista
+# apenas quando o padrão existe; caso contrário zera. É o análogo do
+# filtro de pares de ligação, e igualmente derivado dos dados.
+CHARGE_STATS: dict = {}
+CHARGE_PATTERN_MIN_FREQ = 5e-5   # 0,005%
+
+
+_CHARGE_ELEM_FREQ: dict = {}
+
+
+def _charge_elem_freq() -> dict:
+    """Frequência de (elemento, carga) agregada sobre todos os graus.
+
+    Cache derivado de CHARGE_STATS, invalidado quando a tabela muda de
+    tamanho (troca de checkpoint dentro do mesmo processo).
+    """
+    padroes = CHARGE_STATS.get("patterns", {})
+    if _CHARGE_ELEM_FREQ.get("_n") != len(padroes):
+        agg = {}
+        tot = max(int(CHARGE_STATS.get("total_atoms", 0)), 1)
+        for chave, info in padroes.items():
+            elem, carga, _grau = chave.split("|")
+            agg[(elem, int(carga))] = agg.get((elem, int(carga)), 0) + int(info.get("n", 0))
+        _CHARGE_ELEM_FREQ.clear()
+        _CHARGE_ELEM_FREQ.update({k: v / tot for k, v in agg.items()})
+        _CHARGE_ELEM_FREQ["_n"] = len(padroes)
+    return _CHARGE_ELEM_FREQ
+
+
+def _gate_charges_array(symbols: list, fcharges) -> int:
+    """Zera cargas impossíveis para o ELEMENTO, antes de montar as ligações.
+
+    Precisa vir antes porque _max_val soma a carga prevista ao teto de
+    valência: um F previsto como +1 passa a aceitar duas ligações e molda
+    a molécula inteira em torno disso. Verificar só no fim transformaria o
+    candidato em descarte na sanitização — exatamente o que a recuperação
+    do maior fragmento tenta evitar.
+
+    Aqui o critério é agregado por elemento (qualquer grau), porque o grau
+    ainda não existe. O refinamento por grau fica com _gate_formal_charges,
+    depois das ligações.
+    """
+    if not CHARGE_STATS or fcharges is None:
+        return 0
+    freq = _charge_elem_freq()
+    revertidas = 0
+    for i, c in enumerate(fcharges):
+        if int(c) == 0 or i >= len(symbols):
+            continue
+        if freq.get((symbols[i].upper(), int(c)), 0.0) < CHARGE_PATTERN_MIN_FREQ:
+            fcharges[i] = 0
+            revertidas += 1
+    return revertidas
+
+
+def _gate_formal_charges(rwmol: "Chem.RWMol") -> int:
+    """Zera cargas formais cujo padrão (elemento, carga, grau) não existe
+    na base. Chamada DEPOIS das ligações, quando o grau é definitivo.
+    Retorna quantas cargas foram revertidas."""
+    if not CHARGE_STATS:
+        return 0
+    padroes = CHARGE_STATS.get("patterns", {})
+    revertidas = 0
+    for atom in rwmol.GetAtoms():
+        c = atom.GetFormalCharge()
+        if c == 0:
+            continue
+        chave = f"{atom.GetSymbol().upper()}|{c}|{atom.GetDegree()}"
+        info = padroes.get(chave)
+        if info is None or info.get("freq", 0.0) < CHARGE_PATTERN_MIN_FREQ:
+            atom.SetFormalCharge(0)
+            # Devolve o átomo ao preenchimento implícito de H do RDKit: sem
+            # isso um [OH2+] revertido vira radical O• em vez de hidroxila.
+            atom.SetNumExplicitHs(0)
+            atom.SetNoImplicit(False)
+            atom.SetNumRadicalElectrons(0)
+            revertidas += 1
+    return revertidas
 
 _BOND_ORDER_KEY = {
     BondType.SINGLE: "1", BondType.DOUBLE: "2",
@@ -1119,6 +1298,170 @@ def _connect_components(
         valence_used[i] += 1.0
         valence_used[j] += 1.0
         added_bonds.add(tuple(sorted((i, j))))
+
+
+def _bond_angle_ok(i: int, j: int, adj: list, positions: np.ndarray,
+                   min_deg: float = 45.0) -> bool:
+    """Rejeita a ligação (i, j) se ela formar um ângulo espremido (<min_deg)
+    com alguma ligação JÁ aceita em i ou em j.
+
+    Mesmo critério do forms_small_angle do LiGAN (bond_adding.py) — existe
+    porque, sem ele, a montagem global (_assemble_bonds_global) aceita
+    qualquer par plausível por distância isoladamente e, ao juntar vários
+    pares assim ao redor do mesmo átomo, produz anéis de 3-4 membros
+    geometricamente espremidos que a distância par a par não pega sozinha
+    (dois vizinhos podem estar cada um a uma distância de ligação
+    perfeitamente normal do átomo central, e ainda assim a 20° um do
+    outro — geometria que nenhuma hibridização real sustenta).
+    """
+    pi, pj = positions[i], positions[j]
+    for base, outro, vizinhos in ((i, j, adj[i]), (j, i, adj[j])):
+        p_base = positions[base]
+        v1 = positions[outro] - p_base
+        n1 = np.linalg.norm(v1)
+        if n1 < 1e-6:
+            continue
+        for viz in vizinhos:
+            if viz == outro:
+                continue
+            v2 = positions[viz] - p_base
+            n2 = np.linalg.norm(v2)
+            if n2 < 1e-6:
+                continue
+            cos = float(np.dot(v1, v2) / (n1 * n2))
+            ang = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+            if ang < min_deg:
+                return False
+    return True
+
+
+def _assemble_bonds_global(atom_types: np.ndarray, positions: np.ndarray,
+                           fcharges, max_val_fn):
+    """Monta a conectividade de UM candidato JÁ COMPLETO — todas as posições
+    e tipos já existem — numa única passada GLOBAL sobre todos os pares, em
+    vez de aceitar/rejeitar uma ligação de cada vez, no momento em que cada
+    átomo é colocado (era assim até esta correção — ver histórico de
+    preds_to_mol).
+
+    Motivo, medido: a cabeça de ligação do decoder julga cada par
+    ISOLADAMENTE (pair_h em GNNDecoder.predict_bonds não vê os OUTROS
+    candidatos do mesmo átomo), e faz isso sob geometria AUTOGERADA, nunca
+    vista no treino (que só usa geometria real via teacher forcing). Sob
+    geometria real ela aceita 99,9% das ligações que deveria; sob a
+    geometria que ela própria produz (posMAE ~0,98 Å), só 27,5% — e o par
+    que fecharia um anel de 6 membros, decidido 4-5 passos depois de o
+    parceiro ter sido colocado, é o mais exposto a essa degradação.
+
+    A alternativa aqui é a mesma dos quatro programas de referência que não
+    decidem ligação passo a passo (BondAdder do LiGAN, get_bond_order_batch
+    do DiffSBDD): esperar a geometria inteira existir e só então perceber a
+    conectividade — de uma vez, por plausibilidade, respeitando valência.
+    Isso NÃO melhora a precisão da geometria em si (medido: sem filtro de
+    ângulo, uma montagem global ingênua por distância cria uma enxurrada de
+    anéis de 3-4 membros espúrios — 535 anéis de 3 membros em 400
+    candidatos, contra 61 no treino de referência da mesma amostra); com o
+    filtro de ângulo (_bond_angle_ok, idêntico ao forms_small_angle do
+    LiGAN) isso cai para 65 e os anéis de 6 membros SOBEM de 7 para 26 —
+    ainda longe do que o treino tem (~71% das moléculas), mas dobrando o
+    que a montagem sequencial recuperava da MESMA geometria.
+
+    Pontuação de cada par candidato = frequência, na base (BOND_STATS), do
+    tipo de ligação mais provável para aquele par de elementos — a
+    distância age só como FILTRO (_bond_distance_ok, dentro do p99 medido
+    + tolerância). Duas variantes com peso geométrico na pontuação foram
+    medidas e descartadas por fragmentarem a molécula mais que a
+    frequência pura (ver o comentário dentro do laço) — o custo aceito é
+    uma imperfeição de RÓTULO (um C-C aromático pode sair como simples),
+    não de contagem de anel, que RDKit percebe pelo ciclo, não pela ordem
+    da ligação.
+
+    Retorna (bonds, valence_used): bonds no mesmo formato de
+    candidate["bonds"] — lista de (i, j, código do tipo) — para que o
+    resto de preds_to_mol (RWMol, _connect_components, sanitização) siga
+    idêntico ao que já era testado.
+    """
+    n = len(atom_types)
+    symbols = [ATOM_TYPES_GEN[min(int(a), len(ATOM_TYPES_GEN) - 1)].upper()
+               for a in atom_types]
+
+    # Matriz de distância inteira de uma vez — mais barato que recalcular
+    # por par dentro do laço, e é o mesmo dado que TODOS os candidatos de
+    # bond_type vão reusar para o mesmo par (i, j).
+    diff = positions[:, None, :] - positions[None, :, :]
+    dist_mat = np.linalg.norm(diff, axis=-1)
+
+    candidatos = []   # (score, i, j, BondType)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = float(dist_mat[i, j])
+            if dist <= 0.9 or dist > 2.2:
+                continue
+            # O TIPO da ligação é decidido pela FREQUÊNCIA do par na base —
+            # não por um fator geométrico multiplicativo. Duas tentativas
+            # com peso geométrico foram medidas e descartadas:
+            #
+            #   1) gaussiana ESTREITA à distância média: uma distância de
+            #      par simples fora do centro (comum sob geometria
+            #      autogerada) perdia para uma ligação DUPLA rara cuja
+            #      média mais curta calhava perto — 36% de duplas num
+            #      candidato de 41 átomos, contra ~8% na base. A molécula
+            #      fragmentava (o orçamento de valência esgotava mais
+            #      rápido em ordem 2). Sobrevivência: 10% (contra 69% da
+            #      montagem sequencial que esta substitui).
+            #   2) mesma ideia amortecida (piso 0,3 + ajuste linear pela
+            #      janela p99−média do próprio par, em vez de uma
+            #      constante): melhor que (1), mas ainda fragmentava mais
+            #      que a frequência pura — sobrevivência 29% contra 81%.
+            #
+            # A frequência sozinha tem uma imperfeição conhecida e aceita:
+            # um C-C a 1,39 Å (distância de livro-texto para aromático)
+            # pode virar ligação SIMPLES em vez de aromática, porque a base
+            # tem mais pares C-C simples que aromáticos NO TOTAL. Isso é
+            # um rótulo de ORDEM de ligação errado — não afeta a contagem
+            # de anéis (RDKit conta o ciclo independente da ordem), que é
+            # o problema que esta correção ataca; afeta perceber
+            # aromaticidade corretamente, o que fica para trabalho futuro
+            # (ex.: uma passada de reclassificação de anel pós-montagem).
+            # A distância continua um FILTRO (_bond_distance_ok já exige
+            # estar dentro do p99 medido + tolerância) — só deixou de
+            # competir na pontuação com a frequência.
+            melhor = None
+            for bond_type in (BondType.SINGLE, BondType.AROMATIC,
+                             BondType.DOUBLE, BondType.TRIPLE):
+                if not _bond_distance_ok(symbols[i], symbols[j], bond_type, dist):
+                    continue
+                info = BOND_STATS.get(_pair_key(symbols[i], symbols[j], bond_type))
+                if BOND_STATS and info is None:
+                    continue
+                freq = info.get("freq", 0.0) if info else 1.0
+                if melhor is None or freq > melhor[0]:
+                    melhor = (freq, bond_type)
+            if melhor is not None:
+                candidatos.append((melhor[0], i, j, melhor[1]))
+
+    candidatos.sort(key=lambda c: -c[0])
+
+    valence_used = [0.0] * n
+    added: set = set()
+    adj = [set() for _ in range(n)]
+    bonds = []
+    for score, i, j, bond_type in candidatos:
+        if (i, j) in added:
+            continue
+        budget = BOND_ORDER_BUDGET.get(bond_type, 1.0)
+        if valence_used[i] + budget > max_val_fn(symbols[i], i) + 1e-6:
+            continue
+        if valence_used[j] + budget > max_val_fn(symbols[j], j) + 1e-6:
+            continue
+        if not _bond_angle_ok(i, j, adj, positions):
+            continue
+        valence_used[i] += budget
+        valence_used[j] += budget
+        added.add((i, j))
+        adj[i].add(j); adj[j].add(i)
+        bonds.append((i, j, _BOND_TYPE_IDX.get(bond_type, 0)))
+
+    return bonds, valence_used
 
 
 FINAL_FF_METHODS = ("mmff_uff", "amber_ff14sb", "charmm36")
@@ -1888,6 +2231,11 @@ def _relax_generated_geometry(
 
 def preds_to_mol(
     candidate: dict,
+    # Não usado mais: era o limite do fallback por distância plana,
+    # substituído pela montagem global (_assemble_bonds_global), que já
+    # decide a janela de distância por par de elemento via BOND_STATS.
+    # Mantido na assinatura por estabilidade — nenhum chamador atual passa
+    # este argumento.
     cutoff_dist: float = 1.9,
     site_coords: "np.ndarray | None" = None,
     site_elements: "list | None" = None,
@@ -1903,20 +2251,33 @@ def preds_to_mol(
 
     candidate: {"atom_types": LongTensor(n,), "charges": FloatTensor(n,),
                 "positions": FloatTensor(n,3), "bonds": list[(i,j,bond_type)]}
-    — o decoder autorregressivo já decidiu quais ligações existem durante
-    a própria geração (ver GNNDecoder/LigandCVAE.sample em
-    pipeline_train.py); esta função só valida quimicamente essas decisões
-    (valência, distância) e monta o objeto RDKit — não reconstrói mais a
-    topologia a partir de um "template graph" externo.
+    — candidate["bonds"] traz as ligações que o decoder decidiu passo a
+    passo DURANTE a construção (ver GNNDecoder/LigandCVAE.sample em
+    pipeline_train.py), mas esta função NÃO as usa mais. Posições e tipos
+    já estão todos definitivos quando chegamos aqui, então a conectividade
+    é reconstruída do zero, numa única passada GLOBAL sobre todos os pares
+    (_assemble_bonds_global) — mesma estratégia do BondAdder do LiGAN e do
+    get_bond_order_batch do DiffSBDD.
 
-    Sanidade aplicada nas ligações já decididas pelo modelo:
+    Motivo, medido: julgando cada par isoladamente, sob a geometria que o
+    PRÓPRIO decoder gera (nunca vista no treino, que só usa teacher
+    forcing), a cabeça de ligação aceita só 27,5% das ligações que
+    deveria — contra 99,9% sob geometria real. O par que fecharia um anel
+    de 6 membros, decidido vários passos depois de o parceiro ter sido
+    colocado, é o mais exposto a essa degradação. Ver _assemble_bonds_global
+    para a medição completa (recupera anéis de 6 membros: 7→26 em 400
+    candidatos, mesma amostra do modelo).
+
+    Sanidade aplicada na montagem global:
       - distância átomo-átomo compatível com o tipo de ligação
-        (_bond_distance_ok)
+        (_bond_distance_ok), ponderada pela frequência do par na base
+      - ângulo não espremido com ligações vizinhas já aceitas
+        (_bond_angle_ok — sem isso, a montagem global crava anéis de 3-4
+        membros espúrios que a distância par a par não pega sozinha)
       - orçamento de valência não excedido (MAX_VALENCE)
-    Ligações que violam essas checagens são descartadas. Se restarem
-    fragmentos desconexos, _connect_components tenta uma reparação mínima
-    (liga o par mais próximo entre fragmentos, respeitando valência) antes
-    de desistir do candidato.
+    Se restarem fragmentos desconexos, _connect_components tenta uma
+    reparação mínima (liga o par mais próximo entre fragmentos,
+    respeitando valência) antes de desistir do candidato.
 
     site_coords/site_elements/site_mol/site_is_backbone (opcionais, ver
     pdb_to_site_tensor): se fornecidos, a relaxação final de geometria
@@ -1948,6 +2309,11 @@ def preds_to_mol(
                 if hasattr(fcharges, "detach") else fcharges
             ).astype(int).reshape(-1)
 
+        symbols = [ATOM_TYPES_GEN[min(int(a), len(ATOM_TYPES_GEN) - 1)]
+                   for a in atom_types]
+        if fcharges is not None:
+            _gate_charges_array(symbols, fcharges)
+
         rwmol = Chem.RWMol()
         conf  = Chem.Conformer(n_atoms)
         for i, at_idx in enumerate(atom_types):
@@ -1968,61 +2334,60 @@ def preds_to_mol(
                 return base + float(fcharges[i])
             return base
 
-        valence_used = [0.0] * n_atoms
+        # Ligações: montagem GLOBAL (correção "opção 1"), não mais uma
+        # decisão por passo tomada durante a própria construção — ver a
+        # justificativa medida em _assemble_bonds_global. candidate["bonds"]
+        # (o que o decoder decidiu passo a passo) deixou de ser usado AQUI;
+        # continua usado, sem mudança, DENTRO do rollout (LigandCVAE.sample)
+        # para escolher focal/posição dos próximos átomos — só a montagem
+        # final da molécula ignora essas decisões e reconstrói a
+        # conectividade do zero, a partir da geometria e tipos definitivos.
+        bonds, valence_used = _assemble_bonds_global(
+            atom_types, positions, fcharges, _max_val)
         added = set()
-        for (i, j, type_idx) in candidate["bonds"]:
-            i, j = int(i), int(j)
-            if i == j or i >= n_atoms or j >= n_atoms or (i, j) in added or (j, i) in added:
-                continue
-            bond_type = BOND_TYPE_MAP.get(int(type_idx), BondType.SINGLE)
-            sym_i = ATOM_TYPES_GEN[min(int(atom_types[i]), len(ATOM_TYPES_GEN) - 1)].upper()
-            sym_j = ATOM_TYPES_GEN[min(int(atom_types[j]), len(ATOM_TYPES_GEN) - 1)].upper()
-            dist = float(np.linalg.norm(positions[i] - positions[j]))
-            if not _bond_distance_ok(sym_i, sym_j, bond_type, dist):
-                continue
-            budget = BOND_ORDER_BUDGET.get(bond_type, 1.0)
-            if valence_used[i] + budget > _max_val(sym_i, i) + 1e-6:
-                continue
-            if valence_used[j] + budget > _max_val(sym_j, j) + 1e-6:
-                continue
-            rwmol.AddBond(i, j, bond_type)
-            valence_used[i] += budget
-            valence_used[j] += budget
+        for (i, j, type_idx) in bonds:
+            rwmol.AddBond(i, j, BOND_TYPE_MAP.get(type_idx, BondType.SINGLE))
             added.add((i, j))
-
-        # Fallback por distância só se o modelo não decidiu NENHUMA ligação
-        # válida (ex.: candidato com 1-2 átomos onde a cabeça de ligação
-        # nunca disparou) — último recurso, igual à versão anterior.
-        if not added and n_atoms > 1:
-            for i in range(n_atoms):
-                for j in range(i + 1, n_atoms):
-                    d = float(np.linalg.norm(positions[i] - positions[j]))
-                    if 1.0 < d < cutoff_dist:
-                        sym_i = ATOM_TYPES_GEN[min(int(atom_types[i]), len(ATOM_TYPES_GEN) - 1)].upper()
-                        sym_j = ATOM_TYPES_GEN[min(int(atom_types[j]), len(ATOM_TYPES_GEN) - 1)].upper()
-                        if valence_used[i] >= _max_val(sym_i, i):
-                            continue
-                        if valence_used[j] >= _max_val(sym_j, j):
-                            continue
-                        rwmol.AddBond(i, j, BondType.SINGLE)
-                        valence_used[i] += 1.0
-                        valence_used[j] += 1.0
-                        added.add((i, j))
 
         max_vals_all = [
             _max_val(ATOM_TYPES_GEN[min(int(atom_types[k]),
                                         len(ATOM_TYPES_GEN) - 1)].upper(), k)
             for k in range(n_atoms)
         ]
-        if added and not _connect_components(rwmol, atom_types, positions,
-                                             valence_used, added, max_vals_all):
-            return None
+        # A reparação pode falhar (fragmentos longe demais ou com valência
+        # saturada). Falhar aqui NÃO descarta mais o candidato: medido sobre
+        # 360 amostras, 73% morriam nesta linha, e o maior componente desses
+        # descartados tinha 17,8 átomos em média (mediana 14; 70% com ≥10) —
+        # era este o descarte que convertia 22 átomos amostrados em 6 na
+        # saída, não o passo de fragmentos abaixo. Segue adiante e a poda do
+        # maior fragmento fica com o pedaço conectado.
+        if added:
+            _connect_components(rwmol, atom_types, positions,
+                                valence_used, added, max_vals_all)
+
+        # Portão de carga formal — depois das ligações, quando o grau é
+        # definitivo (ver _gate_formal_charges).
+        _gate_formal_charges(rwmol)
 
         mol = _sanitize_generated_mol(rwmol.GetMol())
         if mol is None:
             return None
-        if len(Chem.GetMolFrags(mol)) != 1:
-            return None
+        # Fragmentado: fica com o MAIOR pedaço em vez de descartar tudo.
+        # Medido: 78% dos candidatos morriam aqui, e a mortalidade não era
+        # neutra — moléculas grandes têm mais ligações e mais chance de uma
+        # falhar, então o que sobrevivia eram os fragmentos pequenos (6,0
+        # átomos na saída contra 19,6 amostrados). Pior, o descarte
+        # selecionava por elemento: S (valência 6) e halogênio (valência 1)
+        # fecham valência facilmente e sobreviviam em excesso — S quase
+        # dobrava da amostra bruta para a saída. Aparar em vez de matar é o
+        # que o DiffSBDD faz (process_molecule, largest_frag=True).
+        frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+        if len(frags) > 1:
+            mol = max(frags, key=lambda m: m.GetNumHeavyAtoms())
+            try:
+                Chem.SanitizeMol(mol)
+            except Exception:
+                return None
         if _has_implausible_ring(mol):
             return None
         return _relax_generated_geometry(
@@ -2479,6 +2844,46 @@ def rank_candidates(
     return df
 
 
+def filter_candidates_by_size(df: pd.DataFrame, min_heavy_atoms: int) -> pd.DataFrame:
+    """Remove do ranking os candidatos com menos átomos PESADOS (não-H) que
+    min_heavy_atoms — o MESMO filtro, com a MESMA contagem, aplicado aos
+    ligantes de treino na curadoria (ver
+    pipeline_curate.CURATE_CONFIG["min_heavy_atoms"], usado em Data
+    Validation and Curation).
+
+    Motivo de existir: nada na geração barrava moléculas pequenas — medido
+    após a arquitetura v4 (anéis de 6 membros e cadeias hidrocarbônicas
+    mais longas melhoraram bastante), ainda assim sobrevivem candidatos de
+    4-6 átomos pesados, menores que QUALQUER ligante que o modelo já viu
+    no treino (nenhum tem menos de 7). Aplicado depois de rank_candidates
+    (o score já está calculado) e antes de save_sdf/save_grid_image/
+    save_html_report — top_n passa a significar "os N melhores DEPOIS
+    deste filtro", não antes.
+
+    De propósito, NÃO usa a coluna "n_atoms" do DataFrame: ela vem de
+    mol.GetNumAtoms() (hoje, na prática, igual à contagem de átomos
+    pesados, porque _relax_generated_geometry devolve o mol sem H
+    explícito — mas essa equivalência é um detalhe de implementação da
+    relaxação, não uma garantia da definição da coluna). Chamar
+    GetNumHeavyAtoms() direto no objeto RDKit (coluna "_mol") é explícito
+    sobre o que está sendo medido e continua correto mesmo que isso mude —
+    a MESMA definição usada na curadoria: átomos != H, sempre.
+    """
+    if df.empty or min_heavy_atoms <= 1:
+        return df
+    mantidos = df["_mol"].apply(
+        lambda m: m is not None and m.GetNumHeavyAtoms() >= min_heavy_atoms
+    )
+    n_removidos = int((~mantidos).sum())
+    filtrado = df[mantidos].reset_index(drop=True)
+    filtrado.index += 1  # ranking recomeça em 1 sobre o que sobrou
+    if n_removidos:
+        log.info(f"  Filtro de tamanho mínimo (≥{min_heavy_atoms} átomos pesados, "
+                 f"mesmo limiar da curadoria): {n_removidos} candidato(s) "
+                 f"removido(s) de {len(df)} — {len(filtrado)} restantes.")
+    return filtrado
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BLOCO 6 — RELATÓRIO E SAÍDAS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2678,6 +3083,11 @@ Exemplos:
                         help="Raio do sítio em Å (default: 6.0)")
     parser.add_argument("--min-atoms",   type=int,   default=5,
                         help="Mínimo de átomos no sítio (default: 5)")
+    parser.add_argument("--min-heavy-atoms", type=int, default=7,
+                        help="Descarta candidatos com menos átomos PESADOS "
+                             "que isto, antes do top-N — mesmo limiar "
+                             "aplicado aos ligantes de treino na curadoria "
+                             "(default: 7)")
     parser.add_argument("--top-n",       type=int,   default=20,
                         help="Top N candidatos no relatório (default: 20)")
     parser.add_argument("--out",         default=None,
@@ -2802,7 +3212,7 @@ Exemplos:
         log.info("  Modo: detecção automática via ligante co-cristalizado")
 
     (site_tensor, origin, voxel_size, site_coords, site_elements,
-     site_mol, site_is_backbone) = pdb_to_site_tensor(
+     site_mol, site_is_backbone, site_residues) = pdb_to_site_tensor(
         pdb_path, args.cutoff, args.min_atoms,
         site_pdb=site_pdb_path,
         site_center=site_center,
@@ -2814,6 +3224,11 @@ Exemplos:
         tensor=site_tensor, origin=origin,
         voxel_size=np.array([voxel_size]),
     )
+    # Sítio decidido internamente (sem --site-pdb): grava os resíduos
+    # REALMENTE usados, com coordenadas originais, para conferência — ver
+    # write_site_pdb.
+    if site_pdb_path is None:
+        write_site_pdb(site_residues, out_dir / "site_residues_used.pdb")
 
     # ── 3. Ligante de referência (opcional) ───────────────────────────────────
     ref_mol = None
@@ -2858,6 +3273,11 @@ Exemplos:
     # ── 5. Ranking e métricas ─────────────────────────────────────────────────
     log.info("\n[4/5] Ranqueando candidatos...")
     df = rank_candidates(candidates, ref_mol=ref_mol)
+    df = filter_candidates_by_size(df, args.min_heavy_atoms)
+    if df.empty:
+        log.error(f"Nenhum candidato com ≥{args.min_heavy_atoms} átomos pesados "
+                  "sobrou após o filtro de tamanho mínimo.")
+        sys.exit(1)
 
     # ── 6. Salva resultados ───────────────────────────────────────────────────
     log.info("\n[5/5] Salvando resultados...")

@@ -71,6 +71,28 @@ def _load_train_module():
 # BLOCO 1 — ANÁLISE DO HISTÓRICO DE TREINAMENTO
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def _check_arch(cfg: dict, mod, contexto: str) -> bool:
+    """Confere se o checkpoint foi treinado com a arquitetura deste código.
+
+    Sem esta checagem, um checkpoint de versão anterior carregado num
+    modelo da versão atual produz métricas silenciosamente erradas — o
+    caso mais perigoso é o load_state_dict(strict=False) do cálculo de
+    active units, que aceita pesos faltantes sem reclamar. Mesmo guarda
+    já existente em pipeline_train.train(resume=) e
+    pipeline_generate.load_model.
+    """
+    ck_arch  = int(cfg.get("arch_version", 1))
+    cur_arch = int(getattr(mod, "ARCH_VERSION", 1))
+    if ck_arch == cur_arch:
+        return True
+    log.error(
+        f"  {contexto}: checkpoint da arquitetura versão {ck_arch}, código na "
+        f"versão {cur_arch}. As cabeças mudaram de forma e de significado — "
+        f"as métricas seriam inválidas. Retreine (Step 5) antes de avaliar."
+    )
+    return False
+
 def analyze_training_history(ckpt_dir: Path):
     """Lê training_history.csv e extrai métricas de saúde do treinamento."""
     csv_path = ckpt_dir / "training_history.csv"
@@ -226,6 +248,9 @@ def evaluate_on_test(ckpt_dir: Path, tensor_dir: Path) -> dict:
                 current_fc.out_features,
                 bias=current_fc.bias is not None,
             ).to(device)
+
+    if not _check_arch(cfg, mod, "Avaliação no teste"):
+        return {}
 
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -492,6 +517,9 @@ def generate_ligands_for_site(
         hidden_dim=cfg.get("hidden_dim", 256),
         n_gnn_layers=cfg.get("n_gnn_layers", 4),
     ).to(device)
+    if not _check_arch(cfg, mod, "Geração de exemplos"):
+        return []
+
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -589,6 +617,8 @@ def compute_active_units(
         hidden_dim=cfg.get("hidden_dim", 256),
         n_gnn_layers=cfg.get("n_gnn_layers", 4),
     ).to(device)
+    if not _check_arch(cfg, mod, "Active units"):
+        return None
     try:
         model.load_state_dict(ckpt["model_state"], strict=False)
     except Exception as e:

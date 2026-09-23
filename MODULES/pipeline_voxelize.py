@@ -2416,7 +2416,34 @@ def run(
     else:
         if not curated_dir.exists():
             raise FileNotFoundError(f"Diretório curado não encontrado: {curated_dir}")
-        pair_dirs = sorted([d for d in curated_dir.iterdir() if d.is_dir()])
+        no_disco = sorted([d for d in curated_dir.iterdir() if d.is_dir()])
+
+        # A fonte da verdade é o metadata da curadoria, NÃO o que sobrou no
+        # disco — ver _approved_pair_ids.
+        aprovados = _approved_pair_ids(curated_dir)
+        if aprovados is None:
+            log.warning(
+                "  Metadata da curadoria não encontrado — processando TODOS os "
+                "diretórios de %s. Se os filtros da Etapa 2 mudaram desde a "
+                "curadoria anterior, pares já rejeitados podem entrar na base.",
+                curated_dir,
+            )
+            pair_dirs = no_disco
+        else:
+            pair_dirs = [d for d in no_disco if d.name in aprovados]
+            obsoletos = len(no_disco) - len(pair_dirs)
+            if obsoletos:
+                log.info(
+                    f"  Diretórios obsoletos ignorados: {obsoletos} "
+                    f"(existem em {curated_dir.name}/ mas foram rejeitados "
+                    f"pela curadoria atual)"
+                )
+            faltando = len(aprovados) - len(pair_dirs)
+            if faltando > 0:
+                log.warning(
+                    f"  {faltando} pares aprovados pela curadoria não têm "
+                    f"diretório em {curated_dir} — rode a Etapa 2 novamente."
+                )
 
     log.info(f"  Pares a processar: {len(pair_dirs)}")
 
@@ -2494,6 +2521,50 @@ def run(
     log.info(f"  ↷ Já existiam (pulados)  : {skipped}")
     log.info(f"  ✗ Falhas                  : {fail}")
     log.info(f"  Índice salvo em           : {tensor_dir / 'tensor_index.csv'}")
+
+def _approved_pair_ids(curated_dir: Path) -> "set[str] | None":
+    """pair_ids que a curadoria APROVOU, lidos do metadata dela.
+
+    A voxelização enumerava `curated_dir.iterdir()`, ou seja, o que está no
+    disco. Isso diverge do que a curadoria decidiu sempre que os filtros
+    mudam: a curadoria deixa de LISTAR um par rejeitado, mas não apaga o
+    diretório da rodada anterior. Na prática, ao endurecer a exclusão de
+    ligantes (resíduos modificados, açúcares, detergentes, tampões), a
+    curadoria passou de 33.212 para 22.293 pares e a voxelização
+    reprocessou os 11.471 diretórios obsoletos assim mesmo — 34% da base
+    de treino era exatamente o material que se queria remover.
+
+    Caminhos do metadata, conforme a fase (ver CODEEP.py, run_fn da
+    curadoria):
+        fase 1 : <...>/data/curated_metadata.csv      (irmão de curated/)
+        fase 2 : <...>/curated/phase2_metadata.csv    (irmão de phase2/)
+        fase 3 : <...>/curated/phase3_metadata.csv
+
+    Retorna None quando nenhum metadata é encontrado — aí o chamador cai
+    no comportamento antigo, com aviso.
+    """
+    candidatos = [
+        curated_dir.parent / f"{curated_dir.name}_metadata.csv",
+        curated_dir.parent / "curated_metadata.csv",
+    ]
+    for csv_path in candidatos:
+        if not csv_path.exists():
+            continue
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            log.warning(f"  Metadata da curadoria ilegível ({csv_path}): {e}")
+            continue
+        if "pair_id" not in df.columns:
+            log.warning(f"  {csv_path} sem coluna pair_id — ignorando.")
+            continue
+        aprovados = set(df["pair_id"].astype(str))
+        log.info(f"  Metadata da curadoria: {csv_path.name} "
+                 f"({len(aprovados)} pares aprovados)")
+        return aprovados
+    return None
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Voxeliza pares sítio-ligante")
