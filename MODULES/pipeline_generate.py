@@ -777,8 +777,34 @@ def pdb_to_site_tensor(
     else:
         log.info(f"  Canais 3-4 (doador/aceptor): {orbital_method_used}")
 
-    # Monta e normaliza tensor
-    tensor = np.stack([ch0, ch1, ch2, ch3, ch4], axis=-1)  # (n,n,n,5)
+    # Canais 5-31: elemento (5) + hidrofobicidade (1) + aromaticidade (1) +
+    # aminoácido (21) — MESMA função que pipeline_voxelize.process_pair usa
+    # do lado do treino (vox._site_extra_channel_weights/
+    # vox._voxelize_multi_weighted), chamada aqui via o módulo dinâmico
+    # `vox` — é a mesma garantia de paridade treino/inferência já usada
+    # para os canais 3-4 (ver nota acima): uma única implementação,
+    # chamada dos dois lados, em vez de duas versões que podem divergir.
+    extra_weights = vox._site_extra_channel_weights(
+        site_coords, site_elements, site_fragments, site_mol
+    )
+    extra_channels = vox._voxelize_multi_weighted(
+        gf, site_coords, extra_weights, sigma, (n, n, n)
+    )   # (28, n, n, n)
+
+    # Monta e normaliza tensor — ch0 (densidade agregada) é descartado, os
+    # 5 canais de elemento em extra_channels já cobrem essa informação
+    # separada por espécie. Ordem final em 3 blocos contíguos por grupo
+    # (ver pipeline_voxelize.SITE_CHANNEL_GROUPS/SiteEncoder) — os 4 canais
+    # originais entram NO MEIO de extra_channels, entre arom(6) e aa(7:28).
+    tensor = np.concatenate([
+        extra_channels[0:7],                      # elem(5)+hidrofob+arom
+        np.stack([ch1, ch2, ch3, ch4], axis=0),    # carga/MEP/doador/aceptor
+        extra_channels[7:28],                      # aminoácido (21)
+    ], axis=0)
+    tensor = np.moveaxis(tensor, 0, -1)   # (n,n,n,32)
+    assert tensor.shape[-1] == vox.N_SITE_CHANNELS, (
+        f"esperava {vox.N_SITE_CHANNELS} canais, montei {tensor.shape[-1]}")
+
     for c in range(tensor.shape[-1]):
         sl  = tensor[..., c]
         med = np.median(sl)
@@ -928,7 +954,7 @@ def load_model(
         )
 
     model = mod.LigandCVAE(
-        in_channels  = 5,
+        in_channels  = cfg.get("site_in_channels", 5),
         latent_dim   = cfg.get("latent_dim",   128),
         hidden_dim   = cfg.get("hidden_dim",   128),
         n_gnn_layers = cfg.get("n_gnn_layers",   3),

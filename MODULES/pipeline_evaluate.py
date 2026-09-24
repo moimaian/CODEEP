@@ -232,7 +232,7 @@ def evaluate_on_test(ckpt_dir: Path, tensor_dir: Path) -> dict:
     cfg  = ckpt.get("config", {})
 
     model = LigandCVAE(
-        in_channels  = 5,
+        in_channels  = cfg.get("site_in_channels", 5),
         latent_dim   = cfg.get("latent_dim",   256),
         hidden_dim   = cfg.get("hidden_dim",   256),
         n_gnn_layers = cfg.get("n_gnn_layers", 4),
@@ -512,7 +512,7 @@ def generate_ligands_for_site(
     cfg       = ckpt.get("config", {})
 
     model = LigandCVAE(
-        in_channels=5,
+        in_channels=cfg.get("site_in_channels", 5),
         latent_dim=cfg.get("latent_dim", 256),
         hidden_dim=cfg.get("hidden_dim", 256),
         n_gnn_layers=cfg.get("n_gnn_layers", 4),
@@ -612,7 +612,7 @@ def compute_active_units(
     latent_dim = cfg.get("latent_dim", 256)
 
     model = mod.LigandCVAE(
-        in_channels=5,
+        in_channels=cfg.get("site_in_channels", 5),
         latent_dim=latent_dim,
         hidden_dim=cfg.get("hidden_dim", 256),
         n_gnn_layers=cfg.get("n_gnn_layers", 4),

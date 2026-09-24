@@ -4,14 +4,24 @@ Pipeline - Etapa 4: Voxelização 3D + Propriedades Quânticas
 Lê os pares curados (binding_site.pdb + ligand.pdb) e gera:
 
   ┌─ Sítio de ligação ──────────────────────────────────────────────────────┐
-  │  Tensor 4D: (X, Y, Z, C_site) onde C_site = 5 canais                   │
-  │    Canal 0 — Densidade atômica (ocupância de vdW gaussiana)             │
-  │    Canal 1 — Carga parcial (Gasteiger) interpolada na grade             │
-  │    Canal 2 — MEP (Potencial Eletrostático Molecular) — Coulomb          │
-  │    Canal 3 — Campo doador de elétrons (HOMO-like, semi-empírico)        │
-  │    Canal 4 — Campo aceptor de elétrons (LUMO-like, semi-empírico)       │
+  │  Tensor 4D: (X, Y, Z, C_site) onde C_site = 32 canais                  │
+  │    [0:5]   — Elemento (C, N, O, S, metal de coordenação) — densidade    │
+  │              gaussiana SEPARADA por espécie, não somada — substitui o   │
+  │              antigo canal único de densidade agregada.                  │
+  │    [5]     — Hidrofobicidade (contribuição atômica de Crippen/RDKit)    │
+  │    [6]     — Aromaticidade (densidade sobre átomos de anel aromático)   │
+  │    [7:28]  — Identidade de aminoácido (20 canônicos + 1 "outro"), um    │
+  │              canal one-hot por resíduo, espalhado no espaço             │
+  │    [28]    — Carga parcial (Gasteiger) interpolada na grade             │
+  │    [29]    — MEP (Potencial Eletrostático Molecular) — Coulomb          │
+  │    [30]    — Campo doador de elétrons (HOMO-like, semi-empírico)        │
+  │    [31]    — Campo aceptor de elétrons (LUMO-like, semi-empírico)       │
   │                                                                           │
-  │  Os 5 canais são computados EXCLUSIVAMENTE a partir dos átomos do        │
+  │  Ordem e nomes exatos em SITE_CHANNEL_NAMES. [0:28] vêm de              │
+  │  _voxelize_multi_weighted (um kernel gaussiano genérico, N pesos por    │
+  │  átomo de uma vez — ver _site_extra_channel_weights para como cada      │
+  │  peso é montado); [28:32] são os 4 canais físico-químicos originais.    │
+  │  Todos os 32 são computados EXCLUSIVAMENTE a partir dos átomos do        │
   │  próprio bolso de ligação (binding_site.pdb) — nunca do ligante. Isso    │
   │  garante que o tensor do sítio seja idêntico em treino e em inferência   │
   │  (pipeline_generate.py constrói o mesmo tensor sem precisar de nenhum    │
@@ -114,7 +124,7 @@ from tqdm import tqdm
 # ── Importações condicionais ───────────────────────────────────────────────────
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem, rdPartialCharges, rdMolTransforms
+    from rdkit.Chem import AllChem, rdPartialCharges, rdMolTransforms, rdMolDescriptors
     from rdkit.Chem.rdchem import HybridizationType, BondType, ChiralType
     HAS_RDKIT = True
 except ImportError:
@@ -307,13 +317,10 @@ VOXEL_CONFIG = {
     #                           duas quando o cálculo real falha)
     "site_qm_method": "rhf_sto3g_fragments",
 
-    # Número de canais do tensor do sítio
-    "n_site_channels": 5,
-    # [0] densidade atômica vdW
-    # [1] carga parcial (Gasteiger)
-    # [2] MEP
-    # [3] densidade HOMO
-    # [4] densidade LUMO
+    # Número de canais do tensor do sítio — ver SITE_CHANNEL_NAMES para a
+    # lista completa e SITE_CHANNEL_GROUPS para os 3 blocos (elemento,
+    # físico-química, aminoácido).
+    "n_site_channels": 32,
 
     # ── ECFP4 como feature global do ligante (Opção A) ────────────────────────
     # Adiciona o Morgan Fingerprint (raio=2, 512 bits) ao grafo do ligante
@@ -393,6 +400,86 @@ HYBRID_TYPES = [HybridizationType.SP, HybridizationType.SP2,
                 HybridizationType.SP3, HybridizationType.OTHER] if HAS_RDKIT else []
 BOND_TYPES   = [BondType.SINGLE, BondType.DOUBLE,
                 BondType.TRIPLE, BondType.AROMATIC] if HAS_RDKIT else []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CANAIS 5-31 DO TENSOR DO SÍTIO — IDENTIDADE DE ELEMENTO, HIDROFOBICIDADE,
+# AROMATICIDADE, IDENTIDADE DE AMINOÁCIDO
+# ══════════════════════════════════════════════════════════════════════════════
+# Os 5 canais originais (densidade/carga/MEP/doador/aceptor) tratam o sítio
+# como um campo físico contínuo, mas nenhum registra QUE elemento ou QUE
+# aminoácido está em cada ponto — a densidade agregada (antigo canal 0)
+# soma qualquer átomo pesado, cega a identidade. Pesquisa dos quatro
+# programas de referência (LiGAN, DiffSBDD, Pocket2Mol, PocketFlow): três
+# dos quatro dão à rede só identidade categórica crua (elemento e,
+# principalmente, aminoácido) e deixam a rede aprender o resto — só o
+# LiGAN (o único voxel como o CODEEP) fabrica também hidrofobicidade e
+# aromaticidade, fundidas na própria tipagem do átomo (smina/AutoDock
+# Vina "XS" types).
+#
+# Uma propriedade CATEGÓRICA (este átomo é carbono; este resíduo é
+# triptofano) não vira contínua na grade — ela ganha um CANAL PRÓPRIO por
+# categoria, e é a PRESENÇA ESPACIAL daquela categoria que é contínua
+# (mesma lógica de uma imagem RGB: 3 canais de intensidade, não 1 canal
+# "categórico de cor"). Cada canal abaixo é só mais um vetor de peso por
+# átomo entrando no MESMO kernel gaussiano que já monta os canais 0-2
+# (ver _voxelize_multi_weighted, generalização de _voxelize_atoms para N
+# pesos simultâneos em vez de 1).
+
+# Elemento (5 canais) — grupos, não elementos crus: metais de coordenação
+# (Zn, Fe, Mg, Mn, Ca, Cu, Ni, Co) são raros em contagem de átomos mas
+# desproporcionalmente importantes em sítios catalíticos — merecem canal
+# próprio em vez de se perderem misturados num "outros". Ordem FIXA —
+# ambos os lados (treino/geração) dependem dela.
+SITE_ELEMENT_GROUPS = [
+    ("elem_C", {"C"}),
+    ("elem_N", {"N"}),
+    ("elem_O", {"O"}),
+    ("elem_S", {"S"}),
+    ("elem_metal", {"FE", "ZN", "MG", "MN", "CA", "CU", "NI", "CO"}),
+]
+
+# Aminoácido (21 canais) — 20 canônicos + 1 "outro" (resíduo modificado
+# que sobreviveu à curadoria, ou heteroátomo/água que entrou como
+# fragmento sem nome padrão). Mesmo padrão de bucket-de-escape já usado
+# em ATOM_TYPES ("OTHER") e replicado do próprio DiffSBDD
+# (amino_acid_dict + índice extra para o que não bate). Ordem alfabética,
+# fixa — igual ao motivo acima.
+AMINO_ACID_ORDER = [
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+]
+AMINO_ACID_INDEX = {aa: i for i, aa in enumerate(AMINO_ACID_ORDER)}
+N_AMINO_ACID_CHANNELS = len(AMINO_ACID_ORDER) + 1   # +1 = "outro"
+
+# Nomes finais dos 32 canais, NA ORDEM em que são empilhados (ver
+# process_pair/pdb_to_site_tensor) — usado só para o metadado gravado no
+# .npz (channels=...), não afeta o cálculo.
+# Ordem final do tensor, em TRÊS BLOCOS CONTÍGUOS por grupo semântico —
+# de propósito, para o SiteEncoder poder fatiar cada grupo com um slice
+# simples (ver GNNDecoder... não, ver SiteEncoder em pipeline_train.py) em
+# vez de precisar reunir índices espalhados:
+#   [0:5]   elemento            (substitui a densidade agregada de antes)
+#   [5:11]  físico-química (6)  — hidrofobicidade, aromaticidade + os 4
+#                                 canais originais (carga/MEP/doador/aceptor)
+#   [11:32] aminoácido (21)
+SITE_CHANNEL_NAMES = (
+    [name for name, _ in SITE_ELEMENT_GROUPS]                          # 5
+    + ["hydrophobic_crippen", "aromatic",
+       "gasteiger", "mep", "homo_density", "lumo_density"]             # 6
+    + [f"aa_{aa.lower()}" for aa in AMINO_ACID_ORDER] + ["aa_other"]   # 21
+)
+N_SITE_CHANNELS = len(SITE_CHANNEL_NAMES)   # 5+6+21 = 32
+
+# Fronteiras dos 3 grupos — mesma fonte usada por SITE_CHANNEL_NAMES acima
+# e por SiteEncoder (pipeline_train.py) para fatiar o tensor de entrada.
+# Ter isso como constante, em vez de números soltos nos dois arquivos,
+# evita os dois lados divergirem se a composição de algum grupo mudar.
+SITE_CHANNEL_GROUPS = {
+    "elemento":        (0, 5),
+    "fisico_quimica":  (5, 11),
+    "aminoacido":      (11, 32),
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -516,6 +603,130 @@ def _voxelize_atoms(
     return (density.reshape(grid_shape).astype(np.float32),
             charge.reshape(grid_shape).astype(np.float32),
             mep.reshape(grid_shape).astype(np.float32))
+
+
+def _voxelize_multi_weighted(
+    grid_flat: np.ndarray,          # (N_vox, 3)
+    atom_coords: np.ndarray,        # (N_atoms, 3)
+    weights_multi: np.ndarray,      # (N_atoms, K) — K pesos por átomo
+    sigma: float,
+    grid_shape: tuple,
+    batch: int = 500 if HAS_CUPY else 100,
+) -> np.ndarray:
+    """Generaliza _voxelize_atoms para K campos gaussianos de uma vez, em
+    vez de 1 (densidade) ou 2 (densidade+carga) fixos.
+
+    Usada pelos canais 5-31 (elemento, hidrofobicidade, aromaticidade,
+    aminoácido — ver _site_extra_channel_weights): a distância entre cada
+    átomo e cada voxel só precisa ser calculada UMA VEZ (`gauss`, a parte
+    cara — uma matriz N_atoms×N_vox de exponenciais); os 28 pesos
+    diferentes (5 elemento + 1 hidrofobicidade + 1 aromaticidade + 21
+    aminoácido) reaproveitam essa MESMA matriz, só trocando o vetor de
+    peso que a multiplica. Calcular cada canal com uma chamada separada a
+    _voxelize_atoms recalcularia `gauss` 28 vezes à toa — o termo mais
+    caro da função inteira.
+
+    Retorna (K, *grid_shape) — um campo por coluna de weights_multi, na
+    mesma ordem.
+    """
+    xp        = _xp()
+    BATCH     = batch
+    inv_2sig2 = 1.0 / (2.0 * sigma**2)
+
+    gf = xp.asarray(grid_flat,   dtype=xp.float32)     # (N_vox, 3)
+    ac = xp.asarray(atom_coords, dtype=xp.float32)      # (N_atoms, 3)
+    wm = xp.asarray(weights_multi, dtype=xp.float32)    # (N_atoms, K)
+
+    N_vox   = gf.shape[0]
+    N_atoms = ac.shape[0]
+    K       = wm.shape[1]
+
+    fields = xp.zeros((N_vox, K), dtype=xp.float32)
+
+    for i in range(0, N_atoms, BATCH):
+        ac_b = ac[i:i+BATCH]              # (b, 3)
+        wm_b = wm[i:i+BATCH]              # (b, K)
+
+        diff  = gf[None, :, :] - ac_b[:, None, :]   # (b, N_vox, 3)
+        dist2 = (diff * diff).sum(axis=-1)           # (b, N_vox)
+        gauss = xp.exp(-dist2 * inv_2sig2)           # (b, N_vox)
+
+        # (b, N_vox)ᵀ · (b, K) → (N_vox, K) — mesma gaussiana, K pesos
+        fields += xp.einsum('bv,bk->vk', gauss, wm_b)
+
+    if HAS_CUPY and xp is cp:
+        fields = cp.asnumpy(fields)
+    else:
+        fields = np.asarray(fields)
+
+    # (N_vox, K) → (K, *grid_shape)
+    return np.moveaxis(fields.reshape(grid_shape + (K,)), -1, 0).astype(np.float32)
+
+
+def _site_extra_channel_weights(
+    site_coords: np.ndarray,
+    site_elements: list,
+    site_fragments: list,
+    site_mol: "Chem.Mol | None",
+) -> np.ndarray:
+    """Monta a matriz de pesos (N_átomos, 28) para os canais 5-31: 5 de
+    elemento, 1 de hidrofobicidade, 1 de aromaticidade, 21 de aminoácido —
+    ver SITE_ELEMENT_GROUPS/AMINO_ACID_ORDER/SITE_CHANNEL_NAMES.
+
+    Reaproveita estruturas que ESSAS FUNÇÕES CHAMADORAS já calculam para
+    outros fins — nenhuma leitura de arquivo nova:
+      site_fragments — {"resname","start","end","mol"} por resíduo (ver
+          protonate_site_residues) já existe para a etapa de QM
+          fragmentado; start/end mapeiam direto para linhas de
+          site_coords, dando a identidade de aminoácido sem reprocessar
+          nada.
+      site_mol — Mol combinado (ver build_combined_site_mol), já
+          construído para a minimização/checagem de colisão; sua
+          aromaticidade percebida (GetIsAromatic()) é reaproveitada aqui.
+
+    Elemento (0:5) é pura função do símbolo — independe de fragmento, por
+    isso funciona mesmo com protonate_site=False (site_fragments=[]).
+    Hidrofobicidade/aromaticidade/aminoácido (5:28) dependem de
+    site_fragments/site_mol e ficam zeradas (sinal neutro, não erro) se
+    esses não estiverem disponíveis.
+    """
+    n = len(site_coords)
+    n_cols = len(SITE_ELEMENT_GROUPS) + 2 + N_AMINO_ACID_CHANNELS
+    W = np.zeros((n, n_cols), dtype=np.float32)
+
+    # ── Elemento (5) ────────────────────────────────────────────────────
+    elems_upper = [str(e).upper() for e in site_elements]
+    for k, (_name, grupo) in enumerate(SITE_ELEMENT_GROUPS):
+        W[:, k] = [1.0 if e in grupo else 0.0 for e in elems_upper]
+
+    idx_hydro = len(SITE_ELEMENT_GROUPS)
+    idx_arom  = idx_hydro + 1
+    idx_aa0   = idx_arom + 1
+
+    # ── Aromaticidade (1) — do site_mol combinado, mesma ordem de átomos
+    if site_mol is not None and site_mol.GetNumAtoms() == n:
+        for i, atom in enumerate(site_mol.GetAtoms()):
+            if atom.GetIsAromatic():
+                W[i, idx_arom] = 1.0
+
+    # ── Hidrofobicidade (1) + Aminoácido (21) — por resíduo/fragmento ───
+    for frag in site_fragments:
+        start, end = frag.get("start"), frag.get("end")
+        if start is None or end is None or end <= start:
+            continue
+        resname = str(frag.get("resname", "")).upper()
+        aa_idx = AMINO_ACID_INDEX.get(resname, len(AMINO_ACID_ORDER))  # "outro"
+        W[start:end, idx_aa0 + aa_idx] = 1.0
+
+        mol = frag.get("mol")
+        if mol is not None and mol.GetNumAtoms() == (end - start):
+            try:
+                contribs = rdMolDescriptors._CalcCrippenContribs(mol)
+                W[start:end, idx_hydro] = [float(c[0]) for c in contribs]
+            except Exception:
+                pass   # fica 0.0 (neutro) — não derruba o par inteiro
+
+    return W
 
 
 def channel_atomic_density(
@@ -2196,8 +2407,43 @@ def process_pair(
         sigma_da, (n, n, n), config,
     )
 
+    # Canais 5-31: elemento (5) + hidrofobicidade (1) + aromaticidade (1) +
+    # aminoácido (21) — ver SITE_CHANNEL_NAMES/_site_extra_channel_weights.
+    # site_mol é o mesmo Mol combinado (ligações intra-resíduo reais
+    # preservadas) que pipeline_generate já constrói do lado da geração
+    # para minimização/colisão — construído aqui também, do lado do
+    # treino, só para a aromaticidade percebida pelo RDKit (GetIsAromatic).
+    site_fragments_for_mol = site_fragments if site_fragments else [
+        {"resname": "UNK", "start": 0, "end": len(site_coords), "mol": None}
+    ]
+    site_mol, _site_is_backbone = build_combined_site_mol(
+        site_coords, site_elements, site_fragments_for_mol
+    )
+    extra_weights = _site_extra_channel_weights(
+        site_coords, site_elements, site_fragments, site_mol
+    )
+    extra_channels = _voxelize_multi_weighted(
+        gf, site_coords, extra_weights, sigma, (n, n, n),
+        batch=config.get("vox_batch", 500 if HAS_CUPY else 100),
+    )   # (28, n, n, n)
+
     # ── 5. Normalização por canal (z-score robusto) ───────────────────────────
-    tensor = np.stack([ch0, ch1, ch2, ch3, ch4], axis=-1)  # (n,n,n,5)
+    # ch0 (densidade agregada) é descartado aqui — os 5 canais de elemento
+    # em extra_channels já cobrem essa informação, separada por espécie em
+    # vez de somada. ch0 ainda precisa ser CALCULADO (sai de graça da mesma
+    # chamada a _voxelize_atoms que produz ch1/ch2), só não entra no tensor
+    # final. extra_channels é [elem(5), hidrofob(1), arom(1), aa(21)] — os
+    # 4 canais originais (carga/MEP/doador/aceptor) entram NO MEIO, entre
+    # arom e aa, para que os 3 grupos fiquem contíguos no tensor final
+    # (ver SITE_CHANNEL_GROUPS/SiteEncoder).
+    tensor = np.concatenate([
+        extra_channels[0:7],                                # elem(5)+hidrofob+arom
+        np.stack([ch1, ch2, ch3, ch4], axis=0),              # carga/MEP/doador/aceptor
+        extra_channels[7:28],                                # aminoácido (21)
+    ], axis=0)                                                # (32, n,n,n)
+    tensor = np.moveaxis(tensor, 0, -1)   # (n,n,n,32)
+    assert tensor.shape[-1] == N_SITE_CHANNELS, (
+        f"esperava {N_SITE_CHANNELS} canais, montei {tensor.shape[-1]}")
 
     for c in range(tensor.shape[-1]):
         sl  = tensor[..., c]
@@ -2219,11 +2465,10 @@ def process_pair(
     # ── 6. Salva tensor do sítio ──────────────────────────────────────────────
     np.savez_compressed(
         out_dir / "site_tensor.npz",
-        tensor     = tensor,          # (n,n,n,5) float32
+        tensor     = tensor,          # (n,n,n,32) float32
         origin     = origin,
         voxel_size = np.array([voxel_size]),
-        channels   = np.array(["density_vdw", "gasteiger", "mep",
-                                "homo_density", "lumo_density"]),
+        channels   = np.array(SITE_CHANNEL_NAMES),
     )
 
     # ── 7. Grafo molecular do ligante ─────────────────────────────────────────

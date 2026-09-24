@@ -410,28 +410,78 @@ class ResBlock3D(nn.Module):
         return self.act(x + self.net(x))
 
 
+#: Composição dos 32 canais do tensor do sítio em 3 grupos CONTÍGUOS —
+#: MESMA composição de pipeline_voxelize.SITE_CHANNEL_GROUPS, duplicada
+#: aqui (padrão já usado no projeto para constantes pequenas e estáveis
+#: que dois módulos precisam conhecer sem se importarem diretamente, ver
+#: ATOM_TYPES_NAMES/MAX_VALENCE replicados em pipeline_generate.py).
+#:   elemento (5)        — C, N, O, S, metal de coordenação
+#:   físico-química (6)  — hidrofobicidade, aromaticidade, carga, MEP,
+#:                          doador, aceptor
+#:   aminoácido (21)      — 20 canônicos + "outro"
+SITE_N_ELEM      = 5
+SITE_N_PHYSCHEM  = 6
+SITE_N_AA        = 21
+SITE_IN_CHANNELS = SITE_N_ELEM + SITE_N_PHYSCHEM + SITE_N_AA   # 32
+
+
 class SiteEncoder(nn.Module):
     """Encoder CNN 3D que mapeia tensor (C,X,Y,Z) → (z_mean, z_logvar).
 
-    Arquitetura:
-        32³×5  →  [Conv+Pool] →  16³×32
-                →  [Conv+Pool] →   8³×64
-                →  [Conv+Pool] →   4³×128
-                →  [Flatten]   →  8192
-                →  [MLP]       →  z_mean (D), z_logvar (D)
+    Arquitetura (stem agrupado + tronco preservado — ver ARCH_VERSION 5):
+        entrada: 32³×32, em 3 grupos CONTÍGUOS de canais (elemento,
+        físico-química, aminoácido — ver SITE_N_ELEM/SITE_N_PHYSCHEM/
+        SITE_N_AA). Cada grupo passa por um "stem" (Conv3d+BatchNorm+
+        GELU) próprio, comprimindo aquele grupo a um número menor de
+        mapas ANTES de juntar com os outros — em vez de despejar os 32
+        canais crus, com estatística bem diferente entre si (aminoácido é
+        quase-binário e esparso; físico-química é contínuo e suave),
+        direto numa única convolução inicial:
+
+            elemento (5)        → stem → 12 ┐
+            físico-química (6)  → stem → 16 ├→ concat (40) → tronco
+            aminoácido (21)     → stem → 12 ┘
+
+        O tronco abaixo é o MESMO de antes dos 27 canais novos — só a
+        entrada cresceu (era in_channels bruto, agora é a saída
+        concatenada dos 3 stems):
+            32³×40 →  [Conv+Pool] →  16³×16
+                   →  [Conv+Pool] →   8³×32
+                   →  [Conv+Pool] →   4³×64
+                   →  [Flatten]   →  4096
+                   →  [MLP]       →  z_mean (D), z_logvar (D)
     """
 
-    def __init__(self, in_channels: int = 5, latent_dim: int = 256,
-                 dropout: float = 0.2):
+    def __init__(self, in_channels: int = SITE_IN_CHANNELS, latent_dim: int = 256,
+                 dropout: float = 0.2, n_elem: int = SITE_N_ELEM,
+                 n_physchem: int = SITE_N_PHYSCHEM, n_aa: int = SITE_N_AA):
         super().__init__()
         self.latent_dim = latent_dim
+        self.n_elem, self.n_physchem, self.n_aa = n_elem, n_physchem, n_aa
+        if n_elem + n_physchem + n_aa != in_channels:
+            raise ValueError(
+                f"grupos do stem ({n_elem}+{n_physchem}+{n_aa}="
+                f"{n_elem + n_physchem + n_aa}) não somam in_channels={in_channels} "
+                "— ver SITE_CHANNEL_GROUPS em pipeline_voxelize.py."
+            )
+
+        def _stem(c_in, c_out):
+            return nn.Sequential(
+                nn.Conv3d(c_in, c_out, kernel_size=3, padding=1),
+                nn.BatchNorm3d(c_out), nn.GELU(),
+            )
+
+        self.stem_elem     = _stem(n_elem, 12)
+        self.stem_physchem = _stem(n_physchem, 16)
+        self.stem_aa       = _stem(n_aa, 12)
+        stem_out_dim = 12 + 16 + 12   # 40
 
         # Arquitetura reduzida para datasets pequenos (< 1000 pares).
         # Removido bloco 4 e reduzidos canais: menos parâmetros = menos overfitting.
         # Capacidade original: ~4.2M params → reduzida: ~900k params
         self.encoder = nn.Sequential(
             # Bloco 1: 32 → 16
-            nn.Conv3d(in_channels, 16, kernel_size=3, padding=1),
+            nn.Conv3d(stem_out_dim, 16, kernel_size=3, padding=1),
             nn.BatchNorm3d(16), nn.GELU(),
             ResBlock3D(16, dropout),
             nn.MaxPool3d(2),
@@ -468,10 +518,23 @@ class SiteEncoder(nn.Module):
                 voxel_sizes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x          : (B, C, X, Y, Z) — tensor do sítio
+            x          : (B, C, X, Y, Z) — tensor do sítio, C=32 nos 3
+                grupos contíguos [0:n_elem], [n_elem:n_elem+n_physchem],
+                [n_elem+n_physchem:] — MESMA ordem de
+                pipeline_voxelize.SITE_CHANNEL_NAMES.
             voxel_sizes : (B,) — tamanho do voxel em Å para cada sítio do batch
         """
-        h = self.encoder(x)
+        x_elem     = x[:, :self.n_elem]
+        x_physchem = x[:, self.n_elem:self.n_elem + self.n_physchem]
+        x_aa       = x[:, self.n_elem + self.n_physchem:]
+
+        h = torch.cat([
+            self.stem_elem(x_elem),
+            self.stem_physchem(x_physchem),
+            self.stem_aa(x_aa),
+        ], dim=1)
+
+        h = self.encoder(h)
         h = h.view(h.size(0), -1)                        # (B, 4096)
 
         # Compatibilidade retroativa: checkpoints antigos foram treinados
@@ -567,11 +630,36 @@ _BOND_ORDER = torch.tensor([1.0, 2.0, 3.0, 1.5], dtype=torch.float32)
 #:       focal, valência livre)=0,879 (−9%). A correção direta do modo de
 #:       falha medido seria treinar com amostragem programada (scheduled
 #:       sampling), não implementada.
-#: Checkpoints da versão 1 são estruturalmente incompatíveis: os mesmos
-#: campos do vetor de features têm outro significado, então carregá-los
-#: com strict=False produziria um modelo silenciosamente errado. Ver
+#:   5 — SiteEncoder deixa de receber o tensor do sítio cru (5 canais:
+#:       densidade agregada, carga, MEP, doador, aceptor) e passa a
+#:       receber 32 canais em 3 grupos contíguos — elemento (5: C/N/O/S/
+#:       metal, densidade SEPARADA por espécie em vez de agregada),
+#:       físico-química (6: hidrofobicidade de Crippen, aromaticidade,
+#:       carga, MEP, doador, aceptor) e identidade de aminoácido (21: 20
+#:       canônicos + "outro"). Motivo: nenhuma versão anterior registrava
+#:       QUE elemento ou QUE aminoácido está em cada ponto do sítio — só
+#:       um campo físico contínuo cego a identidade. Pesquisa dos quatro
+#:       programas de referência (LiGAN, DiffSBDD, Pocket2Mol,
+#:       PocketFlow): três dão à rede identidade categórica crua
+#:       (elemento e, principalmente, aminoácido) e deixam a rede
+#:       aprender o resto; só o LiGAN (o único voxel como o CODEEP)
+#:       fabrica hidrofobicidade/aromaticidade — fundidas na própria
+#:       tipagem do átomo. Cada grupo passa por um "stem" (Conv3d+
+#:       BatchNorm+GELU) próprio ANTES de juntar com os outros — em vez
+#:       de despejar os 32 canais crus, com estatística bem diferente
+#:       entre si (aminoácido é quase-binário e esparso; físico-química é
+#:       contínuo e suave), direto numa única convolução inicial. O
+#:       tronco (3 blocos Conv+ResBlock+Pool) é o MESMO de antes, só
+#:       recebendo mais canais na entrada (ver SiteEncoder). Muda a FORMA
+#:       dos pesos do encoder (novos submódulos stem_elem/stem_physchem/
+#:       stem_aa) — checkpoints anteriores não têm esses módulos, não há
+#:       como carregar parcialmente.
+#: Checkpoints de versões anteriores são estruturalmente incompatíveis:
+#: os mesmos campos do vetor de features (ou, na v5, do tensor do sítio)
+#: têm outro significado ou outra forma, então carregá-los com
+#: strict=False produziria um modelo silenciosamente errado. Ver
 #: pipeline_generate.load_model.
-ARCH_VERSION = 4
+ARCH_VERSION = 5
 
 #: Nº de componentes gaussianas da MDN de posição (Pocket2Mol usa a mesma
 #: ideia com n_component configurável em models/position.py).
@@ -1446,7 +1534,7 @@ class LigandCVAE(nn.Module):
 
     def __init__(
         self,
-        in_channels:  int   = 5,
+        in_channels:  int   = SITE_IN_CHANNELS,
         latent_dim:   int   = 256,
         hidden_dim:   int   = 256,
         n_atom_types: int   = 13,
@@ -2579,7 +2667,7 @@ def train(
                      f"hidden={hidden_dim} gnn_layers={n_gnn_layers}")
 
     model = LigandCVAE(
-        in_channels=5, latent_dim=latent_dim, hidden_dim=hidden_dim,
+        in_channels=SITE_IN_CHANNELS, latent_dim=latent_dim, hidden_dim=hidden_dim,
         n_gnn_layers=n_gnn_layers, dropout=dropout,
     ).to(device)
 
@@ -2696,6 +2784,7 @@ def train(
                 "history":       history,
                 "config": {
                     "arch_version":     ARCH_VERSION,
+                    "site_in_channels": SITE_IN_CHANNELS,
                     "bond_stats":       bond_stats_snapshot,
                     "charge_stats":     charge_stats_snapshot,
                     "scheduled_sampling": {"max": ss_max, "start": ss_start,

@@ -754,7 +754,10 @@ def _count_params(latent_dim: int, hidden_dim: int, n_gnn_layers: int) -> int:
 
     with torch.no_grad():
         m = LigandCVAE(
-            in_channels=5, latent_dim=latent_dim, hidden_dim=hidden_dim,
+            # in_channels não passado — usa o default da classe
+            # (SITE_IN_CHANNELS), sempre em dia com o encoder atual sem
+            # precisar duplicar o número aqui.
+            latent_dim=latent_dim, hidden_dim=hidden_dim,
             n_gnn_layers=n_gnn_layers, dropout=0.0,
         )
         n = sum(p.numel() for p in m.parameters())
