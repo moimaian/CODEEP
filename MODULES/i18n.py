@@ -984,6 +984,33 @@ _TEXTOS = {
     },
     "s5_lbl_patience": {"en": "Patience:", "pt": "Paciência:"},
     "s5_lbl_device": {"en": "Device:", "pt": "Dispositivo:"},
+    "s45_tooltip_device": {
+        "en": "The list is built from the GPUs actually detected at startup, "
+              "so an index that does not exist is never offered.\n\n"
+              "Detected: {dispositivos}\n\n"
+              "  cuda — the current device. Most portable option: it keeps "
+              "working if the project moves to another machine or runs under "
+              "CUDA_VISIBLE_DEVICES, which remaps the indices.\n"
+              "  cuda:N — pins that specific GPU. Only offered when there is "
+              "more than one, since with a single visible GPU 'cuda' and "
+              "'cuda:0' are the same device. Useful to train on one card and "
+              "leave the other free for generation.\n"
+              "  cpu — no GPU. Viable for a quick test, but a full training "
+              "run is orders of magnitude slower.",
+        "pt": "A lista é montada a partir das GPUs realmente detectadas na "
+              "inicialização, então um índice que não existe nunca é "
+              "oferecido.\n\n"
+              "Detectado: {dispositivos}\n\n"
+              "  cuda — o dispositivo corrente. É a opção mais portátil: "
+              "continua válida se o projeto mudar de máquina ou rodar sob "
+              "CUDA_VISIBLE_DEVICES, que remapeia os índices.\n"
+              "  cuda:N — fixa aquela GPU específica. Só aparece quando há "
+              "mais de uma, porque com uma única GPU visível 'cuda' e "
+              "'cuda:0' são o MESMO dispositivo. Útil para treinar numa placa "
+              "e deixar a outra livre para a geração.\n"
+              "  cpu — sem GPU. Serve para um teste rápido, mas um treino "
+              "completo fica ordens de magnitude mais lento.",
+    },
     "s5_lbl_resume": {"en": "Resume from:", "pt": "Retomar de:"},
     "s5_lbl_ckpt_out": {"en": "Save ckpt to:", "pt": "Salvar checkpoint em:"},
     "s5_ph_resume": {

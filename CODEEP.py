@@ -299,6 +299,51 @@ except ImportError:
     _TORCH_OK       = False
     _DEVICE_DEFAULT = "cpu"
 
+
+def _detectar_dispositivos() -> "tuple[list[str], list[str]]":
+    """Monta a lista de dispositivos para os combos das Etapas 4 e 5 a partir
+    das GPUs REALMENTE detectadas, e os nomes para o tooltip.
+
+    Antes a lista era fixa — ["cuda", "cpu", "cuda:0", "cuda:1"] — então numa
+    máquina de uma GPU o "cuda:1" aparecia mesmo sem existir, e escolhê-lo
+    derrubava o treino com "CUDA error: invalid device ordinal" no .to(device)
+    (pipeline_train, logo antes da primeira época).
+
+    Regras:
+      • sem GPU            → ["cpu"]
+      • exatamente 1 GPU   → ["cuda", "cpu"]; o índice explícito seria
+                             redundante, porque com uma só GPU visível
+                             "cuda" e "cuda:0" são o MESMO dispositivo
+      • 2 ou mais GPUs     → ["cuda", "cuda:0", ... , "cpu"]; aí o índice
+                             passa a ter uso real (fixar em qual placa
+                             treinar, deixando a outra livre)
+
+    "cuda" vem primeiro de propósito: é o mais portátil — resolve para o
+    dispositivo corrente e continua válido se o projeto mudar de máquina ou
+    rodar sob CUDA_VISIBLE_DEVICES, que remapeia os índices.
+    """
+    nomes: "list[str]" = []
+    n = 0
+    if _TORCH_OK:
+        try:
+            if torch.cuda.is_available():
+                n = torch.cuda.device_count()
+                for i in range(n):
+                    try:
+                        nomes.append(f"cuda:{i} — {torch.cuda.get_device_name(i)}")
+                    except Exception:
+                        nomes.append(f"cuda:{i}")
+        except Exception:
+            n = 0
+    if n == 0:
+        return ["cpu"], nomes
+    if n == 1:
+        return ["cuda", "cpu"], nomes
+    return ["cuda"] + [f"cuda:{i}" for i in range(n)] + ["cpu"], nomes
+
+
+_DEVICE_OPTIONS, _DEVICE_NAMES = _detectar_dispositivos()
+
 # CuPy: NumPy acelerado por CUDA, usado pela voxelização (pipeline_voxelize.py).
 # NOTA: CuPy 14 tem um bug nos headers CCCL que causa NVRTC_ERROR_COMPILATION
 # em kernels de reduction via CUB (.sum(axis=0), matmul, tensordot). Porém
@@ -595,57 +640,135 @@ _SS_LABEL_SECTION = "font-size:11pt; font-weight:bold; color:#C9D1D9;"
 _SS_GROUPBOX_NO_BG = "QGroupBox { background: #0D1B2A; }"
 
 
-class CollapsibleGroupBox(QGroupBox):
-    """QGroupBox colapsável ao clicar no título ou na borda."""
+# Referência à classe ORIGINAL do Qt, preservada antes do rebind abaixo:
+# CollapsibleGroupBox precisa chamar os métodos da classe-base de título
+# (setTitle/title) sem recursão, e o rebind troca o nome QGroupBox.
+_QtGroupBox = QGroupBox
+
+
+class CollapsibleGroupBox(_QtGroupBox):
+    """QGroupBox que colapsa/expande ao clicar no título. Mesma implementação
+    do CODRUG, portada para cá para os dois programas se comportarem igual.
+
+    Todo QGroupBox do CODEEP é desta classe (ver o rebind logo abaixo), então
+    qualquer grupo com título pode iniciar colapsado via set_collapsed(True) —
+    o que reduz a altura que a janela precisa. Grupos SEM título não colapsam
+    (não há onde clicar, e não haveria indicação do estado).
+
+    Ao colapsar, esconde os widgets FILHOS DIRETOS do grupo (os aninhados
+    somem junto, preservando o próprio estado de visibilidade) e fixa a
+    altura na do título; ao expandir, reexibe apenas os que estavam visíveis
+    antes — assim um campo que o código havia escondido de propósito não
+    reaparece — e restaura a altura mínima/máxima original, de modo que
+    grupos com tamanho fixo voltam ao tamanho certo. Um marcador (seta) no
+    título indica o estado.
+
+    Sobre a versão anterior desta classe no CODEEP: ela percorria o LAYOUT
+    em vez dos filhos diretos (o que reexibia widgets escondidos de
+    propósito), não guardava a altura original (grupos com setFixedWidth/
+    Size voltavam errados), não tinha indicação visual do estado e aceitava
+    clique nas bordas — o que disparava colapsos acidentais ao tentar
+    redimensionar.
+    """
+
+    _ARROW_OPEN = "▾ "
+    _ARROW_CLOSED = "▸ "
+
+    # Emitido só quando o USUÁRIO colapsa/expande clicando no título (não em
+    # set_collapsed chamado pelo código); o argumento é o novo estado.
+    userToggled = pyqtSignal(bool)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._collapsed = False
+        self._base_title = _QtGroupBox.title(self)
+        self._restore_visible = []
+        self._restore_min_h = 0
+        self._restore_max_h = 16777215
+        self._refresh_title()
+
+    # ── título (o texto "limpo" continua acessível via title()) ───────────
+    def setTitle(self, title):
+        self._base_title = str(title or "")
+        self._refresh_title()
+
+    def title(self):
+        return self._base_title
+
+    def _refresh_title(self):
+        if not self._base_title:
+            _QtGroupBox.setTitle(self, "")
+            return
+        arrow = self._ARROW_CLOSED if self._collapsed else self._ARROW_OPEN
+        _QtGroupBox.setTitle(self, arrow + self._base_title)
+
+    # ── colapso ───────────────────────────────────────────────────────────
+    def is_collapsed(self):
+        return self._collapsed
+
+    def _direct_child_widgets(self):
+        return [c for c in self.children()
+                if isinstance(c, QWidget) and not c.isWindow()]
 
     def _collapsed_height(self):
         return max(28, self.fontMetrics().height() + 14)
 
-    def _set_layout_widgets_visible(self, layout, visible):
-        if layout is None:
-            return
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-            widget = item.widget()
-            if widget is not None:
-                widget.setVisible(visible)
-            child_layout = item.layout()
-            if child_layout is not None:
-                self._set_layout_widgets_visible(child_layout, visible)
-
     def set_collapsed(self, collapsed):
-        self._collapsed = bool(collapsed)
-        self._set_layout_widgets_visible(self.layout(), not self._collapsed)
-        if self._collapsed:
-            h = self._collapsed_height()
-            self.setMinimumHeight(h)
-            self.setMaximumHeight(h)
+        collapsed = bool(collapsed) and bool(self._base_title)
+        if collapsed == self._collapsed:
+            return
+        if collapsed:
+            children = self._direct_child_widgets()
+            # Só conta como "escondido de propósito" quem recebeu
+            # hide()/setVisible(False) explícito antes do colapso.
+            self._restore_visible = [
+                w for w in children
+                if not (w.isHidden()
+                        and w.testAttribute(Qt.WA_WState_ExplicitShowHide))
+            ]
+            self._restore_min_h = self.minimumHeight()
+            self._restore_max_h = self.maximumHeight()
+            for w in children:
+                w.setVisible(False)
+            self._collapsed = True
+            self.setFixedHeight(self._collapsed_height())
         else:
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
-            self.adjustSize()
-
-    def _is_toggle_hit(self, pos):
-        title_h = self._collapsed_height()
-        border = 6
-        if pos.y() <= title_h:
-            return True
-        return (
-            pos.x() <= border
-            or pos.x() >= self.width() - border
-            or pos.y() >= self.height() - border
-        )
+            self._collapsed = False
+            self.setMinimumHeight(self._restore_min_h)
+            self.setMaximumHeight(self._restore_max_h)
+            for w in self._restore_visible:
+                w.setVisible(True)
+            self._restore_visible = []
+        self._refresh_title()
+        self.updateGeometry()
+        # updateGeometry() sozinho não basta ao EXPANDIR: enquanto colapsado o
+        # grupo fica com setFixedHeight, e devolver minimumHeight/maximumHeight
+        # não faz o layout do pai recalcular a fatia dele — o grupo continuaria
+        # desenhado com a altura do título. Acontece em layouts que não
+        # reavaliam por conta própria (observado no grupo de largura fixa da
+        # Exploração de Dados: 480 → 31 → 31). Invalidar e reativar o layout do
+        # pai resolve, e é inofensivo no sentido do colapso.
+        pai = self.parentWidget()
+        if pai is not None and pai.layout() is not None:
+            pai.layout().invalidate()
+            pai.layout().activate()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self._is_toggle_hit(event.pos()):
+        if (event.button() == Qt.LeftButton and self._base_title
+                and event.pos().y() <= self._collapsed_height()):
             self.set_collapsed(not self._collapsed)
             event.accept()
+            self.userToggled.emit(self._collapsed)
             return
         super().mousePressEvent(event)
+
+
+# Todo QGroupBox criado daqui em diante no CODEEP é colapsável — mesma
+# estratégia do CODRUG. Como os grupos são construídos dentro de métodos
+# (resolvidos em tempo de chamada), isso alcança TODOS os grupos da
+# interface: Etapa 1 (Raiz/Job/Busca/Caminhos), Etapa 2 (Coleta, Curadoria,
+# Exploração), Etapa 4 (Orçamento, Espaço de busca) e os da aba Início.
+QGroupBox = CollapsibleGroupBox
 
 
 # ==========================================================================================================================================
@@ -1599,6 +1722,23 @@ class MainWindow(QMainWindow):
         largura = max(header.sizeHint().width(),
                      middle.sizeHint().width(),
                      footer.sizeHint().width())
+
+        # ── Limite pela TELA ──────────────────────────────────────────────
+        # setMinimumSize é rígido: um mínimo maior que o monitor deixaria a
+        # janela intransportável — maior que a tela e sem poder encolher.
+        # Com a Home em três colunas (CPU/GPU/Armazenamento) o mínimo natural
+        # passa de 1400×1100, o que não cabe num notebook 1366×768. Quando
+        # não couber, o mínimo vira a área útil da tela e a Home volta a
+        # rolar no seu QScrollArea — que existe exatamente para isso.
+        tela = self.screen() or QGuiApplication.primaryScreen()
+        if tela is not None:
+            disp = tela.availableGeometry()
+            # availableGeometry() já desconta barras de tarefas, mas não a
+            # MOLDURA da janela (barra de título + bordas), que fica fora da
+            # área cliente a que setMinimumSize se aplica — daí a folga.
+            if disp.width() > 0 and disp.height() > 0:
+                largura = min(largura, max(640, disp.width() - 20))
+                altura = min(altura, max(480, disp.height() - 60))
         return largura, altura
 
     def _center_on_screen(self):
@@ -2611,6 +2751,14 @@ class MainWindow(QMainWindow):
             pass
         return rows
 
+    @staticmethod
+    def _texto_dispositivos() -> str:
+        """Linha com as GPUs detectadas, para o tooltip dos combos de
+        dispositivo (ver _detectar_dispositivos)."""
+        if not _DEVICE_NAMES:
+            return "—"
+        return "; ".join(_DEVICE_NAMES)
+
     def _hw_profile(self) -> dict:
         """Mede o hardware UMA VEZ e devolve os números crus que a heurística
         de ajuste consome (ver _hw_recommendations).
@@ -2885,6 +3033,15 @@ class MainWindow(QMainWindow):
         if getattr(self, "lbl_hw_autotune", None) is not None:
             self.lbl_hw_autotune.setText(self._hw_autotune_resumo)
             self.lbl_hw_autotune.setVisible(bool(self._hw_autotune_resumo))
+            # O checkbox está no rodapé fixo e o resumo no miolo rolável:
+            # sem isto, marcar a caixa não mostraria resposta nenhuma se a
+            # aba estivesse rolada para baixo.
+            scroll = getattr(self, "_home_scroll", None)
+            if ligado and scroll is not None:
+                try:
+                    scroll.ensureWidgetVisible(self.lbl_hw_autotune)
+                except Exception:
+                    pass
 
     @staticmethod
     def _sw_versions() -> list[tuple[str, str]]:
@@ -3112,16 +3269,12 @@ class MainWindow(QMainWindow):
 
         lay.addLayout(hw_row)
 
-        # ── Ajuste de parâmetros ao hardware ──────────────────────────────
-        # O diagnóstico acima só informa; este checkbox age. Fica aqui, logo
-        # abaixo dos três quadros, porque é a conclusão prática deles.
-        self.chk_hw_autotune = QCheckBox()
-        self._tr("home_chk_hw_autotune", self.chk_hw_autotune.setText)
-        self._tr("home_tooltip_hw_autotune", self.chk_hw_autotune.setToolTip)
-        self.chk_hw_autotune.setStyleSheet("font-size:9pt;")
-        self.chk_hw_autotune.toggled.connect(self._hw_apply_autotune)
-        lay.addWidget(self.chk_hw_autotune)
-
+        # ── Resumo do ajuste por hardware ─────────────────────────────────
+        # O checkbox que dispara o ajuste fica no rodapé, ao lado do botão
+        # "Ver Terminal"; o RESUMO fica aqui, logo abaixo dos três quadros,
+        # porque é a leitura deles. Ao marcar, _hw_apply_autotune rola a aba
+        # até este texto (ver self._home_scroll) para a resposta não ficar
+        # fora de vista.
         self.lbl_hw_autotune = QLabel()
         self.lbl_hw_autotune.setStyleSheet(
             "color:#8FA8BF;font-size:8.5pt;")
@@ -3183,6 +3336,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(pipe_grp)
         self._home_middle = middle   # sizeHint natural (sem o scroll) — ver abaixo
         scroll.setWidget(middle)
+        self._home_scroll = scroll   # usado por _hw_apply_autotune
         outer.addWidget(scroll, 1)
 
         # ── Rodapé fixo ──────────────────────────────────────────────────
@@ -3206,12 +3360,26 @@ class MainWindow(QMainWindow):
         btn_terminal = self._mk_btn_tr("home_btn_terminal", _SS_BTN_SECONDARY, 160)
         btn_terminal.setFixedHeight(38)
         btn_terminal.clicked.connect(self._open_terminal)
+
+        # Ajuste de parâmetros ao hardware — ao lado de "Ver Terminal", na
+        # mesma linha de ações. O diagnóstico (os três quadros CPU/GPU/
+        # Armazenamento) só informa; é este checkbox que age sobre os campos
+        # das Etapas 2, 3 e 5. O resumo do que mudou aparece no miolo da aba,
+        # abaixo dos quadros (ver self.lbl_hw_autotune).
+        self.chk_hw_autotune = QCheckBox()
+        self._tr("home_chk_hw_autotune", self.chk_hw_autotune.setText)
+        self._tr("home_tooltip_hw_autotune", self.chk_hw_autotune.setToolTip)
+        self.chk_hw_autotune.setStyleSheet("font-size:9pt;")
+        self.chk_hw_autotune.toggled.connect(self._hw_apply_autotune)
+
         btn_row.addStretch()
         btn_row.addWidget(btn_start)
         btn_row.addSpacing(14)
         btn_row.addWidget(btn_req)
         btn_row.addSpacing(14)
         btn_row.addWidget(btn_terminal)
+        btn_row.addSpacing(18)
+        btn_row.addWidget(self.chk_hw_autotune)
         btn_row.addStretch()
         fl.addLayout(btn_row)
 
@@ -4394,8 +4562,11 @@ class MainWindow(QMainWindow):
         self.sp_opt_reduction = QSpinBox()
         self.sp_opt_reduction.setRange(2, 10); self.sp_opt_reduction.setValue(3)
         self.cb_opt_device = QComboBox()
-        self.cb_opt_device.addItems(["cuda", "cpu", "cuda:0", "cuda:1"])
+        # Lista montada a partir das GPUs detectadas (ver _detectar_dispositivos).
+        self.cb_opt_device.addItems(_DEVICE_OPTIONS)
         self.cb_opt_device.setCurrentText(_DEVICE_DEFAULT)
+        self._tr("s45_tooltip_device", self.cb_opt_device.setToolTip,
+                 dispositivos=self._texto_dispositivos())
         self.ed_opt_study = QLineEdit("codeep_hpo")
 
         self.ed_opt_resume = QLineEdit(); self.ed_opt_resume.setReadOnly(True)
@@ -4899,8 +5070,11 @@ class MainWindow(QMainWindow):
         self._tr("s5_tooltip_grad_clip", self.dsb_grad_clip.setToolTip)
         self.sp_patience   = QSpinBox(); self.sp_patience.setRange(1,500); self.sp_patience.setValue(15)
         self.cb_train_device = QComboBox()
-        self.cb_train_device.addItems(["cuda","cpu","cuda:0","cuda:1"])
+        # Lista montada a partir das GPUs detectadas (ver _detectar_dispositivos).
+        self.cb_train_device.addItems(_DEVICE_OPTIONS)
         self.cb_train_device.setCurrentText(_DEVICE_DEFAULT)
+        self._tr("s45_tooltip_device", self.cb_train_device.setToolTip,
+                 dispositivos=self._texto_dispositivos())
 
         # Campo para retomada de treino / fine-tuning
         self.ed_resume = QLineEdit(); self._tr("s5_ph_resume", self.ed_resume.setPlaceholderText)
