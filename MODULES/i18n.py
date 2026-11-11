@@ -117,6 +117,145 @@ _TEXTOS = {
     },
     "home_grp_cpu": {"en": "Hardware Specs — CPU", "pt": "Especificações de Hardware — CPU"},
     "home_grp_gpu": {"en": "Hardware Specs — GPU", "pt": "Especificações de Hardware — GPU"},
+    "home_grp_storage": {
+        "en": "Hardware Specs — Storage",
+        "pt": "Especificações de Hardware — Armazenamento",
+    },
+    "home_chk_hw_autotune": {
+        "en": "Tune parameters to this hardware",
+        "pt": "Ajustar parâmetros ao Hardware",
+    },
+    "home_tooltip_hw_autotune": {
+        "en": "Adjusts the parameters that weigh most on performance to the "
+              "CPU, GPU and storage detected at startup (see the three panels "
+              "above).\n\n"
+              "Affected fields: Max Phase 1 entries, Tensor precision, Site "
+              "HOMO/LUMO channels method, Max QM atoms, Vox batch size, "
+              "Training batch size, Learning rate and Device.\n\n"
+              "Each rule is tied to one measured resource, not to an invented "
+              "machine tier — a PC with a weak GPU and a large disk only gets "
+              "adjusted where it actually needs it. Checking the box shows "
+              "every change with its reason. Unchecking it restores exactly "
+              "the values you had before, including your own customizations.\n\n"
+              "The learning rate moves together with the training batch size "
+              "(linear scaling, lr proportional to batch): the project's "
+              "4e-4 was calibrated for batch 32, so changing the batch alone "
+              "would alter the training dynamics.",
+        "pt": "Ajusta os parâmetros que mais pesam na performance à CPU, à GPU "
+              "e ao armazenamento detectados na inicialização (ver os três "
+              "quadros acima).\n\n"
+              "Campos afetados: Máx. de entradas da Fase 1, Precisão do "
+              "tensor, Método dos canais HOMO/LUMO do sítio, Máx. átomos QM, "
+              "Tamanho do lote de voxel, Tamanho do lote de treino, Taxa de "
+              "aprendizado e Dispositivo.\n\n"
+              "Cada regra está amarrada a UM recurso medido, e não a um "
+              "\"nível de máquina\" inventado — um PC com GPU fraca e disco "
+              "grande recebe ajuste só onde precisa. Ao marcar, cada "
+              "alteração é listada com o seu motivo. Ao desmarcar, os valores "
+              "anteriores são devolvidos exatamente como estavam, inclusive "
+              "as suas personalizações.\n\n"
+              "A taxa de aprendizado acompanha o lote de treino (escala "
+              "linear, lr proporcional ao lote): o valor 4e-4 do projeto foi "
+              "calibrado para lote 32, então mudar só o lote alteraria a "
+              "dinâmica do treino.",
+    },
+    # ── Motivos exibidos no resumo do ajuste por hardware ─────────────────
+    "hw_autotune_header": {
+        "en": "Tuned to the detected hardware ({n} parameters reviewed; "
+              "unchecking restores the previous values):",
+        "pt": "Ajustado ao hardware detectado ({n} parâmetros revisados; "
+              "desmarcar devolve os valores anteriores):",
+    },
+    "hw_kept_at": {
+        "en": "kept at {valor}", "pt": "mantido em {valor}",
+    },
+    "hw_why_dtype_16": {
+        "en": "only {free} GB free; a full Phase 1 dataset needs 49.5 GB in "
+              "float32 against 15.8 GB in float16",
+        "pt": "só {free} GB livres; um dataset completo de Fase 1 pede 49,5 GB "
+              "em float32 contra 15,8 GB em float16",
+    },
+    "hw_why_dtype_32": {
+        "en": "{free} GB free is enough for the 49.5 GB of a full float32 "
+              "dataset, so there is no reason to give up precision",
+        "pt": "{free} GB livres acomodam os 49,5 GB de um dataset completo em "
+              "float32, então não há motivo para abrir mão de precisão",
+    },
+    "hw_why_entries": {
+        "en": "{free} GB free at about {gb} GB per 1,000 entries (measured: "
+              "curation + tensors), keeping 30% as headroom",
+        "pt": "{free} GB livres a cerca de {gb} GB por 1.000 entradas (medido: "
+              "curadoria + tensores), reservando 30% de folga",
+    },
+    "hw_gpu_absent": {"en": "absent", "pt": "ausente"},
+    "hw_why_entries_time": {
+        "en": "capped by processing time, not disk: {cores} physical cores and "
+              "GPU {gpu} — a larger Phase 1 would take days to curate and "
+              "voxelize",
+        "pt": "limitado pelo tempo de processamento, não pelo disco: {cores} "
+              "núcleos físicos e GPU {gpu} — uma Fase 1 maior levaria dias "
+              "para curar e voxelizar",
+    },
+    "hw_why_batch_cpu": {
+        "en": "no GPU: training runs on CPU, where a small batch keeps the "
+              "step time and the RAM use manageable",
+        "pt": "sem GPU: o treino roda em CPU, onde um lote pequeno mantém o "
+              "tempo por passo e o uso de RAM administráveis",
+    },
+    "hw_why_qm_xtb": {
+        "en": "the xtb binary is available: ~0.25 s per pair, the only method "
+              "validated at full-dataset scale",
+        "pt": "o binário xtb está disponível: ~0,25 s por par, o único método "
+              "validado na escala do dataset completo",
+    },
+    "hw_why_qm_rhf_gpu": {
+        "en": "no xtb binary, but there is a GPU: RHF/STO-3G per residue is "
+              "viable with GPU4PySCF acceleration",
+        "pt": "sem o binário xtb, mas há GPU: o RHF/STO-3G por resíduo é "
+              "viável com a aceleração do GPU4PySCF",
+    },
+    "hw_why_qm_heuristic": {
+        "en": "no xtb binary and no GPU: real QM per residue would take "
+              "minutes per pair, so the no-QM approximation is the only "
+              "sensible option",
+        "pt": "sem o binário xtb e sem GPU: QM real por resíduo levaria "
+              "minutos por par, então a aproximação sem QM é a única opção "
+              "sensata",
+    },
+    "hw_why_max_qm": {
+        "en": "{cores} physical cores — the fragmented QM is CPU-bound, and "
+              "fragments above the limit fall back to the approximation",
+        "pt": "{cores} núcleos físicos — o QM fragmentado é limitado pela CPU, "
+              "e fragmentos acima do limite caem na aproximação",
+    },
+    "hw_why_vox_batch": {
+        "en": "{vram} GB of VRAM; it only changes memory use, never the "
+              "result (about 131 KB per atom in the batch on a 32³ grid)",
+        "pt": "{vram} GB de VRAM; só muda o uso de memória, nunca o resultado "
+              "(cerca de 131 KB por átomo do lote numa grade 32³)",
+    },
+    "hw_why_vox_batch_cpu": {
+        "en": "no CuPy: the gaussians are computed by NumPy in RAM, which "
+              "needs a small batch",
+        "pt": "sem CuPy: as gaussianas são calculadas pelo NumPy em RAM, que "
+              "precisa de um lote pequeno",
+    },
+    "hw_why_device": {
+        "en": "detected GPU: {gpu}",
+        "pt": "GPU detectada: {gpu}",
+    },
+    "hw_why_batch": {
+        "en": "{vram} GB of VRAM — the batch is the main VRAM consumer during "
+              "training",
+        "pt": "{vram} GB de VRAM — o lote é o principal consumidor de VRAM no "
+              "treino",
+    },
+    "hw_why_lr": {
+        "en": "linear scaling for batch {batch} (the project's 4e-4 was "
+              "calibrated for batch 32)",
+        "pt": "escala linear para o lote {batch} (o 4e-4 do projeto foi "
+              "calibrado para lote 32)",
+    },
     "home_grp_sw": {"en": "Software Specs", "pt": "Especificações de Software"},
     "home_grp_pipeline": {"en": "Pipeline — Steps", "pt": "Pipeline — Etapas"},
     "home_step1_name": {"en": "Step 1 – Job", "pt": "Etapa 1 – Job"},
@@ -462,7 +601,7 @@ _TEXTOS = {
         "en": "Heuristic (electronegativity, no QM)", "pt": "Heurística (eletronegatividade, sem QM)",
     },
     "s3_tooltip_site_qm_method": {
-        "en": "Level of theory for channels 3-4 (site donor/acceptor field):\n  RHF/STO-3G per "
+        "en": "Level of theory for the site donor/acceptor field (channels\n  homo_density/lumo_density):\n  RHF/STO-3G per "
               "residue — real QM, FMO-style fragmented (slower,\n    ~1s/residue; uses the "
               "already-installed PySCF/GPU4PySCF).\n  GFN-xTB per residue, parallel — "
               "RECOMMENDED if the `xtb` binary is\n    available: semi-empirical, dispatched "
@@ -474,7 +613,7 @@ _TEXTOS = {
               "disconnected molecular fragments\n    (it's a concatenation of independently "
               "capped residues, not a\n    covalently continuous molecule) and segfaults on real "
               "sites, besides\n    taking minutes to converge even when it didn't crash.",
-        "pt": "Nível de teoria para os canais 3-4 (campo doador/aceptor do sítio):\n  "
+        "pt": "Nível de teoria para o campo doador/aceptor do sítio (canais\n  homo_density/lumo_density):\n  "
               "RHF/STO-3G por resíduo — QM real, fragmentado tipo FMO (mais lento,\n    "
               "~1s/resíduo; usa PySCF/GPU4PySCF já instalado).\n  GFN-xTB por resíduo, paralelo "
               "— RECOMENDADO se o binário `xtb`\n    estiver disponível: semi-empírico, "
@@ -492,7 +631,47 @@ _TEXTOS = {
     "s3_lbl_grid": {"en": "Grid size (N³):", "pt": "Tamanho da grade (N³):"},
     "s3_lbl_padding": {"en": "Padding (Å):", "pt": "Preenchimento (Å):"},
     "s3_lbl_max_qm": {"en": "Max QM atoms:", "pt": "Máx. átomos QM:"},
-    "s3_lbl_batch": {"en": "Vox batch size:", "pt": "Tamanho do lote de voxel.:"},
+    "s3_lbl_batch": {"en": "Vox batch size:", "pt": "Tamanho do lote de voxel:"},
+    "s3_lbl_vox_dtype": {
+        "en": "Tensor precision:", "pt": "Precisão do tensor:",
+    },
+    "s3_tooltip_vox_dtype": {
+        "en": "Precision used to STORE each site tensor on disk. It does not "
+              "change the calculation (every channel is always computed in "
+              "float32) and it does not change training, which converts back "
+              "to float32 when loading.\n\n"
+              "Switching from float32 to float16 cuts the disk space the "
+              "tensors need to about a third. Measured on the 32-channel "
+              "dataset:\n"
+              "  float32 — about 1.5 MB per pair (~51 GB for 33,889 pairs)\n"
+              "  float16 — about 0.45 MB per pair (~16 GB for 33,889 pairs)\n\n"
+              "The cost is a rounding error of about 0.002 on values already "
+              "z-score normalized into the [-5, +5] range — negligible next "
+              "to the encoder's BatchNorm3d and the data augmentation "
+              "rotations. Choose float16 when disk space is the constraint; "
+              "keep float32 when it is not.\n\n"
+              "The choice is recorded in voxel_config.json and carried into "
+              "the checkpoint, so generation applies the same rounding and "
+              "the encoder never sees a precision it was not trained on.",
+        "pt": "Precisão usada para GRAVAR cada tensor do sítio em disco. Não "
+              "muda o cálculo (todos os canais são sempre computados em "
+              "float32) e não muda o treino, que converte de volta para "
+              "float32 ao carregar.\n\n"
+              "Trocar de float32 para float16 reduz a cerca de um terço o "
+              "espaço em disco necessário para os tensores. Medido no "
+              "dataset de 32 canais:\n"
+              "  float32 — cerca de 1,5 MB por par (~51 GB em 33.889 pares)\n"
+              "  float16 — cerca de 0,45 MB por par (~16 GB em 33.889 pares)\n\n"
+              "O custo é um erro de arredondamento de cerca de 0,002 em "
+              "valores já normalizados por z-score na faixa [-5, +5] — "
+              "desprezível diante da BatchNorm3d do encoder e das rotações "
+              "de data augmentation. Escolha float16 quando o espaço em "
+              "disco for o limitante; mantenha float32 quando não for.\n\n"
+              "A escolha fica registrada no voxel_config.json e é levada "
+              "para o checkpoint, então a geração aplica o mesmo "
+              "arredondamento e o encoder nunca recebe uma precisão com que "
+              "não foi treinado.",
+    },
     "s3_lbl_qm_basis": {"en": "QM basis:", "pt": "Base QM:"},
     "s3_tooltip_qm_basis": {
         "en": "Only affects the 'RHF/STO-3G per residue' method above — ignored by GFN-xTB "
@@ -509,7 +688,7 @@ _TEXTOS = {
     },
     "s3_lbl_site_ph": {"en": "Site pH:", "pt": "pH do sítio:"},
     "s3_lbl_site_qm_method": {
-        "en": "Site channels\n 3-4 method:", "pt": "Método dos canais\n 3-4 do sítio:",
+        "en": "Site HOMO/LUMO\n channels method:", "pt": "Método dos canais\n HOMO/LUMO do sítio:",
     },
 
     # ---------------------------------------------------------------- STEP 4 — Hyperparameter optimization
@@ -1060,10 +1239,10 @@ _TEXTOS = {
               "só tem efeito para checkpoints treinados antes disso (sem config salva).",
     },
     "s7_tooltip_gen_qm_basis": {
-        "en": "Fallback only (same rule as the site channels 3-4 method above): only takes "
+        "en": "Fallback only (same rule as the site HOMO/LUMO channels method above): only takes "
               "effect for checkpoints trained before the voxelization config started being "
               "saved automatically — only matters for the RHF/STO-3G per residue method.",
-        "pt": "Só como reserva (mesma regra do método dos canais 3-4 acima): só tem efeito "
+        "pt": "Só como reserva (mesma regra do método dos canais HOMO/LUMO acima): só tem efeito "
               "para checkpoints treinados antes de a config de voxelização passar a ser salva "
               "automaticamente — só importa para o método RHF/STO-3G por resíduo.",
     },

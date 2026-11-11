@@ -651,7 +651,7 @@ def pdb_to_site_tensor(
     site_center: "tuple[float, float, float] | None" = None,
     site_radius_A: float = 10.0,
 ) -> np.ndarray:
-    """Pipeline completo: PDB → tensor do sítio (5, 32, 32, 32).
+    """Pipeline completo: PDB → tensor do sítio (X, Y, Z, 32 canais).
 
     O sítio pode ser definido de três formas, nesta ordem de precedência:
 
@@ -717,7 +717,8 @@ def pdb_to_site_tensor(
     # inferência tenha a mesma distribuição do tensor de treino: qualquer
     # divergência aqui (pH diferente, protonate_site desligado só de um
     # lado) reabriria um mismatch treino↔inferência como o que motivou os
-    # canais 3-4 serem site-derived (ver pipeline_voxelize BLOCO 3B).
+    # canais doador/aceptor serem site-derived (ver pipeline_voxelize
+    # BLOCO 3B).
     if config.get("protonate_site", True):
         site_coords, site_elements, site_charges, site_fragments = \
             vox.protonate_site_residues(site_residues, ph=config.get("ph", 7.4))
@@ -770,7 +771,7 @@ def pdb_to_site_tensor(
             f"  Canais 3-4: pedido site_qm_method={configured_method!r} mas "
             f"o cálculo real caiu para {orbital_method_used!r} (ver logs de "
             f"debug para o motivo). Se o modelo foi treinado com um método "
-            f"diferente deste, os canais 3-4 desta inferência ficam "
+            f"diferente deste, os canais HOMO/LUMO desta inferência ficam "
             f"fora da distribuição vista no treino — ver "
             f"MODULES/pipeline_voxelize.py::channel_site_orbital_field."
         )
@@ -782,7 +783,8 @@ def pdb_to_site_tensor(
     # do lado do treino (vox._site_extra_channel_weights/
     # vox._voxelize_multi_weighted), chamada aqui via o módulo dinâmico
     # `vox` — é a mesma garantia de paridade treino/inferência já usada
-    # para os canais 3-4 (ver nota acima): uma única implementação,
+    # para os canais doador/aceptor (ver nota acima): uma única
+    # implementação,
     # chamada dos dois lados, em vez de duas versões que podem divergir.
     extra_weights = vox._site_extra_channel_weights(
         site_coords, site_elements, site_fragments, site_mol
@@ -812,6 +814,15 @@ def pdb_to_site_tensor(
         tensor[..., c] = np.clip(
             (sl - med) / (1.4826 * mad), -5, 5
         ).astype(np.float32)
+
+    # Paridade de PRECISÃO com o treino: se os tensores de treino foram
+    # gravados em float16 (ver "tensor_dtype" em pipeline_voxelize), aplica
+    # aqui o mesmo arredondamento, para o encoder não receber na inferência
+    # uma precisão que nunca viu no treino. O tensor segue em float32 — só
+    # os valores passam pelo ida-e-volta do float16 (erro ~2e-3).
+    if str(config.get("tensor_dtype", "float32")).lower() == "float16":
+        tensor = tensor.astype(np.float16).astype(np.float32)
+        log.info("  Precisão alinhada ao treino: valores arredondados a float16.")
 
     log.info(f"  Tensor gerado: {tensor.shape}  voxel={voxel_size:.2f} Å")
     # site_coords/site_elements/site_mol/site_is_backbone (protonados, com H
@@ -1650,7 +1661,8 @@ def _infer_amber_resname(residue_atoms: list, resname: str) -> str:
     construída — não re-deriva da regra de pH uma segunda vez — e retorna
     o nome de resíduo AMBER correspondente (ASH/GLH/HID/HIE/HIP/LYN quando
     aplicável). Garante que a topologia GROMACS reflita EXATAMENTE a mesma
-    decisão de protonação usada nos canais 3-4 do tensor do sítio (Seção 3
+    decisão de protonação usada nos canais doador/aceptor do tensor do
+    sítio (Seção 3
     da metodologia) — sem isso, pdb2gmx assumiria estados padrão fixos,
     sem noção nenhuma do pH configurado.
 

@@ -10,17 +10,22 @@ Lê os pares curados (binding_site.pdb + ligand.pdb) e gera:
   │              antigo canal único de densidade agregada.                  │
   │    [5]     — Hidrofobicidade (contribuição atômica de Crippen/RDKit)    │
   │    [6]     — Aromaticidade (densidade sobre átomos de anel aromático)   │
-  │    [7:28]  — Identidade de aminoácido (20 canônicos + 1 "outro"), um    │
+  │    [7]     — Carga parcial (Gasteiger) interpolada na grade             │
+  │    [8]     — MEP (Potencial Eletrostático Molecular) — Coulomb          │
+  │    [9]     — Campo doador de elétrons (HOMO-like, semi-empírico)        │
+  │    [10]    — Campo aceptor de elétrons (LUMO-like, semi-empírico)       │
+  │    [11:32] — Identidade de aminoácido (20 canônicos + 1 "outro"), um    │
   │              canal one-hot por resíduo, espalhado no espaço             │
-  │    [28]    — Carga parcial (Gasteiger) interpolada na grade             │
-  │    [29]    — MEP (Potencial Eletrostático Molecular) — Coulomb          │
-  │    [30]    — Campo doador de elétrons (HOMO-like, semi-empírico)        │
-  │    [31]    — Campo aceptor de elétrons (LUMO-like, semi-empírico)       │
-  │                                                                           │
-  │  Ordem e nomes exatos em SITE_CHANNEL_NAMES. [0:28] vêm de              │
-  │  _voxelize_multi_weighted (um kernel gaussiano genérico, N pesos por    │
-  │  átomo de uma vez — ver _site_extra_channel_weights para como cada      │
-  │  peso é montado); [28:32] são os 4 canais físico-químicos originais.    │
+  │                                                                         │
+  │  Ordem e nomes exatos em SITE_CHANNEL_NAMES. Os 3 grupos são            │
+  │  contíguos (ver SITE_CHANNEL_GROUPS, usado também pelo SiteEncoder      │
+  │  para fatiar a entrada): elemento [0:5], físico-química [5:11] e        │
+  │  aminoácido [11:32]. Os 28 canais de elemento/hidrofobicidade/          │
+  │  aromaticidade/aminoácido vêm de _voxelize_multi_weighted (um kernel    │
+  │  gaussiano genérico, N pesos por átomo de uma vez — ver                 │
+  │  _site_extra_channel_weights para como cada peso é montado); os 4       │
+  │  canais físico-químicos originais [7:11] entram no MEIO do tensor,      │
+  │  entre aromaticidade e aminoácido, para manter os grupos contíguos.     │
   │  Todos os 32 são computados EXCLUSIVAMENTE a partir dos átomos do        │
   │  próprio bolso de ligação (binding_site.pdb) — nunca do ligante. Isso    │
   │  garante que o tensor do sítio seja idêntico em treino e em inferência   │
@@ -44,11 +49,11 @@ Lê os pares curados (binding_site.pdb + ligand.pdb) e gera:
 Requisitos:
     pip install numpy scipy biopython rdkit pyscf torch torch-geometric tqdm
 
-Notas sobre os canais 2-4 do sítio:
-    • Canal 2 (MEP) é a soma de potenciais de Coulomb das cargas parciais
-      dos átomos do sítio (escala bem para proteínas inteiras).
-    • Canais 3-4 (doador/aceptor, HOMO/LUMO-like) são calculados a partir
-      dos átomos do SÍTIO — nunca do ligante. Este é o substituto de uma
+Notas sobre os canais físico-químicos do sítio ([5:11]):
+    • O MEP (canal [8]) é a soma de potenciais de Coulomb das cargas
+      parciais dos átomos do sítio (escala bem para proteínas inteiras).
+    • Os canais doador/aceptor (HOMO/LUMO-like, [9] e [10]) são calculados
+      a partir dos átomos do SÍTIO — nunca do ligante. Este é o substituto de uma
       versão anterior que calculava HOMO/LUMO via QM (RHF/STO-3G) sobre o
       LIGANTE co-cristalizado: isso vazava a "resposta" para dentro do
       condicionamento do encoder durante o treino, já que na geração real
@@ -58,7 +63,7 @@ Notas sobre os canais 2-4 do sítio:
       mas não são mais usadas na construção do tensor.
     • Como o sítio é protonado por resíduo (ver protonate_residue, pH
       configurável), há três níveis de teoria disponíveis para os canais
-      3-4 (config["site_qm_method"]):
+      doador/aceptor (config["site_qm_method"]):
         1. "rhf_sto3g_fragments" (padrão) — RHF/STO-3G real por RESÍDUO
            (fragmentação tipo FMO, cada fragmento protonado e capado com H
            nas bordas cortadas — sempre pequeno o bastante para caber sob
@@ -296,7 +301,7 @@ VOXEL_CONFIG = {
     # Base QM (STO-3G é a mais rápida; use 3-21G para mais precisão)
     "qm_basis": "sto-3g",
 
-    # ── Protonação do sítio (canais 3-4) ───────────────────────────────────
+    # ── Protonação do sítio (canais doador/aceptor) ────────────────────────
     # pH usado para decidir o estado de protonação de resíduos ionizáveis
     # (Asp/Glu/His/Cys/Tyr/Lys/Arg) via regra de limiar de Henderson-
     # Hasselbalch sobre pKa de tabela — ver RESIDUE_PKA e protonate_residue.
@@ -307,7 +312,8 @@ VOXEL_CONFIG = {
     # protonated, com H explícitos e cargas Gasteiger reais por resíduo.
     "protonate_site": True,
 
-    # Método para os canais 3-4 (doador/aceptor de elétrons do sítio):
+    # Método para os canais doador/aceptor de elétrons do sítio
+    # (homo_density/lumo_density, índices 9 e 10 — ver SITE_CHANNEL_NAMES):
     #   "rhf_sto3g_fragments" — QM real por resíduo (fragmentação FMO-like)
     #   "gfn_xtb_fragments"   — GFN-xTB por resíduo, em paralelo (requer o
     #                           binário `xtb` no PATH — não instalado por
@@ -337,6 +343,18 @@ VOXEL_CONFIG = {
     "use_ecfp4": False,
     "ecfp4_bits": 512,
     "ecfp4_radius": 2,
+
+    # ── Precisão de ARMAZENAMENTO do tensor do sítio ───────────────────────
+    # "float32" (padrão) ou "float16". NÃO muda o cálculo — todos os canais
+    # são computados em float32 de qualquer forma; muda só como o .npz é
+    # gravado, e o carregador do treino converte de volta para float32 na
+    # leitura (SiteLigandDataset). Medido no dataset de 32 canais:
+    #   float32 → 1.483 KB por par  (51,5 GB em 33.889 pares)
+    #   float16 →   456 KB por par  (15,8 GB em 33.889 pares)
+    # O erro de arredondamento do float16 é de ~2e-3 em valores já
+    # normalizados por z-score na faixa [-5, +5] — desprezível diante da
+    # BatchNorm3d do encoder e das rotações de data augmentation.
+    "tensor_dtype": "float32",
 }
 
 # Chaves de VOXEL_CONFIG que realmente mudam os VALORES do tensor do sítio
@@ -350,6 +368,11 @@ VOXEL_CONFIG = {
 VOXEL_CONFIG_TENSOR_KEYS = (
     "grid_size", "padding_A", "gaussian_sigma", "max_qm_atoms",
     "qm_basis", "ph", "protonate_site", "site_qm_method",
+    # Entra aqui porque o arredondamento do float16 altera (pouco, ~2e-3) os
+    # valores que o encoder viu no treino: registrando a escolha, a geração
+    # aplica o MESMO arredondamento ao tensor de um sítio novo em vez de
+    # alimentar o encoder com float32 cheio (ver pdb_to_site_tensor).
+    "tensor_dtype",
 )
 
 
@@ -385,7 +408,8 @@ VDW_DEFAULT = 1.70
 
 # Eletronegatividade de Pauling por elemento — usada para estimar caráter
 # doador/aceptor de elétrons (aproximação semi-empírica de HOMO/LUMO nos
-# canais 3-4 do tensor do sítio; ver channel_site_donor_acceptor).
+# canais homo_density/lumo_density do tensor do sítio; ver
+# channel_site_donor_acceptor).
 ELECTRONEGATIVITY = {
     "C": 2.55, "N": 3.04, "O": 3.44, "S": 2.58, "P": 2.19,
     "F": 3.98, "CL": 3.16, "BR": 2.96, "I": 2.66,
@@ -1177,8 +1201,8 @@ def channel_site_orbital_field(
     grid_shape: tuple,
     config: dict,
 ) -> tuple[np.ndarray, np.ndarray, str]:
-    """Dispatcher dos canais 3-4 — escolhe o nível de teoria conforme
-    config["site_qm_method"]:
+    """Dispatcher dos canais doador/aceptor (homo_density/lumo_density, [9]
+    e [10]) — escolhe o nível de teoria conforme config["site_qm_method"]:
         "rhf_sto3g_fragments" — QM real por resíduo (ver _fragment_qm_weights),
             com fallback heurístico POR FRAGMENTO quando o QM falha só num
             resíduo (o resto do sítio continua com o valor real).
@@ -1728,7 +1752,7 @@ def protonate_site_residues(
     (inferência — resíduos selecionados por extract_site_from_pdb ou
     load_site_from_residues_pdb). Ambos os lados chamam esta MESMA função
     para que a lógica de protonação seja idêntica — é a mesma garantia de
-    paridade treino/inferência que motivou os canais 3-4 serem
+    paridade treino/inferência que motivou os canais doador/aceptor serem
     site-derived em vez de vir do ligante (ver BLOCO 3B).
 
     IMPORTANTE: cada `residue` deve conter o conjunto COMPLETO de átomos do
@@ -2103,12 +2127,12 @@ def compute_site_anchored_atom_order(
     """Ordem canônica de construção do ligante para teacher forcing do
     decoder autorregressivo — ancorada no sítio, ao estilo Pocket2Mol
     (Peng et al., 2022): a molécula "cresce" a partir do ponto do bolso com
-    maior sinal doador/aceptor de elétrons (canais 3-4, ver
+    maior sinal doador/aceptor de elétrons (homo_density/lumo_density, ver
     channel_site_orbital_field), em vez de uma ordem arbitrária (canônica
     RDKit) desconectada da geometria do encaixe.
 
     Algoritmo:
-      1. Âncora = voxel de maior (canal 3 + canal 4) → coordenada 3D.
+      1. Âncora = voxel de maior (doador + aceptor) → coordenada 3D.
       2. Átomo semente = átomo real do ligante mais próximo da âncora.
       3. Busca "melhor-primeiro" pelas ligações reais: a cada passo, expande
          o átomo não-visitado mais próximo da âncora entre os vizinhos já
@@ -2463,9 +2487,16 @@ def process_pair(
         return {"pair_id": pair_id, "status": "invalid_tensor"}
 
     # ── 6. Salva tensor do sítio ──────────────────────────────────────────────
+    # A precisão de ARMAZENAMENTO é configurável (ver "tensor_dtype" em
+    # VOXEL_CONFIG). O cálculo acima é sempre em float32; só a gravação
+    # muda, e o carregador do treino converte de volta para float32 ao ler
+    # (SiteLigandDataset em pipeline_train.py), então nada mais no pipeline
+    # precisa saber qual foi a escolha.
+    dtype_salvo = np.float16 if str(
+        config.get("tensor_dtype", "float32")).lower() == "float16" else np.float32
     np.savez_compressed(
         out_dir / "site_tensor.npz",
-        tensor     = tensor,          # (n,n,n,32) float32
+        tensor     = tensor.astype(dtype_salvo, copy=False),   # (n,n,n,32)
         origin     = origin,
         voxel_size = np.array([voxel_size]),
         channels   = np.array(SITE_CHANNEL_NAMES),
@@ -2510,8 +2541,9 @@ def process_pair(
         "n_site_atoms":    int(len(site_coords)),
         "n_ligand_atoms":  int(mol.GetNumAtoms()) if mol else 0,
         "ligand_smiles":   Chem.MolToSmiles(mol) if mol else "",
-        # Método que REALMENTE gerou os canais 3-4 (não o configurado —
-        # ver channel_site_orbital_field). config_site_qm_method fica
+        # Método que REALMENTE gerou os canais doador/aceptor (não o
+        # configurado — ver channel_site_orbital_field). O campo
+        # config_site_qm_method fica
         # como referência do que foi pedido, para detectar divergência
         # (ex.: gfn_xtb_fragments pedido mas xtb ausente/falhou -> heuristic).
         "orbital_channels_source": orbital_method_used,

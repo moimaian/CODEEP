@@ -707,7 +707,8 @@ def _make_partial_features(
     final, ainda não decidida) — por isso ficam ZERADOS NOS DOIS LADOS.
     Sem essa máscara, o treino ensinaria o decoder a depender de sinais
     que não existem durante a geração — o mesmo tipo de vazamento
-    treino↔inferência corrigido nos canais 3-4 do tensor do sítio.
+    treino↔inferência corrigido nos canais doador/aceptor do tensor do
+    sítio.
 
     Nuance aceita (exposure bias): o campo de carga [19] em treino usa o
     valor REAL (teacher forcing); em geração usa a carga que o PRÓPRIO
@@ -2587,7 +2588,8 @@ def train(
     # geração (Etapa 9) possa reconstruir o tensor de um sítio novo com a
     # MESMA config usada aqui, sem depender do usuário reproduzi-la
     # manualmente na interface (risco de mismatch treino↔inferência nos
-    # canais 3-4, ver pipeline_generate.load_model). Ausente (dict vazio)
+    # canais doador/aceptor, ver pipeline_generate.load_model). Ausente
+    # (dict vazio)
     # para tensores gerados antes desta funcionalidade existir — nesse caso
     # a geração cai para o comportamento legado (config manual da UI).
     bond_stats_snapshot = compute_bond_stats(dataset_dir)

@@ -1714,7 +1714,8 @@ class MainWindow(QMainWindow):
             "step3": [
                 "ed_vox_pair", "sp_vox_workers", "chk_vox_parallel_pairs", "sp_grid",
                 "sp_vox_pad", "sp_max_qm",
-                "sp_vox_batch", "cb_qm_basis", "chk_ecfp4", "cb_vox_phase",
+                "sp_vox_batch", "cb_vox_dtype", "cb_qm_basis", "chk_ecfp4",
+                "cb_vox_phase",
                 "chk_protonate_site", "dsb_site_ph", "cb_site_qm_method",
             ],
             # Etapa 4 (Optuna): os controles do espaço de busca são gerados a partir de
@@ -2546,6 +2547,346 @@ class MainWindow(QMainWindow):
         return rows
 
     @staticmethod
+    def _hw_storage_info() -> list[tuple[str, str]]:
+        """Retorna lista de (label, valor) com informações de armazenamento do
+        volume onde o CODEEP está instalado.
+
+        É o terceiro eixo do diagnóstico (CPU/GPU/Armazenamento): o dataset
+        voxelizado é a maior estrutura que o pipeline produz — medido em
+        32 canais, ~1,45 MB por par em float32 contra ~0,45 MB em float16,
+        o que em 33.889 pares dá 49,5 GB contra 15,8 GB. Sem esse número
+        visível na aba de início, o usuário só descobre que o disco é curto
+        quando a Etapa 3 morre no meio.
+        """
+        import shutil as _sh
+        rows: list[tuple[str, str]] = []
+        try:
+            uso = _sh.disk_usage(str(_APP_DIR))
+            rows.append(("Mount point", str(_APP_DIR)))
+            rows.append(("Total", f"{uso.total / 1e9:.1f} GB"))
+            rows.append(("Used", f"{uso.used / 1e9:.1f} GB "
+                                 f"({uso.used * 100 / uso.total:.0f}%)"))
+            rows.append(("Free", f"{uso.free / 1e9:.1f} GB"))
+        except Exception as e:
+            rows.append(("Error", str(e)))
+            return rows
+
+        # Tipo de mídia: /sys/block/<dev>/queue/rotational (0 = SSD/NVMe,
+        # 1 = disco mecânico). Importa porque o treino relê o dataset
+        # inteiro a cada época — num disco mecânico isso domina o tempo.
+        dispositivo = tipo = ""
+        try:
+            if _PSUTIL_OK:
+                import psutil as _ps
+                melhor = ""
+                for part in _ps.disk_partitions(all=False):
+                    if str(_APP_DIR).startswith(part.mountpoint) and \
+                            len(part.mountpoint) >= len(melhor):
+                        melhor, dispositivo = part.mountpoint, part.device
+            if dispositivo:
+                rows.append(("Device", dispositivo))
+                base = os.path.basename(dispositivo)
+                # nvme0n1p6 → nvme0n1 ; sda3 → sda
+                if base.startswith("nvme"):
+                    base = base.split("p")[0]
+                else:
+                    base = base.rstrip("0123456789")
+                rot = Path(f"/sys/block/{base}/queue/rotational")
+                if rot.exists():
+                    tipo = "HDD (rotational)" if rot.read_text().strip() == "1" \
+                           else ("NVMe SSD" if base.startswith("nvme") else "SSD")
+                    rows.append(("Media type", tipo))
+        except Exception:
+            pass
+
+        # Quantos pares de treino ainda caberiam, nas duas precisões — a
+        # tradução direta de "GB livres" para a unidade com que o usuário
+        # realmente decide (ver _hw_recommendations/cb_vox_dtype).
+        try:
+            rows.append(("Fits (float32)",
+                         f"~{int(uso.free / 1.45e6):,} pairs".replace(",", ".")))
+            rows.append(("Fits (float16)",
+                         f"~{int(uso.free / 0.45e6):,} pairs".replace(",", ".")))
+        except Exception:
+            pass
+        return rows
+
+    def _hw_profile(self) -> dict:
+        """Mede o hardware UMA VEZ e devolve os números crus que a heurística
+        de ajuste consome (ver _hw_recommendations).
+
+        Separado de _hw_cpu_info/_hw_gpu_info de propósito: aquelas montam
+        strings para exibição (e variam de formato conforme a fonte que
+        respondeu — lscpu, /proc/cpuinfo ou psutil), e extrair números de
+        texto formatado quebraria no primeiro ambiente em que a fonte
+        mudasse. Aqui as grandezas são lidas direto das APIs.
+        """
+        if getattr(self, "_hw_prof_cache", None):
+            return self._hw_prof_cache
+
+        import shutil as _sh
+        prof = {
+            "cores_log": os.cpu_count() or 1,
+            "cores_phys": 0,
+            "ram_gb": 0.0,
+            "gpu": False,
+            "gpu_name": "",
+            "vram_gb": 0.0,
+            "free_disk_gb": 0.0,
+            "cupy": bool(_CUPY_OK),
+            "xtb": bool(_sh.which("xtb")),
+        }
+        if _PSUTIL_OK:
+            try:
+                import psutil as _ps
+                prof["cores_phys"] = _ps.cpu_count(logical=False) or 0
+                prof["ram_gb"] = _ps.virtual_memory().total / 1e9
+            except Exception:
+                pass
+        if not prof["cores_phys"]:
+            prof["cores_phys"] = max(1, prof["cores_log"] // 2)
+        if not prof["ram_gb"]:
+            try:
+                prof["ram_gb"] = (os.sysconf("SC_PAGE_SIZE")
+                                  * os.sysconf("SC_PHYS_PAGES")) / 1e9
+            except Exception:
+                prof["ram_gb"] = 8.0
+        if _TORCH_OK:
+            try:
+                import torch as _t
+                if _t.cuda.is_available():
+                    p = _t.cuda.get_device_properties(0)
+                    prof["gpu"] = True
+                    prof["gpu_name"] = p.name
+                    prof["vram_gb"] = p.total_memory / 1e9
+            except Exception:
+                pass
+        try:
+            prof["free_disk_gb"] = _sh.disk_usage(str(_APP_DIR)).free / 1e9
+        except Exception:
+            pass
+
+        self._hw_prof_cache = prof
+        log.info(
+            "Perfil de hardware: %d núcleos físicos / %d lógicos | RAM %.1f GB | "
+            "GPU %s (%.1f GB) | disco livre %.1f GB | CuPy=%s | xtb=%s",
+            prof["cores_phys"], prof["cores_log"], prof["ram_gb"],
+            prof["gpu_name"] or "ausente", prof["vram_gb"],
+            prof["free_disk_gb"], prof["cupy"], prof["xtb"],
+        )
+        return prof
+
+    # Parâmetros que a heurística controla, na ordem em que aparecem no resumo.
+    # Cada entrada é (atributo do widget, chave i18n do rótulo).
+    _HW_TUNED_FIELDS = (
+        ("sp_phase1_max",       "s2_lbl_max_entries"),
+        ("cb_vox_dtype",        "s3_lbl_vox_dtype"),
+        ("cb_site_qm_method",   "s3_lbl_site_qm_method"),
+        ("sp_max_qm",           "s3_lbl_max_qm"),
+        ("sp_vox_batch",        "s3_lbl_batch"),
+        ("sp_batch",            "s5_lbl_batch"),
+        ("dsb_lr",              "s5_lbl_lr"),
+        ("cb_train_device",     "s5_lbl_device"),
+    )
+
+    def _hw_recommendations(self) -> "dict[str, tuple]":
+        """Traduz o perfil de hardware em valores sugeridos.
+
+        Devolve {atributo: (valor, chave_i18n_do_motivo, kwargs)}. Cada regra
+        está amarrada a UM recurso medido, e não a um "nível de máquina"
+        inventado: assim um PC com GPU fraca e disco grande recebe ajuste só
+        onde precisa. Os números de referência vêm de medições neste próprio
+        pipeline, citadas em cada regra.
+        """
+        p = self._hw_profile()
+        rec: "dict[str, tuple]" = {}
+
+        # ── Precisão do tensor: decidida pelo disco livre ──────────────────
+        # Um dataset completo de Fase 1 (33.889 pares, 32 canais) ocupa
+        # 49,5 GB em float32 e 15,8 GB em float16 (medido). Abaixo de 60 GB
+        # livres o float32 não fecha com margem para os dados curados.
+        if p["free_disk_gb"] < 60:
+            rec["cb_vox_dtype"] = ("float16", "hw_why_dtype_16",
+                                   {"free": f"{p['free_disk_gb']:.0f}"})
+        else:
+            rec["cb_vox_dtype"] = ("float32", "hw_why_dtype_32",
+                                   {"free": f"{p['free_disk_gb']:.0f}"})
+
+        # ── Máx. de entradas da Fase 1: limitada pelo disco ───────────────
+        # Medido: 50.000 entradas renderam 33.889 pares curados, ocupando
+        # ~20 GB de curadoria + 49,5 GB de tensores float32 (15,8 em
+        # float16) — ou seja ~1,4 GB (float32) / ~0,7 GB (float16) por
+        # 1.000 entradas. Usa 70% do disco livre para deixar folga ao
+        # checkpoint, aos logs e ao sistema.
+        gb_por_mil = 0.7 if rec["cb_vox_dtype"][0] == "float16" else 1.4
+        cap_disco = int((p["free_disk_gb"] * 0.70) / gb_por_mil) * 1000
+        # Segundo teto, pelo TEMPO: a curadoria e a voxelização medem ~0,28 s
+        # por par com GPU + CuPy + xtb nesta máquina de referência. Sem GPU a
+        # voxelização cai para NumPy em CPU e o QM para a aproximação, o que
+        # multiplica o tempo por par — 50.000 entradas viram dias de espera
+        # em vez de horas. O teto evita sugerir um dataset que o usuário não
+        # vai conseguir processar, mesmo que o disco permita.
+        if p["gpu"] and p["cores_phys"] >= 8:
+            cap_tempo = 50000
+        elif p["gpu"] or p["cores_phys"] >= 8:
+            cap_tempo = 25000
+        else:
+            cap_tempo = 10000
+        entradas = max(1000, min(50000, cap_disco, cap_tempo))
+        gpu_txt = p["gpu_name"] or i18n.t("hw_gpu_absent", self._idioma)
+        if cap_tempo < cap_disco:
+            rec["sp_phase1_max"] = (entradas, "hw_why_entries_time",
+                                    {"cores": p["cores_phys"],
+                                     "gpu": gpu_txt})
+        else:
+            rec["sp_phase1_max"] = (entradas, "hw_why_entries",
+                                    {"free": f"{p['free_disk_gb']:.0f}",
+                                     "gb": f"{gb_por_mil:.1f}".replace(".", ",")})
+
+        # ── Método dos canais HOMO/LUMO ───────────────────────────────────
+        # Índices: 0=RHF/STO-3G fragmentado, 1=GFN-xTB fragmentado,
+        # 2=heurística. Medido: xTB a ~0,25 s por par; o RHF por resíduo só
+        # é viável com aceleração de GPU (GPU4PySCF); a heurística não faz
+        # QM nenhum e é a única opção sensata numa máquina sem as duas.
+        if p["xtb"]:
+            rec["cb_site_qm_method"] = (1, "hw_why_qm_xtb", {})
+        elif p["gpu"]:
+            rec["cb_site_qm_method"] = (0, "hw_why_qm_rhf_gpu", {})
+        else:
+            rec["cb_site_qm_method"] = (2, "hw_why_qm_heuristic", {})
+
+        # ── Máx. átomos QM por fragmento ──────────────────────────────────
+        # Custo do QM cresce rápido com o tamanho do fragmento, e o xTB
+        # fragmentado é CPU-bound: acima do limite o resíduo cai para
+        # aproximação semi-empírica, então reduzir troca precisão por tempo
+        # em máquinas com poucos núcleos.
+        if p["cores_phys"] >= 12:
+            rec["sp_max_qm"] = (60, "hw_why_max_qm", {"cores": p["cores_phys"]})
+        elif p["cores_phys"] >= 6:
+            rec["sp_max_qm"] = (45, "hw_why_max_qm", {"cores": p["cores_phys"]})
+        else:
+            rec["sp_max_qm"] = (30, "hw_why_max_qm", {"cores": p["cores_phys"]})
+
+        # ── Tamanho do lote de voxel ──────────────────────────────────────
+        # Só mexe em memória, não no resultado: a matriz gaussiana é
+        # (lote × n_voxels) float32 — com grade 32³ são ~131 KB por átomo do
+        # lote, ou ~65 MB em lote 500. Sem CuPy o cálculo é NumPy em RAM e
+        # o lote precisa ser pequeno.
+        if not p["cupy"]:
+            rec["sp_vox_batch"] = (100, "hw_why_vox_batch_cpu", {})
+        elif p["vram_gb"] >= 12:
+            rec["sp_vox_batch"] = (1000, "hw_why_vox_batch",
+                                   {"vram": f"{p['vram_gb']:.0f}"})
+        elif p["vram_gb"] >= 8:
+            rec["sp_vox_batch"] = (500, "hw_why_vox_batch",
+                                   {"vram": f"{p['vram_gb']:.0f}"})
+        else:
+            rec["sp_vox_batch"] = (250, "hw_why_vox_batch",
+                                   {"vram": f"{p['vram_gb']:.0f}"})
+
+        # ── Dispositivo de treino ─────────────────────────────────────────
+        rec["cb_train_device"] = ("cuda" if p["gpu"] else "cpu",
+                                  "hw_why_device", {"gpu": gpu_txt})
+
+        # ── Lote de treino + taxa de aprendizado (acopladas) ──────────────
+        # O lote é o principal consumidor de VRAM no treino. A lr NÃO pode
+        # ser ajustada em separado: o valor 4e-4 do projeto foi calibrado
+        # para lote 32 (ver comentário em pipeline_train.train), então a
+        # heurística aplica a regra de escala linear lr ∝ lote, que é o
+        # padrão para manter a dinâmica de treino ao mudar o lote.
+        sem_gpu = not p["gpu"]
+        if sem_gpu:
+            lote = 4
+        elif p["vram_gb"] >= 15:
+            lote = 32
+        elif p["vram_gb"] >= 10:
+            lote = 24
+        elif p["vram_gb"] >= 7:
+            lote = 16
+        else:
+            lote = 8
+        rec["sp_batch"] = (
+            lote,
+            "hw_why_batch_cpu" if sem_gpu else "hw_why_batch",
+            {} if sem_gpu else {"vram": f"{p['vram_gb']:.0f}"},
+        )
+        rec["dsb_lr"] = (round(4e-4 * lote / 32, 6), "hw_why_lr",
+                         {"batch": lote})
+        return rec
+
+    def _hw_widget_value(self, widget):
+        """Lê o valor de um widget ajustável de forma uniforme."""
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        if isinstance(widget, (QDoubleSpinBox, QSpinBox)):
+            return widget.value()
+        return None
+
+    def _hw_set_widget_value(self, widget, valor):
+        """Aplica um valor sugerido, aceitando índice OU texto em combos."""
+        if isinstance(widget, QComboBox):
+            if isinstance(valor, int):
+                if 0 <= valor < widget.count():
+                    widget.setCurrentIndex(valor)
+            else:
+                idx = widget.findText(str(valor))
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+                else:
+                    widget.setCurrentText(str(valor))
+        elif isinstance(widget, QDoubleSpinBox):
+            widget.setValue(float(valor))
+        elif isinstance(widget, QSpinBox):
+            widget.setValue(int(valor))
+
+    def _hw_apply_autotune(self, ligado: bool):
+        """Liga/desliga o ajuste por hardware.
+
+        Ao LIGAR: guarda os valores atuais e aplica os sugeridos.
+        Ao DESLIGAR: devolve exatamente os valores guardados — inclusive os
+        que o usuário tinha personalizado antes de marcar, e não as
+        constantes do código.
+        """
+        if ligado:
+            rec = self._hw_recommendations()
+            self._hw_saved_values = {}
+            linhas = []
+            for attr, label_key in self._HW_TUNED_FIELDS:
+                widget = getattr(self, attr, None)
+                if widget is None or attr not in rec:
+                    continue
+                antes = self._hw_widget_value(widget)
+                self._hw_saved_values[attr] = antes
+                valor, motivo_key, motivo_kwargs = rec[attr]
+                self._hw_set_widget_value(widget, valor)
+                depois = self._hw_widget_value(widget)
+                # Os rótulos dos formulários têm "\n" para quebrar em duas
+                # linhas no campo; aqui tudo vira uma linha só.
+                rotulo = " ".join(
+                    i18n.t(label_key, self._idioma).split()).rstrip(":")
+                motivo = i18n.t(motivo_key, self._idioma, **motivo_kwargs)
+                if str(antes) == str(depois):
+                    mudanca = i18n.t("hw_kept_at", self._idioma, valor=antes)
+                else:
+                    mudanca = f"{antes} → {depois}"
+                linhas.append(f"  • {rotulo}: {mudanca} — {motivo}")
+            if linhas:
+                linhas.insert(0, i18n.t("hw_autotune_header", self._idioma,
+                                        n=len(linhas)))
+            self._hw_autotune_resumo = "\n".join(linhas)
+        else:
+            for attr, _ in self._HW_TUNED_FIELDS:
+                widget = getattr(self, attr, None)
+                if widget is not None and attr in getattr(self, "_hw_saved_values", {}):
+                    self._hw_set_widget_value(widget, self._hw_saved_values[attr])
+            self._hw_saved_values = {}
+            self._hw_autotune_resumo = ""
+
+        if getattr(self, "lbl_hw_autotune", None) is not None:
+            self.lbl_hw_autotune.setText(self._hw_autotune_resumo)
+            self.lbl_hw_autotune.setVisible(bool(self._hw_autotune_resumo))
+
+    @staticmethod
     def _sw_versions() -> list[tuple[str, str]]:
         """Retorna lista de (biblioteca, versão) para o quadro Software Specs."""
         import importlib, subprocess as _sp, shutil as _sh
@@ -2749,7 +3090,46 @@ class MainWindow(QMainWindow):
         gpu_grp.set_collapsed(False)
         hw_row.addWidget(gpu_grp, 1)
 
+        # Quadro Armazenamento — terceiro eixo do diagnóstico, ao lado de
+        # CPU e GPU: o dataset voxelizado é a maior estrutura do pipeline
+        # (ver _hw_storage_info) e é o recurso que mais frequentemente
+        # limita uma execução de Fase 1 completa.
+        sto_grp = CollapsibleGroupBox()
+        sto_grp.setStyleSheet(_SS_GROUPBOX_NO_BG)
+        self._tr("home_grp_storage", sto_grp.setTitle)
+        sto_form = QFormLayout(sto_grp)
+        sto_form.setHorizontalSpacing(16); sto_form.setVerticalSpacing(4)
+        for label, val in self._hw_storage_info():
+            lbl_k = QLabel(label)
+            lbl_k.setStyleSheet("color:#6E8CA8;font-size:9pt;")
+            lbl_v = QLabel(val)
+            lbl_v.setStyleSheet("font-weight:bold;font-size:9pt;color:#C9D1D9;")
+            lbl_v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lbl_v.setWordWrap(True)
+            sto_form.addRow(lbl_k, lbl_v)
+        sto_grp.set_collapsed(False)
+        hw_row.addWidget(sto_grp, 1)
+
         lay.addLayout(hw_row)
+
+        # ── Ajuste de parâmetros ao hardware ──────────────────────────────
+        # O diagnóstico acima só informa; este checkbox age. Fica aqui, logo
+        # abaixo dos três quadros, porque é a conclusão prática deles.
+        self.chk_hw_autotune = QCheckBox()
+        self._tr("home_chk_hw_autotune", self.chk_hw_autotune.setText)
+        self._tr("home_tooltip_hw_autotune", self.chk_hw_autotune.setToolTip)
+        self.chk_hw_autotune.setStyleSheet("font-size:9pt;")
+        self.chk_hw_autotune.toggled.connect(self._hw_apply_autotune)
+        lay.addWidget(self.chk_hw_autotune)
+
+        self.lbl_hw_autotune = QLabel()
+        self.lbl_hw_autotune.setStyleSheet(
+            "color:#8FA8BF;font-size:8.5pt;")
+        self.lbl_hw_autotune.setWordWrap(True)
+        self.lbl_hw_autotune.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_hw_autotune.setVisible(False)
+        lay.addWidget(self.lbl_hw_autotune)
+
         lay.addStretch(1)
 
         # ── Software Specs ─────────────────────────────────────────────────
@@ -3834,6 +4214,14 @@ class MainWindow(QMainWindow):
                 batch=_BATCH_DEFAULT, cupy_status=i18n.t(cupy_key, self._idioma),
             ))
         self._tr("s3_tooltip_vox_batch", _apply_vox_batch_tooltip)
+        # Precisão de ARMAZENAMENTO do tensor (não do cálculo, que é sempre
+        # float32). float16 reduz ~3x o espaço em disco do dataset; o padrão
+        # continua float32 para não mudar o comportamento de quem não
+        # escolher nada. Ver "tensor_dtype" em pipeline_voxelize.VOXEL_CONFIG.
+        self.cb_vox_dtype = QComboBox()
+        self.cb_vox_dtype.addItems(["float32", "float16"])
+        self.cb_vox_dtype.setCurrentIndex(0)
+        self._tr("s3_tooltip_vox_dtype", self.cb_vox_dtype.setToolTip)
         self.cb_qm_basis = QComboBox()
         self.cb_qm_basis.addItems(["sto-3g","3-21g","6-31g"])
         self._tr("s3_tooltip_qm_basis", self.cb_qm_basis.setToolTip)
@@ -3841,7 +4229,7 @@ class MainWindow(QMainWindow):
         self.cb_vox_phase = QComboBox()
         self.cb_vox_phase.addItems(["1", "2", "3"])
 
-        # ── Protonação do sítio + método QM dos canais 3-4 (doador/aceptor) ──
+        # ── Protonação do sítio + método QM dos canais HOMO/LUMO ─────────────
         self.chk_protonate_site = QCheckBox()
         self._tr("s3_chk_protonate_site", self.chk_protonate_site.setText)
         self.chk_protonate_site.setChecked(True)
@@ -3854,6 +4242,14 @@ class MainWindow(QMainWindow):
             ["qm_method_rhf_fragments", "qm_method_gfn_xtb_fragments",
              "qm_method_heuristic"]
         )
+        # Pré-seleciona GFN-xTB (índice 1) em vez de RHF/STO-3G: é o método
+        # com que o dataset de referência foi voxelizado e o único validado
+        # em escala (~0,25 s/par, contra ordem de minutos por par no RHF
+        # fragmentado). Se o binário `xtb` não estiver no PATH,
+        # channel_site_orbital_field cai sozinho na heurística e registra o
+        # método REALMENTE usado em meta.json. Um step3.json salvo tem
+        # precedência sobre este padrão (ver a lista de autosave "step3").
+        self.cb_site_qm_method.setCurrentIndex(1)
         self._tr("s3_tooltip_site_qm_method", self.cb_site_qm_method.setToolTip)
         self._SITE_QM_METHOD_VALUES = [
             "rhf_sto3g_fragments", "gfn_xtb_fragments", "heuristic",
@@ -3868,6 +4264,7 @@ class MainWindow(QMainWindow):
         pf_vox.addRow(self._trL("s3_lbl_padding"), self.sp_vox_pad)
         pf_vox.addRow(self._trL("s3_lbl_max_qm"), self.sp_max_qm)
         pf_vox.addRow(self._trL("s3_lbl_batch"), self.sp_vox_batch)
+        pf_vox.addRow(self._trL("s3_lbl_vox_dtype"), self.cb_vox_dtype)
 
         pf_qm.addRow(self._trL("s3_lbl_qm_basis"), self.cb_qm_basis)
         pf_qm.addRow("", self.chk_ecfp4)
@@ -3892,6 +4289,7 @@ class MainWindow(QMainWindow):
             config["padding_A"] = self.sp_vox_pad.value()
             config["max_qm_atoms"] = self.sp_max_qm.value()
             config["vox_batch"]    = self.sp_vox_batch.value()
+            config["tensor_dtype"] = self.cb_vox_dtype.currentText()
             config["qm_basis"] = self.cb_qm_basis.currentText()
             config["use_ecfp4"] = self.chk_ecfp4.isChecked()
             config["protonate_site"] = self.chk_protonate_site.isChecked()
@@ -4980,6 +5378,13 @@ class MainWindow(QMainWindow):
             ["qm_method_rhf_fragments", "qm_method_gfn_xtb_fragments",
              "qm_method_heuristic"]
         )
+        # Mesmo padrão da Etapa 3 (GFN-xTB, índice 1): os canais HOMO/LUMO do
+        # sítio precisam ser gerados na inferência pelo MESMO método usado na
+        # voxelização do treino, senão ficam fora da distribuição vista pelo
+        # encoder. Só tem efeito para checkpoints sem a config de voxelização
+        # salva — nos demais, load_model usa a config do checkpoint e avisa no
+        # log se divergir deste campo.
+        self.cb_gen_site_qm_method.setCurrentIndex(1)
         self._tr("s7_tooltip_gen_qm_method", self.cb_gen_site_qm_method.setToolTip)
         self._GEN_SITE_QM_METHOD_VALUES = [
             "rhf_sto3g_fragments", "gfn_xtb_fragments", "heuristic",
