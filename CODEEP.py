@@ -1178,6 +1178,114 @@ class TrainingPlotPanel(QWidget):
             self._dados.setdefault(k, []).append((self._epoch, v))
         self._redesenhar()
 
+    # Coluna de training_history.csv para cada serie do grafico. As chaves
+    # sao as MESMAS que feed_line extrai das linhas "Val →" do log (ver
+    # pipeline_train.train._linha), de modo que um historico carregado do
+    # disco e um treino ao vivo alimentam exatamente as mesmas series.
+    _COLUNAS_CSV = {
+        "total": "val_total",   "recon":  "val_recon",   "kl":      "val_kl",
+        "atom":  "val_atom",    "posNLL": "val_pos",     "posMAE":  "val_pos_mae",
+        "focal": "val_focal",   "exist":  "val_exist",   "bond":    "val_bond",
+        "stop":  "val_stop",    "charge": "val_charge",  "fcharge": "val_fcharge",
+    }
+
+    def load_history(self, ckpt_dir) -> int:
+        """Reconstroi as curvas de um treino JA CONCLUIDO, do disco.
+
+        Usada ao carregar um projeto anterior (ver
+        MainWindow._restore_training_plot): sem isto, o painel so tinha
+        dados enquanto um treino rodava na sessao atual — reabrir o projeto
+        no dia seguinte mostrava um grafico vazio, embora o historico
+        estivesse no disco desde sempre.
+
+        Duas fontes, nesta ordem:
+          1. training_history.csv — completo e exato, mas pipeline_train so
+             o grava DEPOIS do laco de epocas
+             (pipeline_train.py: pd.DataFrame(history).to_csv), entao um
+             treino interrompido ou parado pelo botao Stop nao tem CSV;
+          2. training.log — as linhas "Val →" que o FileHandler de
+             pipeline_train gravou epoca a epoca, lidas com as mesmas
+             regexes de feed_line. Cobre justamente o treino interrompido.
+
+        Retorna quantas epocas foram carregadas (0 se nao houver nada).
+        """
+        from pathlib import Path as _P
+        ckpt_dir = _P(ckpt_dir) if ckpt_dir else None
+        self._epoch = 0
+        self._dados = {}
+        if ckpt_dir is None or not ckpt_dir.is_dir():
+            self._redesenhar()
+            return 0
+
+        n = self._carregar_csv(ckpt_dir / "training_history.csv")
+        if n == 0:
+            n = self._carregar_log(ckpt_dir / "training.log")
+        # Um unico redesenho no fim — redesenhar por epoca levaria 150
+        # renderizacoes do matplotlib para nada.
+        self._redesenhar()
+        return n
+
+    def _carregar_csv(self, caminho) -> int:
+        if not caminho.is_file():
+            return 0
+        import csv as _csv
+        try:
+            with open(caminho, newline="", encoding="utf-8") as fh:
+                linhas = list(_csv.DictReader(fh))
+        except Exception as e:
+            log.debug(f"training_history.csv ilegivel ({caminho}): {e}")
+            return 0
+        n = 0
+        for linha in linhas:
+            try:
+                ep = int(float(linha.get("epoch") or 0))
+            except (TypeError, ValueError):
+                continue
+            if ep <= 0:
+                continue
+            achou = False
+            for chave, coluna in self._COLUNAS_CSV.items():
+                bruto = linha.get(coluna)
+                if bruto in (None, ""):
+                    continue
+                try:
+                    valor = float(bruto)
+                except (TypeError, ValueError):
+                    continue
+                self._dados.setdefault(chave, []).append((ep, valor))
+                achou = True
+            if achou:
+                n += 1
+                self._epoch = max(self._epoch, ep)
+        return n
+
+    def _carregar_log(self, caminho) -> int:
+        """Reproduz as linhas "Val →" do training.log pelas regexes de
+        feed_line, sem redesenhar a cada linha."""
+        if not caminho.is_file():
+            return 0
+        try:
+            texto = caminho.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            log.debug(f"training.log ilegivel ({caminho}): {e}")
+            return 0
+        n = 0
+        for linha in texto.splitlines():
+            m = self._RE_EPOCH.search(linha)
+            if m:
+                self._epoch = int(m.group(1))
+                continue
+            mv = self._RE_VAL.search(linha)
+            if not mv:
+                continue
+            vals = {k: float(v) for k, v in self._RE_KV.findall(mv.group(1))}
+            if not vals:
+                continue
+            for k, v in vals.items():
+                self._dados.setdefault(k, []).append((self._epoch, v))
+            n += 1
+        return n
+
     # ── Desenho ───────────────────────────────────────────────────────
     def _redesenhar(self):
         ax1, ax2 = self._ax1, self._ax2
@@ -2260,6 +2368,10 @@ class MainWindow(QMainWindow):
         root = self.ed_root.text().strip() or self.dp_dir
         self._refresh_paths()
         self._inject_root(root, job_dir)
+        # Curvas da Etapa 5: reconstruidas do checkpoint no disco. Depois
+        # de _load_job_state_into_ui/_refresh_paths, porque depende de
+        # cb_train_phase e Checkpoint out ja terem os valores do projeto.
+        self._restore_training_plot()
         self._save_all_tab_states()
 
     # ── Menu ──────────────────────────────────────────────────────────────
@@ -5240,6 +5352,40 @@ class MainWindow(QMainWindow):
             params_min_height=300,
         )
 
+    def _restore_training_plot(self):
+        """Repopula as curvas da Etapa 5 a partir do checkpoint no disco.
+
+        Chamada ao carregar um projeto anterior (_load_project). A pasta de
+        checkpoint e resolvida pela MESMA regra do run_fn da Etapa 5: o
+        campo Checkpoint out quando preenchido, senao o padrao da fase
+        escolhida em cb_train_phase — fase 1 em <root>/checkpoints/phase1,
+        fases 2 e 3 em <job>/checkpoints/phase<N>.
+        """
+        painel = getattr(self, "_training_plot", None)
+        if painel is None:
+            return
+        try:
+            fase = self.cb_train_phase.currentText().strip() or "1"
+            manual = self.ed_ckpt_out.text().strip()
+            if manual:
+                ckpt_dir = Path(manual)
+            elif fase == "1":
+                ckpt_dir = Path(self.ed_root.text().strip() or self.dp_dir) / "checkpoints" / "phase1"
+            else:
+                ckpt_dir = Path(self.job_dir) / "checkpoints" / f"phase{fase}"
+            n = painel.load_history(ckpt_dir)
+            if n:
+                log.info(f"Curvas de treino restauradas: {n} epocas de {ckpt_dir}")
+            else:
+                log.debug(f"Sem historico de treino em {ckpt_dir} — painel de curvas vazio.")
+        except Exception as e:
+            # Carregar um projeto nunca deve falhar por causa do grafico.
+            log.debug(f"Nao foi possivel restaurar as curvas de treino: {e}")
+            try:
+                painel.reset()
+            except Exception:
+                pass
+
     def _open_training_plot(self, worker):
         """Liga o worker do treino ao painel de curvas embutido na aba.
 
@@ -5573,10 +5719,11 @@ class MainWindow(QMainWindow):
         self._tr("s7_tooltip_gen_qm_basis", self.cb_gen_qm_basis.setToolTip)
 
         # ── FF de geometria final (minimização conjunta ligante+sítio) ───────
-        self.cb_final_ff = self._mk_combo_tr(["ff_mmff_uff", "ff_amber_ff14sb", "ff_charmm36"])
+        self.cb_final_ff = self._mk_combo_tr(
+            ["ff_mmff_uff", "ff_amber_ff14sb", "ff_charmm36", "ff_none"])
         self.cb_final_ff.setCurrentIndex(0)   # MMFF/UFF — mais simples/rápido, pré-selecionado
         self._tr("s7_tooltip_final_ff", self.cb_final_ff.setToolTip)
-        self._FINAL_FF_VALUES = ["mmff_uff", "amber_ff14sb", "charmm36"]
+        self._FINAL_FF_VALUES = ["mmff_uff", "amber_ff14sb", "charmm36", "none"]
 
         # ── Induced-fit: backbone travado, cadeia lateral livre ──────────────
         self.chk_induced_fit = QCheckBox()

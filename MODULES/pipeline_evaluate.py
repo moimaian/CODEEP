@@ -312,7 +312,21 @@ def evaluate_on_test(ckpt_dir: Path, tensor_dir: Path) -> dict:
 # BLOCO 3 — GERAÇÃO E VALIDAÇÃO DE LIGANTES
 # ══════════════════════════════════════════════════════════════════════════════
 
+_GEN_MODULE = None     # cache — ver _load_generate_module
+
+
 def _load_generate_module():
+    """Carrega pipeline_generate.py UMA vez por processo.
+
+    Antes, era recarregado a cada candidato (dentro de
+    decode_predictions_to_mol): além do custo, cada instância nova nascia
+    com BOND_STATS/CHARGE_STATS VAZIAS, porque quem as popula é
+    pipeline_generate.load_model — que a Etapa 6 não chama. Ver
+    _prepare_generate_module.
+    """
+    global _GEN_MODULE
+    if _GEN_MODULE is not None:
+        return _GEN_MODULE
     import importlib.util
     gen_path = Path(__file__).resolve().parent / "pipeline_generate.py"
     spec = importlib.util.spec_from_file_location("pipeline_generate", gen_path)
@@ -320,10 +334,66 @@ def _load_generate_module():
         raise ImportError(f"Não foi possível criar spec para {gen_path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _GEN_MODULE = mod
     return mod
 
 
-def decode_predictions_to_mol(candidate: dict):
+def _prepare_generate_module(cfg: dict, tensor_dir: "Path | None" = None):
+    """Carrega o módulo de geração e injeta nele a química empírica da base,
+    exatamente como pipeline_generate.load_model faz na Etapa 7.
+
+    Por que isto é obrigatório: sem BOND_STATS a montagem da molécula
+    (_assemble_bonds_global / _bond_distance_ok) perde os dois priors que
+    vêm da base e passa a montar moléculas que não são química de pequenas
+    moléculas. Medido na Etapa 6 com o dicionário vazio, 60 candidatos:
+
+      - o TIPO da ligação deixa de ser decidido: com estatística vazia todos
+        os tipos pontuam freq = 1,0 e vence o primeiro da ordem de iteração,
+        BondType.SINGLE. Resultado, 565 de 565 ligações simples — nenhuma
+        aromática era POSSÍVEL por construção, independentemente do que o
+        modelo tivesse aprendido;
+      - _bond_distance_ok cai no limite plano (2,15 Å) e abandona a checagem
+        de frequência do par, de modo que pares que a base praticamente não
+        tem passam a ser aceitos: O-O (1 ocorrência em 90.272 ligações da
+        base) e N-N apareceram 4 e 13 vezes.
+
+    A consequência metodológica era pior que os defeitos em si: Etapa 6 e
+    Etapa 7 exercitavam caminhos de montagem DIFERENTES, e suas métricas
+    não eram comparáveis entre si.
+    """
+    gen = _load_generate_module()
+
+    _stats = (cfg or {}).get("bond_stats") or {}
+    if _stats:
+        gen.BOND_STATS.clear(); gen.BOND_STATS.update(_stats)
+        log.info(f"  Química da base herdada do checkpoint: "
+                 f"{len(_stats)} pares (elemento, elemento, ordem)")
+    else:
+        log.warning(
+            "  Checkpoint sem bond_stats: a montagem cai no critério plano de "
+            "distância (2,15 Å), NÃO rejeita pares inexistentes na base "
+            "(O-O, N-N, O-F...) e rotula TODA ligação como simples. As "
+            "métricas desta etapa não serão comparáveis com a Etapa 7."
+        )
+
+    # Padrões de carga formal — mesma cascata de load_model: checkpoint
+    # primeiro, charge_stats.json ao lado dos tensores como alternativa.
+    _cst = (cfg or {}).get("charge_stats") or {}
+    if not _cst and tensor_dir is not None:
+        _cst_path = Path(tensor_dir) / "charge_stats.json"
+        if _cst_path.exists():
+            try:
+                import json
+                _cst = json.loads(_cst_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                log.debug(f"  charge_stats.json ilegível: {e}")
+    if _cst:
+        gen.CHARGE_STATS.clear(); gen.CHARGE_STATS.update(_cst)
+
+    return gen
+
+
+def decode_predictions_to_mol(candidate: dict, gen=None):
     """Converte um candidato de LigandCVAE.sample() (decoder autorregressivo)
     em molécula RDKit.
 
@@ -333,11 +403,17 @@ def decode_predictions_to_mol(candidate: dict):
     aqui que divergiria com o tempo (era exatamente o que acontecia com a
     versão anterior, escrita para o decoder de topologia fixa por template
     — já incompatível com o formato de saída atual).
+
+    gen: módulo de geração JÁ preparado por _prepare_generate_module (com
+    BOND_STATS/CHARGE_STATS da base). Passar None mantém compatibilidade,
+    mas então a montagem roda sem os priors da base — ver o aviso na
+    docstring de _prepare_generate_module.
     """
     if not HAS_RDKIT:
         return None
     try:
-        gen = _load_generate_module()
+        if gen is None:
+            gen = _load_generate_module()
         return gen.preds_to_mol(candidate)
     except Exception as e:
         log.warning(f"  decode_predictions_to_mol: {e}")
@@ -473,19 +549,44 @@ def compute_molecule_metrics(smiles_list, train_smiles: "set[str] | list[str] | 
 
 
 def save_generated_sdf(generated_records, out_sdf: Path, real_smiles: str):
-    """Salva os ligantes gerados com coordenadas 3D em formato SDF."""
+    """Salva os ligantes gerados com coordenadas 3D em formato SDF.
+
+    Candidatos marcados com too_small (ver generate_ligands_for_site) NÃO
+    entram: eram eles que colocavam butano e N-N no arquivo que se abre no
+    PyMOL. Eles continuam contados nas métricas de validade.
+    """
     writer = Chem.SDWriter(str(out_sdf))
+    n_escritos = n_pequenos = n_revertidos = 0
     for idx, record in enumerate(generated_records, start=1):
         mol = record.get("mol")
         if mol is None:
             continue
+        if record.get("too_small"):
+            n_pequenos += 1
+            continue
         mol.SetProp("_Name", f"generated_{idx}")
         mol.SetProp("SMILES", record.get("smiles", ""))
+        mol.SetProp("HeavyAtoms", str(record.get("n_heavy", mol.GetNumHeavyAtoms())))
+        # Rastreabilidade da guarda de relaxação (ver
+        # pipeline_generate._geometry_is_sane): diz se a geometria deste
+        # candidato é a minimizada ou a do decoder, revertida por
+        # divergência do minimizador.
+        if mol.HasProp("relax_reverted"):
+            revertido = bool(mol.GetBoolProp("relax_reverted"))
+            mol.SetProp("Geometry", "decoder (minimização revertida)"
+                                    if revertido else "minimizada")
+            n_revertidos += int(revertido)
         if real_smiles:
             mol.SetProp("Reference_SMILES", real_smiles)
         writer.write(mol)
+        n_escritos += 1
     writer.close()
     log.info(f"\n  3D SDF saved at: {out_sdf}")
+    log.info(f"  Molecules written: {n_escritos}"
+             + (f"  (excluded by minimum size: {n_pequenos})" if n_pequenos else ""))
+    if n_revertidos:
+        log.info(f"  Geometry reverted to the decoder's (minimizer diverged): "
+                 f"{n_revertidos}")
 
 
 def generate_ligands_for_site(
@@ -493,8 +594,21 @@ def generate_ligands_for_site(
     tensor_dir: Path,
     n_samples: int = 20,
     temperature: float = 1.0,
+    min_heavy_atoms: int = 7,
 ):
-    """Gera ligantes para os sítios do conjunto de teste e avalia qualidade."""
+    """Gera ligantes para os sítios do conjunto de teste e avalia qualidade.
+
+    min_heavy_atoms: mesmo limiar da curadoria
+    (pipeline_curate.CURATE_CONFIG["min_heavy_atoms"]) e da Etapa 7
+    (pipeline_generate.filter_candidates_by_size). Aqui NÃO descarta o
+    candidato: cada registro recebe "n_heavy" e "too_small", para que as
+    métricas de validade química continuem medidas sobre TODOS os
+    candidatos (trocar o denominador tornaria a validade incomparável com
+    a da Etapa 7) enquanto o SDF/SMI, que é o que se abre no visualizador,
+    fica só com moléculas de tamanho plausível. Era por falta deste campo
+    que butano (4 átomos) e N-N (2 átomos) apareciam em
+    generated_ligands_3d.sdf.
+    """
     if not HAS_TORCH:
         return []
 
@@ -540,21 +654,40 @@ def generate_ligands_for_site(
     log.info(f"Ligante real (cristal): {real_smiles}")
     log.info(f"Gerando {n_samples} ligantes (temperatura={temperature})...")
 
-    # Amostragem — construção sequencial em lockstep (ver LigandCVAE.sample)
+    # Química empírica da base, do próprio checkpoint — sem isto a montagem
+    # roda sem os priors que a Etapa 7 usa e as duas etapas deixam de ser
+    # comparáveis (ver _prepare_generate_module).
+    bond_stats = cfg.get("bond_stats") or None
+    gen = _prepare_generate_module(cfg, tensor_dir=tensor_dir)
+
+    # Amostragem — construção sequencial em lockstep (ver LigandCVAE.sample).
+    # bond_stats também entra no rollout: é o que habilita a janela de
+    # distância por par de elemento no rollback geométrico de
+    # LigandCVAE.sample (sem ele, a janela cai no limite genérico).
     generated_records = []
     voxel_sizes = batch["voxel_sizes"].to(device)
     with torch.no_grad():
         samples = model.sample(site,
                                n_samples=n_samples,
                                temperature=temperature,
-                               voxel_sizes=voxel_sizes)
+                               voxel_sizes=voxel_sizes,
+                               bond_stats=bond_stats)
         for candidate in samples:
-            mol = decode_predictions_to_mol(candidate)
+            mol = decode_predictions_to_mol(candidate, gen=gen)
             if mol:
                 smi = Chem.MolToSmiles(mol)
-                generated_records.append({"smiles": smi, "mol": mol})
+                n_heavy = mol.GetNumHeavyAtoms()
+                generated_records.append({
+                    "smiles": smi,
+                    "mol": mol,
+                    "n_heavy": n_heavy,
+                    "too_small": n_heavy < min_heavy_atoms,
+                })
             else:
-                generated_records.append({"smiles": "", "mol": None})
+                generated_records.append({
+                    "smiles": "", "mol": None,
+                    "n_heavy": 0, "too_small": True,
+                })
 
     return real_smiles, generated_records
 
@@ -835,7 +968,8 @@ def plot_performance_report(
         log.info(f"Performance report saved at: {out}")
     plt.close()
 
-def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path):
+def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path,
+         min_heavy_atoms: int = 7):
     
 
     print_section("1. TRAINING HISTORY ANALYSIS")
@@ -907,6 +1041,7 @@ def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path):
             tensor_dir=tensor_dir,
             n_samples=20,
             temperature=1.0,
+            min_heavy_atoms=min_heavy_atoms,
         )
 
         gen_smiles = [record["smiles"] for record in generated_records]
@@ -942,15 +1077,33 @@ def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path):
                  f"{'N/A (sascorer indisponível)' if sa_mean is None else sa_mean}")
         log.info(f"  Lipinski Rule           : {metrics.get('lipinski_%', 'N/A')}%")
 
+        # Funil de tamanho — o mesmo limiar da curadoria e da Etapa 7.
+        # Reportado separadamente da validade: um candidato de 2 átomos é
+        # quimicamente VÁLIDO e ao mesmo tempo inútil como ligante, e
+        # misturar as duas coisas numa só porcentagem esconde qual dos dois
+        # problemas o modelo tem.
+        tamanhos = [r.get("n_heavy", 0) for r in generated_records
+                    if r.get("mol") is not None]
+        n_pequenos = sum(1 for r in generated_records
+                         if r.get("mol") is not None and r.get("too_small"))
+        if tamanhos:
+            log.info(f"  Heavy atoms (valid)     : "
+                     f"median {int(np.median(tamanhos))}, "
+                     f"min {min(tamanhos)}, max {max(tamanhos)}")
+            log.info(f"  Below minimum size      : {n_pequenos} of "
+                     f"{len(tamanhos)} valid (excluded from SDF/SMI)")
+
         out_sdf = ckpt_dir / "generated_ligands_3d.sdf"
         save_generated_sdf(generated_records, out_sdf, real_smi)
 
-        # Save generated SMILES
+        # Save generated SMILES — mesmo critério de tamanho do SDF, para que
+        # os dois arquivos tragam o mesmo conjunto de moléculas.
         out_smi = ckpt_dir / "generated_smiles.smi"
         with open(out_smi, "w") as f:
             f.write(f"# Real crystal ligand: {real_smi}\n")
-            for smi in gen_smiles:
-                if smi:
+            for record in generated_records:
+                smi = record.get("smiles", "")
+                if smi and not record.get("too_small"):
                     f.write(smi + "\n")
         log.info(f"\n  SMILES saved at: {out_smi}")
 
@@ -1020,6 +1173,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Generate new ligands and evaluate chemical quality",
     )
+    parser.add_argument(
+        "--min-heavy-atoms",
+        type=int,
+        default=7,
+        help="Minimum heavy atoms for a generated molecule to be written to "
+             "the SDF/SMI (same threshold as curation and Step 7). It does "
+             "not change the validity metrics.",
+    )
     args = parser.parse_args()
 
     ckpt_dir = Path(args.ckpt)
@@ -1036,4 +1197,5 @@ if __name__ == "__main__":
         do_generate=args.generate,
         tensor_dir=tensor_dir,
         fig_dir=fig_dir,
+        min_heavy_atoms=args.min_heavy_atoms,
     )

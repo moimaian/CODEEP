@@ -1284,6 +1284,10 @@ _TEXTOS = {
         "en": "CHARMM36 (protein FF, requires GROMACS+AmberTools)",
         "pt": "CHARMM36 (FF de proteína, requer GROMACS+AmberTools)",
     },
+    "ff_none": {
+        "en": "None — raw decoder geometry (diagnostic)",
+        "pt": "Nenhum — geometria crua do decoder (diagnóstico)",
+    },
     "s7_lbl_final_ff": {"en": "Final geometry FF:", "pt": "FF de geometria final:"},
     "s7_tooltip_final_ff": {
         "en": "Force field for the final minimization of the COMPLEX (ligand +\nsite, not the "
@@ -1296,7 +1300,18 @@ _TEXTOS = {
               "(antechamber/parmchk2/tleap — conda-forge) on PATH.\nAutomatically falls back to "
               "MMFF/UFF with a log warning if missing.\nUses the amber99sb-ildn.ff/charmm27.ff "
               "folder already bundled with\nGROMACS by default (not the newer ff14SB/CHARMM36 "
-              "files,\nwhich do not ship with the standard installation).",
+              "files,\nwhich do not ship with the standard installation)."
+              "\n\nNone — does NOT minimize: writes out the raw geometry the\n"
+              "decoder produced. The steric clash check still runs, so the\n"
+              "clash columns stay available in the ranking and the report.\n"
+              "This is a DIAGNOSTIC option, not the best-quality one:\n"
+              "measured over 273 molecules, the mean bond-length error\n"
+              "against the database average is 0.179 Å raw against 0.061 Å\n"
+              "after minimization, and minimization improves 91.2% of the\n"
+              "molecules. Use it to separate what the model learned from\n"
+              "what the force field repaired — without it, every geometric\n"
+              "metric the software reports is post-force-field and says\n"
+              "nothing about the decoder.",
         "pt": "Campo de força para a minimização final do COMPLEXO (ligante +\nsítio, não o "
               "ligante isolado) antes da checagem de colisão\nestérica com a proteína.\n\n"
               "MMFF/UFF (RDKit) — padrão, sem dependência extra. UFF cobre\nmetais do sítio "
@@ -1307,7 +1322,19 @@ _TEXTOS = {
               "(antechamber/parmchk2/tleap — conda-forge) no PATH.\nCai automaticamente para "
               "MMFF/UFF com aviso no log se ausentes.\nUsa a pasta "
               "amber99sb-ildn.ff/charmm27.ff já empacotada com o\nGROMACS por padrão (não os "
-              "arquivos ff14SB/CHARMM36 mais\nrecentes, que não vêm com a instalação padrão).",
+              "arquivos ff14SB/CHARMM36 mais\nrecentes, que não vêm com a instalação padrão)."
+              "\n\nNenhum — NÃO minimiza: grava a geometria crua que o\n"
+              "decoder produziu. A checagem de colisão estérica continua\n"
+              "rodando, de modo que as colunas de colisão seguem\n"
+              "disponíveis no ranking e no relatório.\n"
+              "É opção de DIAGNÓSTICO, não a de melhor qualidade: medido\n"
+              "em 273 moléculas, o erro médio de comprimento de ligação\n"
+              "contra a média da base é 0,179 Å cru contra 0,061 Å depois\n"
+              "da minimização, e minimizar melhora 91,2% das moléculas.\n"
+              "Serve para separar o que o modelo aprendeu do que o campo\n"
+              "de força consertou — sem isso, toda métrica geométrica que\n"
+              "o software reporta é pós-campo de força e não diz nada\n"
+              "sobre o decoder.",
     },
     "s7_chk_induced_fit": {
         "en": "Induced-fit (flexible side chains)", "pt": "Induced-fit (cadeias laterais flexíveis)",

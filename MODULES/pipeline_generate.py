@@ -1224,13 +1224,214 @@ def _has_implausible_ring(mol: "Chem.Mol") -> bool:
     return False
 
 
+# Elementos que podem participar de um anel aromático em química de
+# pequenas moléculas. Halogênio e metal nunca; P aromático existe
+# (fosfinina) mas é raro o bastante para não valer o risco de kekulização.
+AROMATIC_CAPABLE = {"C", "N", "O", "S"}
+
+
+def _clear_atom_aromatic_flags(rwmol: "Chem.RWMol", idxs=None) -> None:
+    """Limpa o flag aromático dos ÁTOMOS (todos, se idxs=None).
+
+    RDKit marca GetIsAromatic()=True nos DOIS átomos quando a ligação é
+    criada por AddBond(..., BondType.AROMATIC) — e NÃO desmarca quando a
+    ligação é depois rebaixada. Limpar só o flag da LIGAÇÃO deixa o átomo
+    marcado e a sanitização continua falhando com "non-ring atom N marked
+    aromatic".
+
+    Medido no checkpoint ARCH5 (300 candidatos, 3 sítios do teste): 65,0%
+    de TODOS os candidatos morriam exatamente nesta mensagem e o caminho
+    de resgate salvava 0 de 260. Com esta limpeza, a sobrevivência à
+    sanitização vai de 10,0% para 87,3% e a média de átomos pesados na
+    saída de 6,8 para 19,5.
+
+    O defeito era latente: antes da correção de ordem de ligação do CCD a
+    base tinha quase só ligações simples, então _assemble_bonds_global —
+    que escolhe o tipo pela frequência do par na base — praticamente nunca
+    atribuía AROMATIC. Com a base corrigida (C-C aromático 34,0% contra
+    23,8% de C-C simples), 87,7% dos candidatos passaram a receber ao
+    menos uma ligação aromática, e o defeito virou a causa de morte
+    dominante.
+    """
+    alvo = range(rwmol.GetNumAtoms()) if idxs is None else idxs
+    for i in alvo:
+        atom = rwmol.GetAtomWithIdx(int(i))
+        if atom is not None:
+            atom.SetIsAromatic(False)
+
+
+def _reperceive_aromatic_rings(
+    rwmol: "Chem.RWMol",
+    symbols: list,
+    positions: np.ndarray,
+    max_val_fn,
+) -> int:
+    """Re-percepção de aromaticidade PÓS-montagem: promove a AROMATIC os
+    anéis de 5-6 membros cuja geometria já é aromática.
+
+    Por que é necessário: _assemble_bonds_global decide o TIPO da ligação
+    pela frequência do par na base, par a par, sem saber que o par faz
+    parte de um ciclo. Um C-C a 1,39 Å (distância de livro-texto para
+    aromático) pode sair SIMPLES porque a frequência agregada de C-C
+    simples compete com a de C-C aromático — e seis decisões locais
+    independentes quase nunca saem todas aromáticas ao mesmo tempo.
+    Medido antes desta passada: 0% de aromaticidade na saída, contra ~71%
+    das moléculas da base tendo um anel de 6.
+
+    A aromaticidade é propriedade do CICLO, não do par isolado: só se pode
+    decidir depois de o ciclo existir. É o que esta função faz, logo antes
+    da sanitização, quando a conectividade já é definitiva.
+
+    Critérios para promover um anel (todos obrigatórios):
+      - tamanho 5 ou 6 (os únicos relevantes em química de fármacos);
+      - todos os átomos em AROMATIC_CAPABLE (C/N/O/S);
+      - toda ligação do anel com distância dentro da janela AROMÁTICA
+        medida na base para aquele par de elementos (_bond_distance_ok,
+        isto é p99 + tolerância) — é a geometria que autoriza, não a
+        topologia sozinha;
+      - folga de valência em todos os átomos do anel: AROMATIC custa 1,5
+        contra 1,0 de SINGLE (BOND_ORDER_BUDGET), então promover as duas
+        ligações de anel de um átomo acrescenta 1,0 à sua valência usada.
+        Sem esta checagem a promoção estouraria a valência e o candidato
+        morreria na sanitização — trocaria um rótulo errado por uma
+        molécula descartada.
+
+    A sanitização continua sendo o juiz final: um anel promovido que não
+    kekuliza cai no resgate cirúrgico de _sanitize_generated_mol, que o
+    rebaixa de volta. Promover aqui é, portanto, aposta sem risco de
+    perder candidato.
+
+    Retorna quantos anéis foram promovidos.
+    """
+    try:
+        Chem.FastFindRings(rwmol)
+        rings = rwmol.GetRingInfo().AtomRings()
+    except Exception:
+        return 0
+
+    def _ordem_usada(idx: int) -> float:
+        """Soma das ordens das ligações do átomo, pelo tipo ATUAL."""
+        atom = rwmol.GetAtomWithIdx(int(idx))
+        return sum(float(BOND_ORDER_BUDGET.get(b.GetBondType(), 1.0))
+                   for b in atom.GetBonds())
+
+    promovidos = 0
+    for ring in rings:
+        if len(ring) not in (5, 6):
+            continue
+        if any(symbols[i].upper() not in AROMATIC_CAPABLE for i in ring):
+            continue
+
+        # Ligações do ciclo, na ordem do anel.
+        ring_bonds = []
+        ok = True
+        for k in range(len(ring)):
+            i, j = int(ring[k]), int(ring[(k + 1) % len(ring)])
+            bond = rwmol.GetBondBetweenAtoms(i, j)
+            if bond is None:
+                ok = False
+                break
+            if bond.GetBondType() == BondType.AROMATIC:
+                ok = False          # já aromático — nada a fazer neste anel
+                break
+            dist = float(np.linalg.norm(positions[i] - positions[j]))
+            if not _bond_distance_ok(symbols[i], symbols[j],
+                                     BondType.AROMATIC, dist):
+                ok = False
+                break
+            ring_bonds.append((i, j, bond))
+        if not ok or len(ring_bonds) != len(ring):
+            continue
+
+        # Folga de valência: cada átomo do anel participa de 2 ligações do
+        # ciclo, cada uma subindo de (tipo atual) para 1,5.
+        incremento = {}
+        for (i, j, bond) in ring_bonds:
+            delta = 1.5 - float(BOND_ORDER_BUDGET.get(bond.GetBondType(), 1.0))
+            incremento[i] = incremento.get(i, 0.0) + delta
+            incremento[j] = incremento.get(j, 0.0) + delta
+        cabe = True
+        for idx, delta in incremento.items():
+            if delta <= 0.0:
+                continue
+            if (_ordem_usada(idx) + delta
+                    > max_val_fn(symbols[idx].upper(), idx) + 1e-6):
+                cabe = False
+                break
+        if not cabe:
+            continue
+
+        for (i, j, bond) in ring_bonds:
+            bond.SetBondType(BondType.AROMATIC)
+            bond.SetIsAromatic(True)
+        for idx in ring:
+            rwmol.GetAtomWithIdx(int(idx)).SetIsAromatic(True)
+        promovidos += 1
+
+    return promovidos
+
+
 def _sanitize_generated_mol(mol: "Chem.Mol") -> "Chem.Mol | None":
+    """Sanitiza o candidato em cascata, preservando o máximo de
+    aromaticidade que o RDKit aceitar.
+
+    1. sanitiza como está;
+    2. resgate CIRÚRGICO — rebaixa só as ligações aromáticas SEM suporte
+       de anel de 5-6 (a causa do erro "non-ring atom marked aromatic"),
+       limpando o flag dos átomos que ficaram sem nenhuma ligação
+       aromática, e PRESERVA os anéis aromáticos legítimos;
+    3. último recurso — rebaixa TODA a aromaticidade, ligação E átomo
+       (ver _clear_atom_aromatic_flags: o flag do átomo é o que o resgate
+       antigo esquecia, e por isso salvava zero candidatos).
+    """
     try:
         Chem.SanitizeMol(mol)
         return mol
     except Exception:
         pass
 
+    # ── 2. Resgate cirúrgico: só a aromaticidade sem anel ────────────────
+    # Rebaixar em bloco perde os anéis aromáticos que a montagem acertou;
+    # o que de fato impede a sanitização é a ligação aromática ACÍCLICA
+    # (ou em anel de tamanho que não kekuliza). Rebaixa-se apenas essas e
+    # tenta de novo.
+    try:
+        rw = Chem.RWMol(mol)
+        Chem.FastFindRings(rw)
+        aneis = rw.GetRingInfo().AtomRings()
+        mudou = False
+        for bond in rw.GetBonds():
+            if bond.GetBondType() != BondType.AROMATIC:
+                continue
+            i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            em_anel_valido = any(
+                len(r) in (5, 6) and i in r and j in r for r in aneis
+            )
+            if em_anel_valido:
+                continue
+            bond.SetBondType(BondType.SINGLE)
+            bond.SetIsAromatic(False)
+            mudou = True
+        if mudou:
+            # Átomos que não sobraram com nenhuma ligação aromática perdem
+            # o flag — é a correção de fundo (_clear_atom_aromatic_flags).
+            orfaos = [
+                atom.GetIdx() for atom in rw.GetAtoms()
+                if atom.GetIsAromatic() and not any(
+                    b.GetBondType() == BondType.AROMATIC
+                    for b in atom.GetBonds())
+            ]
+            _clear_atom_aromatic_flags(rw, orfaos)
+            cirurgico = rw.GetMol()
+            try:
+                Chem.SanitizeMol(cirurgico)
+                return cirurgico
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ── 3. Último recurso: rebaixa tudo (ligação E átomo) ────────────────
     aromatic_bonds = [
         (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
         for bond in mol.GetBonds()
@@ -1244,6 +1445,7 @@ def _sanitize_generated_mol(mol: "Chem.Mol") -> "Chem.Mol | None":
                 continue
             bond.SetBondType(BondType.SINGLE)
             bond.SetIsAromatic(False)
+        _clear_atom_aromatic_flags(downgraded)
         downgraded_mol = downgraded.GetMol()
         try:
             Chem.SanitizeMol(downgraded_mol)
@@ -1450,15 +1652,26 @@ def _assemble_bonds_global(atom_types: np.ndarray, positions: np.ndarray,
             #      constante): melhor que (1), mas ainda fragmentava mais
             #      que a frequência pura — sobrevivência 29% contra 81%.
             #
-            # A frequência sozinha tem uma imperfeição conhecida e aceita:
-            # um C-C a 1,39 Å (distância de livro-texto para aromático)
-            # pode virar ligação SIMPLES em vez de aromática, porque a base
-            # tem mais pares C-C simples que aromáticos NO TOTAL. Isso é
-            # um rótulo de ORDEM de ligação errado — não afeta a contagem
-            # de anéis (RDKit conta o ciclo independente da ordem), que é
-            # o problema que esta correção ataca; afeta perceber
-            # aromaticidade corretamente, o que fica para trabalho futuro
-            # (ex.: uma passada de reclassificação de anel pós-montagem).
+            # A frequência sozinha tem uma imperfeição conhecida: um C-C
+            # a 1,39 Å (distância de livro-texto para aromático) pode
+            # virar SIMPLES, porque a decisão é par a par e não sabe que o
+            # par pertence a um ciclo — seis decisões locais independentes
+            # quase nunca saem todas aromáticas ao mesmo tempo. Isso é um
+            # rótulo de ORDEM de ligação errado; não afeta a contagem de
+            # anéis (RDKit conta o ciclo independente da ordem), que é o
+            # problema que esta correção ataca.
+            #   Consequência medida: 0% de aromaticidade na saída. Daí a
+            # passada de reclassificação PÓS-montagem que hoje existe —
+            # _reperceive_aromatic_rings, chamada em preds_to_mol depois de
+            # a conectividade ficar definitiva, que é o único momento em
+            # que o ciclo existe para ser julgado.
+            #   Nota sobre as frequências: depois da correção de ordem de
+            # ligação do CCD, C-C aromático (34,0%) passou a ser MAIS
+            # frequente que C-C simples (23,8%) — o inverso do que era
+            # quando esta função foi escrita. A escolha por frequência
+            # passou a atribuir AROMATIC com frequência, o que trouxe à
+            # superfície o defeito de flag de átomo descrito em
+            # _clear_atom_aromatic_flags.
             # A distância continua um FILTRO (_bond_distance_ok já exige
             # estar dentro do p99 medido + tolerância) — só deixou de
             # competir na pontuação com a frequência.
@@ -1501,7 +1714,7 @@ def _assemble_bonds_global(atom_types: np.ndarray, positions: np.ndarray,
     return bonds, valence_used
 
 
-FINAL_FF_METHODS = ("mmff_uff", "amber_ff14sb", "charmm36")
+FINAL_FF_METHODS = ("mmff_uff", "amber_ff14sb", "charmm36", "none")
 
 # Nome do campo de força GROMACS (pasta <nome>.ff) para cada opção exposta
 # na interface. GROMACS não traz amber14sb/charmm36 nativamente (só até
@@ -2075,6 +2288,60 @@ def _check_pocket_clashes(mol: "Chem.Mol", site_coords: np.ndarray,
     return result
 
 
+# Limites de sanidade da geometria PÓS-minimização. Não são critérios de
+# qualidade química — são critérios de DIVERGÊNCIA do minimizador.
+# Nenhuma ligação covalente entre átomos pesados passa de ~2,2 Å, e nenhum
+# par de átomos pesados fica a menos de ~1,2 Å (N≡N, o mais curto). Os
+# valores abaixo são folgados de propósito: só pegam explosão numérica.
+RELAX_MAX_BOND_DIST = 2.60   # Å — acima disto a ligação "arrebentou"
+RELAX_MIN_ATOM_DIST = 0.70   # Å — abaixo disto os átomos colapsaram
+
+
+def _geometry_is_sane(mol: "Chem.Mol") -> bool:
+    """A geometria atual do confôrmero é fisicamente possível?
+
+    Motivo, medido no checkpoint ARCH5: a geometria CRUA do decoder é
+    sólida — distâncias de ligação média 1,40 Å, p95 1,83 Å, raio máximo
+    por molécula 13,8 Å, ZERO átomos além de 15 Å em 300 candidatos.
+    DEPOIS de _relax_generated_geometry (MMFF94s/UFF), o raio máximo
+    chegava a 211,3 Å e 8 de 262 moléculas passavam de 15 Å: o
+    minimizador DIVERGE em moléculas tensionadas (anel espúrio de 3-4
+    membros, valência no limite) e o resultado era aceito sem nenhuma
+    conferência. É a causa do sintoma "o SMILES abre bem no editor 2D mas
+    o SDF 3D é totalmente irreal" — o grafo está intacto, as coordenadas
+    explodiram.
+
+    O teste é por COMPRIMENTO DE LIGAÇÃO, não por raio da molécula: é
+    independente do tamanho do ligante (um ligante grande e legítimo tem
+    raio grande, mas nunca uma ligação de 50 Å) e uma translação de corpo
+    rígido, que é inofensiva, não o dispara.
+    """
+    try:
+        if mol is None or mol.GetNumConformers() == 0:
+            return True
+        conf = mol.GetConformer()
+        n = mol.GetNumAtoms()
+        if n == 0:
+            return True
+        pos = np.array([list(conf.GetAtomPosition(i)) for i in range(n)],
+                       dtype=float)
+        if not np.all(np.isfinite(pos)):
+            return False
+        for bond in mol.GetBonds():
+            i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            if float(np.linalg.norm(pos[i] - pos[j])) > RELAX_MAX_BOND_DIST:
+                return False
+        if n > 1:
+            d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)
+            np.fill_diagonal(d, np.inf)
+            if float(d.min()) < RELAX_MIN_ATOM_DIST:
+                return False
+        return True
+    except Exception:
+        # Não conseguir conferir não é motivo para descartar a geometria.
+        return True
+
+
 def _relax_generated_geometry(
     mol: "Chem.Mol",
     site_coords: "np.ndarray | None" = None,
@@ -2104,7 +2371,28 @@ def _relax_generated_geometry(
               "amber_ff14sb" | "charmm36" (via GROMACS+AmberTools — cai
               para "mmff_uff" automaticamente se a pilha GROMACS/acpype
               não estiver instalada, ou se gromacs_site_topology não foi
-              construída, com aviso no log).
+              construída, com aviso no log) | "none".
+
+              "none" NÃO minimiza: entrega a geometria crua do decoder.
+              A checagem de colisão estérica e a guarda de sanidade
+              continuam rodando normalmente — é só a minimização que é
+              desviada, para que has_pocket_clash/n_pocket_clashes sigam
+              disponíveis em rank_candidates e no relatório HTML.
+
+              Não é a opção de melhor geometria, e sim a de DIAGNÓSTICO.
+              Medido (273 moléculas, checkpoint ARCH5, erro médio de
+              comprimento de ligação contra a média da base):
+
+                geometria crua do decoder : 0,179 Å (mediana 0,172)
+                depois da minimização     : 0,061 Å (mediana 0,037)
+
+              A minimização melhora 91,2% das moléculas, piora 0,7%, e em
+              8,1% diverge e é revertida pela guarda (_geometry_is_sane).
+              Ou seja: para PRODUZIR candidatos, minimizar é melhor. Usar
+              "none" serve para separar o que o modelo aprendeu do que o
+              campo de força consertou — sem isso, toda métrica geométrica
+              reportada pelo software é pós-campo de força e não diz nada
+              sobre o decoder.
     gromacs_site_topology: dict retornado por
               _build_gromacs_site_topology — construído UMA VEZ por sítio
               pelo chamador (generate_candidates), não aqui (custaria caro
@@ -2122,6 +2410,14 @@ def _relax_generated_geometry(
     if mol is None or mol.GetNumConformers() == 0 or mol.GetNumBonds() == 0:
         return mol
 
+    # final_ff="none": geometria crua do decoder, sem minimização nenhuma.
+    # Só a MINIMIZAÇÃO é desviada — a checagem de colisão estérica no fim
+    # desta função continua rodando, porque é ela que grava
+    # has_pocket_clash/n_pocket_clashes, consumidas por rank_candidates e
+    # pelo relatório HTML. Pular a função inteira apagaria essas colunas
+    # em silêncio.
+    sem_minimizacao = (final_ff == "none")
+
     # ── Hidrogênios explícitos para a minimização ─────────────────────────
     # MMFF94s e UFF precisam dos hidrogênios como partículas: sem eles
     # faltam os termos de estiramento X–H, os ângulos em torno de carbonos
@@ -2138,36 +2434,73 @@ def _relax_generated_geometry(
     # coordenadas melhoradas: o restante do pipeline (métricas, SMILES,
     # SDF) espera esse formato.
     n_heavy = mol.GetNumAtoms()
-    try:
-        mol_h = Chem.AddHs(mol, addCoords=True)
-        tem_h = mol_h.GetNumAtoms() > n_heavy
-    except Exception as exc:
-        log.debug(f"  AddHs falhou ({type(exc).__name__}: {exc}); "
-                  "minimizando sem hidrogênios explícitos")
+    if sem_minimizacao:
+        # Os hidrogênios explícitos só existem para entrar no campo de
+        # força; sem minimização não há para que adicioná-los (a checagem
+        # de colisão roda sobre os átomos pesados).
         mol_h, tem_h = mol, False
+    else:
+        try:
+            mol_h = Chem.AddHs(mol, addCoords=True)
+            tem_h = mol_h.GetNumAtoms() > n_heavy
+        except Exception as exc:
+            log.debug(f"  AddHs falhou ({type(exc).__name__}: {exc}); "
+                      "minimizando sem hidrogênios explícitos")
+            mol_h, tem_h = mol, False
+
+    # Geometria de ANTES da minimização — a do próprio decoder, que foi
+    # medida como sólida. É o estado para o qual se volta se o minimizador
+    # divergir (ver _geometry_is_sane).
+    try:
+        _conf_pre = mol.GetConformer()
+        coords_pre = [list(_conf_pre.GetAtomPosition(i)) for i in range(n_heavy)]
+    except Exception:
+        coords_pre = None
 
     def _devolve_coords():
-        """Traz as posições dos átomos pesados de mol_h de volta para mol."""
-        if not tem_h:
-            return
-        cf, cm = mol_h.GetConformer(), mol.GetConformer()
-        for i in range(n_heavy):
-            cm.SetAtomPosition(i, cf.GetAtomPosition(i))
+        """Traz as posições dos átomos pesados de mol_h de volta para mol,
+        e REVERTE se a minimização divergiu."""
+        if tem_h:
+            cf, cm = mol_h.GetConformer(), mol.GetConformer()
+            for i in range(n_heavy):
+                cm.SetAtomPosition(i, cf.GetAtomPosition(i))
+
+        # Guarda contra divergência: aceitar sem conferir era o que
+        # produzia SDF com átomos a 211 Å do centroide.
+        if coords_pre is not None and not _geometry_is_sane(mol):
+            cm = mol.GetConformer()
+            for i in range(n_heavy):
+                cm.SetAtomPosition(i, coords_pre[i])
+            mol.SetBoolProp("relax_reverted", True)
+            log.debug("  Minimização divergiu (ligação acima de "
+                      f"{RELAX_MAX_BOND_DIST} Å ou átomos colapsados) — "
+                      "geometria revertida para a do decoder.")
+        else:
+            mol.SetBoolProp("relax_reverted", False)
 
     have_site = site_coords is not None and site_elements is not None and len(site_elements) > 0
     have_site_mol = site_mol is not None and site_is_backbone is not None
 
     if not have_site:
-        try:
-            if AllChem.MMFFHasAllMoleculeParams(mol_h):
-                AllChem.MMFFOptimizeMolecule(mol_h, mmffVariant="MMFF94s", maxIters=200)
-            else:
-                AllChem.UFFOptimizeMolecule(mol_h, maxIters=200)
-        except Exception:
-            pass
+        if not sem_minimizacao:
+            try:
+                if AllChem.MMFFHasAllMoleculeParams(mol_h):
+                    AllChem.MMFFOptimizeMolecule(mol_h, mmffVariant="MMFF94s", maxIters=200)
+                else:
+                    AllChem.UFFOptimizeMolecule(mol_h, maxIters=200)
+            except Exception:
+                pass
         _devolve_coords()
         return mol
 
+    if induced_fit and sem_minimizacao:
+        # Induced-fit é uma escolha de QUEM pode se mover durante a
+        # minimização; sem minimização ele não tem efeito nenhum. Avisar,
+        # em vez de ignorar em silêncio.
+        log.warning("  induced_fit=True não tem efeito com final_ff='none' "
+                    "(não há minimização em que a cadeia lateral possa se "
+                    "mover) — ignorado.")
+        induced_fit = False
     if induced_fit and not have_site_mol:
         log.warning("  induced_fit=True requer site_mol/site_is_backbone "
                     "(indisponíveis — provavelmente protonate_site=False) "
@@ -2193,7 +2526,11 @@ def _relax_generated_geometry(
     effective_site_coords = site_coords
     effective_site_elements = site_elements
     minimized = False
-    if final_ff in ("amber_ff14sb", "charmm36"):
+    if sem_minimizacao:
+        # Nada a minimizar: cai direto na checagem de colisão abaixo, que
+        # passa a avaliar a geometria CRUA do decoder dentro do bolso.
+        pass
+    elif final_ff in ("amber_ff14sb", "charmm36"):
         if HAS_GROMACS and HAS_ACPYPE and gromacs_site_topology is not None and have_site_mol:
             # Também recebe o ligante com H explícitos: o antechamber precisa
             # deles para a tipagem GAFF. Caminho não exercitado nesta máquina
@@ -2218,7 +2555,7 @@ def _relax_generated_geometry(
                 f"(gromacs_site_topology) — não construída (ver "
                 f"_build_gromacs_site_topology). Usando RDKit MMFF/UFF como fallback."
             )
-    if not minimized and have_site_mol:
+    if not minimized and have_site_mol and not sem_minimizacao:
         try:
             # n_lig passa a contar também os hidrogênios do ligante, o que
             # mantém o deslocamento correto para a parte do sítio e, com ela,
@@ -2239,7 +2576,7 @@ def _relax_generated_geometry(
             log.debug(f"  Minimização conjunta RDKit falhou: {type(e).__name__}: {e}")
             minimized = False
 
-    if not minimized:
+    if not minimized and not sem_minimizacao:
         # Nenhum campo de força pôde ser construído para o complexo —
         # cai para a relaxação isolada (melhor que geometria não relaxada).
         try:
@@ -2406,6 +2743,16 @@ def preds_to_mol(
         # Portão de carga formal — depois das ligações, quando o grau é
         # definitivo (ver _gate_formal_charges).
         _gate_formal_charges(rwmol)
+
+        # Re-percepção de aromaticidade: a montagem global decide o TIPO
+        # par a par, sem saber do ciclo, e por isso um anel de benzeno
+        # geometricamente perfeito costuma sair todo SIMPLES. Promover aqui,
+        # com o ciclo já fechado e a geometria autorizando, é a única
+        # oportunidade de a aromaticidade aparecer (ver
+        # _reperceive_aromatic_rings). A cascata de _sanitize_generated_mol
+        # desfaz a promoção se o anel não kekulizar, então não há risco de
+        # perder candidato.
+        _reperceive_aromatic_rings(rwmol, symbols, positions, _max_val)
 
         mol = _sanitize_generated_mol(rwmol.GetMol())
         if mol is None:
@@ -3155,7 +3502,11 @@ Exemplos:
                              "ligante+sítio (padrão: mmff_uff — RDKit, sem dependência "
                              "extra). amber_ff14sb/charmm36 requerem GROMACS (gmx) + "
                              "acpype + AmberTools (antechamber/parmchk2/tleap) no PATH "
-                             "— caem automaticamente para mmff_uff se ausentes.")
+                             "— caem automaticamente para mmff_uff se ausentes. "
+                             "none = NÃO minimiza, entrega a geometria crua do "
+                             "decoder (a checagem de colisão estérica continua "
+                             "rodando). Opção de diagnóstico: minimizar produz "
+                             "geometria melhor em 91% das moléculas.")
     parser.add_argument("--induced-fit", action="store_true",
                         help="Trava só o backbone do sítio (N,Cα,C,O) na minimização "
                              "final, deixando a cadeia lateral livre para se ajustar "
