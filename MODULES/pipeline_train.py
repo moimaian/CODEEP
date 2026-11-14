@@ -585,6 +585,67 @@ _ATOM_TYPE_MAXVAL = torch.tensor(
 # mesma convenção de pipeline_generate.BOND_ORDER_BUDGET.
 _BOND_ORDER = torch.tensor([1.0, 2.0, 3.0, 1.5], dtype=torch.float32)
 
+# Raio de van der Waals por ÍNDICE de ATOM_TYPES (Å) — espelha
+# pipeline_generate.VDW_RADII_CLASH, duplicado aqui pelo mesmo motivo de
+# ATOM_TYPES_NAMES/_ATOM_TYPE_MAXVAL: constante pequena e estável que os
+# dois módulos precisam conhecer sem se importarem. "OTHER" recebe o
+# default de 1.70 (= VDW_RADIUS_DEFAULT).
+_ATOM_TYPE_VDW = torch.tensor(
+    [1.70, 1.55, 1.52, 1.80, 1.80, 1.47, 1.75, 1.85, 1.98,
+     2.05, 1.39, 1.73, 1.70], dtype=torch.float32
+)
+
+# ── Guia estérico da amostragem (camada 0) ───────────────────────────────────
+# O decoder não vê a proteína: o único sinal do sítio que chega até ele é z,
+# um vetor global. Medido no bolso P2Rank do 2pc8, a geometria crua põe 65%
+# dos átomos a menos de 2,0 Å de um átomo da proteína, e a minimização com
+# sítio rígido não resolve. Estas duas regras agem no laço de reamostragem
+# que já existia (rollback geométrico): a posição sorteada é REJEITADA e
+# sorteada de novo se
+#   (a) colidir com a proteína pelo mesmo critério da métrica de avaliação
+#       (CLASH_VDW_FACTOR × soma dos raios — ver _check_pocket_clashes); ou
+#   (b) cair perto demais de um átomo que não é o focal: menos de
+#       GUARD_MIN_ANY_DIST de qualquer um, ou menos de GUARD_MIN_13_DIST de
+#       um que esteja a 1-2 ligações do focal (exclusão 1-3/1-4). Sem esta
+#       regra nada impede o triângulo na origem: _bond_angle_ok usa 45° de
+#       mínimo e os ângulos internos de um anel de 3 são 60°.
+# (a) exige as coordenadas do sítio, então só age quando o chamador as
+# passa; (b) depende apenas do grafo parcial e age sempre.
+GUARD_MIN_ANY_DIST = 1.1    # Å — nenhum par não-ligado real fica abaixo disso
+GUARD_MIN_13_DIST  = 2.3    # Å — 1-3 de um ângulo de ~109° com ligações de 1,4 Å
+
+
+def _viola_vizinhanca(pos_list, bonds_list, f, p_xyz,
+                      min_any: float = GUARD_MIN_ANY_DIST,
+                      min_13:  float = GUARD_MIN_13_DIST) -> bool:
+    """True se o ponto p_xyz fica perto demais de um átomo que NÃO é o focal.
+
+    pos_list : lista de [x,y,z] dos átomos já colocados do candidato
+    bonds_list : lista de (i, j, tipo) já decididos, índices locais
+    f : índice local do átomo focal (o novo átomo vai se ligar a ele)
+    """
+    if not pos_list:
+        return False
+    P  = np.asarray(pos_list, dtype=np.float64)
+    dd = np.linalg.norm(P - np.asarray(p_xyz, dtype=np.float64), axis=1)
+    # topo = átomos a 1 e 2 ligações do focal (via as ligações já decididas)
+    topo = {f: 0}
+    fronteira = [f]
+    for dep in (1, 2):
+        prox = []
+        for (bi, bj, _bt) in bonds_list:
+            for a_, b_ in ((bi, bj), (bj, bi)):
+                if a_ in fronteira and b_ not in topo:
+                    topo[b_] = dep
+                    prox.append(b_)
+        fronteira = prox
+    for k in range(len(P)):
+        if k == f:
+            continue
+        if dd[k] < min_any or (k in topo and dd[k] < min_13):
+            return True
+    return False
+
 #: Versão da arquitetura do decoder, gravada no checkpoint.
 #:   1 — cabeça de posição determinística (Huber sobre coordenada absoluta
 #:       no referencial da grade), decoder sem geometria nem tipo de
@@ -1622,6 +1683,11 @@ class LigandCVAE(nn.Module):
         ecfp4:           "torch.Tensor | None" = None,
         bond_stats:      "dict | None" = None,
         max_pos_retry:   int = 20,
+        guard_site_coords: "np.ndarray | None" = None,
+        guard_site_radii:  "np.ndarray | None" = None,
+        guard_origin:      "np.ndarray | None" = None,
+        guard_clash_factor: float = 0.75,
+        guard_13:          bool = True,
     ) -> list:
         """Gera novos ligantes condicionados no sítio — construção
         SEQUENCIAL autorregressiva (um átomo por vez, condicionado no
@@ -1676,6 +1742,25 @@ class LigandCVAE(nn.Module):
         valence_used: list = [[] for _ in range(n_samples)]
         bond_counts:  list = [[] for _ in range(n_samples)]
         finished = [False] * n_samples
+
+        # ── Guia estérico (ver GUARD_MIN_ANY_DIST) ────────────────────────
+        # As posições geradas estão no referencial da GRADE; as coordenadas
+        # do sítio chegam em Å absolutos. guard_origin é a origem da grade,
+        # somada à posição sorteada para comparar no mesmo referencial.
+        guard_xyz = guard_rad = None
+        if guard_site_coords is not None and len(guard_site_coords) > 0:
+            guard_xyz = torch.as_tensor(
+                np.asarray(guard_site_coords, dtype=np.float32), device=device)
+            if guard_site_radii is None:
+                guard_rad = torch.full((guard_xyz.shape[0],), 1.70, device=device)
+            else:
+                guard_rad = torch.as_tensor(
+                    np.asarray(guard_site_radii, dtype=np.float32), device=device)
+        guard_off = torch.zeros(3, device=device)
+        if guard_origin is not None:
+            guard_off = torch.as_tensor(
+                np.asarray(guard_origin, dtype=np.float32), device=device)
+        n_rej = [0, 0, 0]   # [colisão, vizinhança 1-3, sorteios avaliados]
 
         for t in range(max_atoms):
             active = [c for c in range(n_samples) if not finished[c]]
@@ -1866,7 +1951,26 @@ class LigandCVAE(nn.Module):
                 lim_lo, lim_hi = 0.9, 2.0
                 for _tent in range(max_pos_retry):
                     ruim = []
+                    # Colisão com a proteína — vetorizada para todos os
+                    # candidatos de uma vez (uma cdist por tentativa, não uma
+                    # por candidato). Vale TAMBÉM para o primeiro átomo, que
+                    # não tem focal: medido, ele cai a menos de 2,0 Å de um
+                    # átomo da proteína em 40% dos sorteios.
+                    colide = None
+                    if guard_xyz is not None:
+                        r_novo = _ATOM_TYPE_VDW.to(device)[
+                            next_type[cl_t].clamp(max=_ATOM_TYPE_VDW.shape[0] - 1)]
+                        lim_cl = guard_clash_factor * (
+                            r_novo.unsqueeze(1) + guard_rad.unsqueeze(0))
+                        colide = (torch.cdist(sampled + guard_off,
+                                              guard_xyz) < lim_cl).any(dim=1)
+                    samp_cpu = (sampled.detach().cpu().numpy()
+                                if (colide is not None or guard_13) else None)
                     for k, li in enumerate(continue_local):
+                        n_rej[2] += 1
+                        if colide is not None and bool(colide[k]):
+                            ruim.append(k); n_rej[0] += 1
+                            continue
                         f = focal_local.get(li, -1)
                         if f < 0:
                             continue          # primeiro átomo: sem âncora
@@ -1884,6 +1988,11 @@ class LigandCVAE(nn.Module):
                             hi = (max(p99) + 0.15) if p99 else lim_hi
                         if not (lim_lo <= d <= hi):
                             ruim.append(k)
+                            continue
+                        if guard_13 and _viola_vizinhanca(
+                                positions[cand], bonds[cand], f, samp_cpu[k]):
+                            ruim.append(k); n_rej[1] += 1
+                            continue
                     if not ruim:
                         break
                     novo = _draw()
@@ -1969,6 +2078,14 @@ class LigandCVAE(nn.Module):
                 bond_counts[cand].append(new_counts)
                 if len(atom_types[cand]) >= max_atoms:
                     finished[cand] = True
+
+        if n_rej[0] or n_rej[1]:
+            log.info(
+                f"  Guia estérico: {n_rej[2]} posições avaliadas, "
+                f"{n_rej[0]} rejeitadas por colisão com o sítio"
+                f"{'' if guard_xyz is not None else ' (inativo)'}, "
+                f"{n_rej[1]} por vizinhança 1-3."
+            )
 
         results = []
         for cand in range(n_samples):

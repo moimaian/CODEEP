@@ -2811,6 +2811,7 @@ def generate_candidates(
     ligand_charge_method: str = "gas",
     origin: "np.ndarray | None" = None,
     pos_frame: "str | None" = None,
+    steric_guard: bool = True,
 ) -> list[dict]:
     """Gera N candidatos a partir do tensor do sítio — construção
     SEQUENCIAL autorregressiva (um átomo por vez), com TODOS os n_samples
@@ -2834,6 +2835,21 @@ def generate_candidates(
     tensor = torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     voxel_sizes_gen = torch.tensor([voxel_size], dtype=torch.float32).to(DEVICE)
 
+    # Coordenadas e raios do sítio para o guia estérico da amostragem. Sem
+    # elas o guia cai para a regra de vizinhança 1-3, que não precisa do
+    # sítio. A etapa 6 (pipeline_evaluate) está nesse caso: lá só existe o
+    # tensor do par, não as coordenadas do bolso.
+    guard_xyz = guard_rad = None
+    if steric_guard and site_coords is not None and len(site_coords) > 0:
+        guard_xyz = np.asarray(site_coords, dtype=np.float32)
+        elems_g = ([e.upper() for e in site_elements]
+                   if site_elements is not None else ["C"] * len(guard_xyz))
+        guard_rad = np.array(
+            [VDW_RADII_CLASH.get(e, VDW_RADIUS_DEFAULT) for e in elems_g],
+            dtype=np.float32)
+        log.info(f"  Guia estérico ativo: {len(guard_xyz)} átomos do sítio, "
+                 f"fator {CLASH_VDW_FACTOR}")
+
     with torch.no_grad():
         samples = model.sample(
             tensor, n_samples=n_samples, temperature=temperature,
@@ -2843,6 +2859,18 @@ def generate_candidates(
             # rollback geométrico saber qual distância é aceitável para cada
             # par de elementos, em vez de uma janela genérica.
             bond_stats=BOND_STATS or None,
+            # ── Guia estérico (ver GUARD_MIN_ANY_DIST em pipeline_train) ──
+            # Rejeita, no laço de reamostragem que já existia, a posição que
+            # colide com o sítio pelo MESMO critério de _check_pocket_clashes
+            # (CLASH_VDW_FACTOR × soma dos raios), e a que cai perto demais
+            # de um átomo a 1-2 ligações do focal. O orçamento de tentativas
+            # sobe porque o decoder, cego para a proteína, propõe muita
+            # posição ocupada: medido, ~40% dos sorteios são rejeitados.
+            max_pos_retry=60 if guard_xyz is not None else 20,
+            guard_site_coords=guard_xyz,
+            guard_site_radii=guard_rad,
+            guard_origin=(origin if pos_frame == "grid_origin_angstrom" else None),
+            guard_clash_factor=CLASH_VDW_FACTOR,
         )
 
     # ── Referencial das posições geradas ──────────────────────────────────
