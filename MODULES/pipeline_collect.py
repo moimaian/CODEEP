@@ -390,7 +390,7 @@ def collect_phase2(
     Parâmetros
     ----------
     job_dir : Path | str | None
-        Diretório raiz do job (JOBS/<job_id>/). Se None usa BASE_DIR.
+        Diretório raiz do job (PROJECTS/<job_id>/). Se None usa BASE_DIR.
         PDBs vão para <job_dir>/data/raw/pdb/phase2/
         SDFs vão para <job_dir>/data/raw/sdf/
     organism_terms : list[str] | None
@@ -1330,7 +1330,7 @@ def show_status(job_dir: "Path | str | None" = None):
     if not job_path:
         log.info("\n[PHASE 2 / PHASE 3] Job-specific specialization")
         log.info("  No job_dir provided. Job-local status cannot be evaluated.")
-        log.info("  Pass JOBS/<job_id> to show_status(job_dir=...) to inspect phases 2 and 3.")
+        log.info("  Pass PROJECTS/<job_id> to show_status(job_dir=...) to inspect phases 2 and 3.")
         log.info("─" * 72)
         return
 

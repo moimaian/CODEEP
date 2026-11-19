@@ -16,5 +16,5 @@ Exemplos praticos no CODEEP:
 """
 
 APP_NOME = "CODEEP"
-VERSAO = "1.1.0-1"
+VERSAO = "1.2.0-1"
 LICENCA_CURTA = "GPL-3.0-or-later"

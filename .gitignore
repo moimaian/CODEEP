@@ -3,7 +3,7 @@ __pycache__/
 .gitignore
 step5.json
 step7.json
-JOBS/
+PROJECTS/
 ANTIGOS/
 packaging/dist/
 data/
@@ -25,5 +25,8 @@ TEST/receptores/
 TEST/run_benchmark_common_targets.sh
 TEST/split_by_name.pt
 hpo/
+PROTO/
 regen_ligand_graphs.py
 results/
+
+PROTO/

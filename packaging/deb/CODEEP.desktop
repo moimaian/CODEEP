@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CODEEP
+Comment=De novo ligand generation with deep learning
+Comment[pt_BR]=Geração de ligantes de novo por aprendizado profundo
+Exec=/usr/bin/codeep
+Icon=/opt/codeep/ICONS/CODEEP.png
+Terminal=false
+Categories=Science;Qt;
+StartupNotify=false

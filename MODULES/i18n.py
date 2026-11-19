@@ -50,13 +50,13 @@ _TEXTOS = {
     # ---------------------------------------------------------------- Menu
     "menu_title": {"en": "Menu", "pt": "Menu"},
     "menu_home": {"en": "Home", "pt": "Início"},
-    "menu_step1": {"en": "Step 1 – Job", "pt": "Etapa 1 – Job"},
-    "menu_step2": {"en": "Step 2 – Data Management", "pt": "Etapa 2 – Gerenciamento de Dados"},
-    "menu_step3": {"en": "Step 3 – Voxelization", "pt": "Etapa 3 – Voxelização"},
-    "menu_step4": {"en": "Step 4 – Hyperparameters", "pt": "Etapa 4 – Hiperparâmetros"},
-    "menu_step5": {"en": "Step 5 – Training", "pt": "Etapa 5 – Treinamento"},
-    "menu_step6": {"en": "Step 6 – Evaluation", "pt": "Etapa 6 – Avaliação"},
-    "menu_step7": {"en": "Step 7 – Generation", "pt": "Etapa 7 – Geração"},
+    "menu_step1": {"en": "CONFIG – Job", "pt": "CONFIG – Job"},
+    "menu_step2": {"en": "Step 1 – Data Management", "pt": "Etapa 1 – Gerenciamento de Dados"},
+    "menu_step3": {"en": "Step 2 – Voxelization", "pt": "Etapa 2 – Voxelização"},
+    "menu_step4": {"en": "Step 3 – Hyperparameters", "pt": "Etapa 3 – Hiperparâmetros"},
+    "menu_step5": {"en": "Step 4 – Training", "pt": "Etapa 4 – Treinamento"},
+    "menu_step6": {"en": "Step 5 – Evaluation", "pt": "Etapa 5 – Avaliação"},
+    "menu_step7": {"en": "Step 6 – Generation", "pt": "Etapa 6 – Geração"},
     "menu_exit": {"en": "Exit", "pt": "Sair"},
     "menu_help": {"en": "Help", "pt": "Ajuda"},
     "menu_install_requirements": {"en": "Install Requirements", "pt": "Instalar Dependências"},
@@ -64,14 +64,26 @@ _TEXTOS = {
     "menu_about": {"en": "About", "pt": "Sobre"},
 
     # ---------------------------------------------------------------- Tab names (short)
+    # ── Numeração das abas ────────────────────────────────────────────────
+    # Os RÓTULOS exibidos foram deslocados (a antiga Etapa 1 virou CONFIG e as
+    # demais recuaram uma posição), mas as CHAVES mantêm a numeração ORIGINAL —
+    # "tab_step2" é a aba rotulada "Step 1", e assim por diante. As chaves são
+    # as mesmas usadas pelos métodos _tab_stepN de CODEEP.py e pelos arquivos
+    # de estado stepN.json gravados dentro de cada job: renomeá-las quebraria
+    # o carregamento de projetos criados antes desta mudança.
+    #   chave      rótulo
+    #   tab_step1  CONFIG      tab_step5  Step 4
+    #   tab_step2  Step 1      tab_step6  Step 5
+    #   tab_step3  Step 2      tab_step7  Step 6
+    #   tab_step4  Step 3
     "tab_home": {"en": "Home", "pt": "Início"},
-    "tab_step1": {"en": "Step 1", "pt": "Etapa 1"},
-    "tab_step2": {"en": "Step 2", "pt": "Etapa 2"},
-    "tab_step3": {"en": "Step 3", "pt": "Etapa 3"},
-    "tab_step4": {"en": "Step 4", "pt": "Etapa 4"},
-    "tab_step5": {"en": "Step 5", "pt": "Etapa 5"},
-    "tab_step6": {"en": "Step 6", "pt": "Etapa 6"},
-    "tab_step7": {"en": "Step 7", "pt": "Etapa 7"},
+    "tab_step1": {"en": "CONFIG", "pt": "CONFIG"},
+    "tab_step2": {"en": "Step 1", "pt": "Etapa 1"},
+    "tab_step3": {"en": "Step 2", "pt": "Etapa 2"},
+    "tab_step4": {"en": "Step 3", "pt": "Etapa 3"},
+    "tab_step5": {"en": "Step 4", "pt": "Etapa 4"},
+    "tab_step6": {"en": "Step 5", "pt": "Etapa 5"},
+    "tab_step7": {"en": "Step 6", "pt": "Etapa 6"},
 
     # ---------------------------------------------------------------- Falha ao construir uma aba
     "tab_load_error_title": {
@@ -94,10 +106,10 @@ _TEXTOS = {
     "btn_cpu_gpu_monitor": {"en": "CPU/GPU Monitor", "pt": "Monitor de CPU/GPU"},
     "tooltip_cpu_gpu_monitor": {
         "en": "Open a separate CPU/GPU monitor window that keeps updating even while the main "
-              "window is busy running a heavy task (e.g. Step 5 Training or Step 7 Generation).",
+              "window is busy running a heavy task (e.g. Step 4 Training or Step 6 Generation).",
         "pt": "Abre uma janela separada de monitor de CPU/GPU que continua atualizando mesmo "
-              "quando a janela principal estiver ocupada rodando uma tarefa pesada (ex.: Etapa 5 "
-              "Treinamento ou Etapa 7 Geração).",
+              "quando a janela principal estiver ocupada rodando uma tarefa pesada (ex.: Etapa 4 "
+              "Treinamento ou Etapa 6 Geração).",
     },
     "msg_title_monitor": {"en": "Monitor", "pt": "Monitor"},
     "msg_title_monitor_error": {"en": "Monitor error", "pt": "Erro no monitor"},
@@ -258,40 +270,40 @@ _TEXTOS = {
     },
     "home_grp_sw": {"en": "Software Specs", "pt": "Especificações de Software"},
     "home_grp_pipeline": {"en": "Pipeline — Steps", "pt": "Pipeline — Etapas"},
-    "home_step1_name": {"en": "Step 1 – Job", "pt": "Etapa 1 – Job"},
+    "home_step1_name": {"en": "CONFIG – Job", "pt": "CONFIG – Job"},
     "home_step1_desc": {
         "en": "Working directory setup, job naming and path validation",
         "pt": "Configuração do diretório de trabalho, nomeação do job e validação de caminhos",
     },
-    "home_step2_name": {"en": "Step 2 – Data Management", "pt": "Etapa 2 – Gerenciamento de Dados"},
+    "home_step2_name": {"en": "Step 1 – Data Management", "pt": "Etapa 1 – Gerenciamento de Dados"},
     "home_step2_desc": {
         "en": "Collection, structure validation/curation and dataset exploration",
         "pt": "Coleta, validação/curadoria de estrutura e exploração do dataset",
     },
-    "home_step3_name": {"en": "Step 3 – Voxelization", "pt": "Etapa 3 – Voxelização"},
+    "home_step3_name": {"en": "Step 2 – Voxelization", "pt": "Etapa 2 – Voxelização"},
     "home_step3_desc": {
         "en": "3D tensors + molecular graphs (PyG)",
         "pt": "Tensores 3D + grafos moleculares (PyG)",
     },
     "home_step4_name": {
-        "en": "Step 4 – Hyperparameter optimization",
-        "pt": "Etapa 4 – Otimização de hiperparâmetros",
+        "en": "Step 3 – Hyperparameter optimization",
+        "pt": "Etapa 3 – Otimização de hiperparâmetros",
     },
     "home_step4_desc": {
         "en": "Optuna search on a cheap data subset (optional)",
         "pt": "Busca com Optuna em um subconjunto barato dos dados (opcional)",
     },
-    "home_step5_name": {"en": "Step 5 – Training", "pt": "Etapa 5 – Treinamento"},
+    "home_step5_name": {"en": "Step 4 – Training", "pt": "Etapa 4 – Treinamento"},
     "home_step5_desc": {
         "en": "CVAE: 3D-CNN encoder + GNN decoder",
         "pt": "CVAE: encoder 3D-CNN + decoder GNN",
     },
-    "home_step6_name": {"en": "Step 6 – Evaluation", "pt": "Etapa 6 – Avaliação"},
+    "home_step6_name": {"en": "Step 5 – Evaluation", "pt": "Etapa 5 – Avaliação"},
     "home_step6_desc": {
         "en": "Diagnostics, metrics and training curves",
         "pt": "Diagnósticos, métricas e curvas de treinamento",
     },
-    "home_step7_name": {"en": "Step 7 – Generation", "pt": "Etapa 7 – Geração"},
+    "home_step7_name": {"en": "Step 6 – Generation", "pt": "Etapa 6 – Geração"},
     "home_step7_desc": {
         "en": "Ligand candidates for a target protein",
         "pt": "Candidatos a ligante para uma proteína-alvo",
@@ -323,16 +335,14 @@ _TEXTOS = {
     "btn_run": {"en": "▶  Run", "pt": "▶  Executar"},
     "btn_stop": {"en": "⏹  Stop", "pt": "⏹  Parar"},
     "msg_please_start_job": {
-        "en": "Please configure and start a Job (Step 1) first.",
-        "pt": "Configure e inicie um Job primeiro (Etapa 1).",
+        "en": "Please configure and start a Job (CONFIG) first.",
+        "pt": "Configure e inicie um Job primeiro (CONFIG).",
     },
     "msg_config_error_title": {"en": "Configuration Error", "pt": "Erro de Configuração"},
 
     # ---------------------------------------------------------------- STEP 1 — Job configuration
-    "title_step1": {"en": "Step 1 — Job Configuration", "pt": "Etapa 1 — Configuração do Job"},
-    "s1_grp_root": {"en": "CODEEP Root Directory", "pt": "Diretório Raiz do CODEEP"},
-    "s1_grp_job_id": {"en": "Job Identification", "pt": "Identificação do Job"},
-        "s1_lbl_job_mode": {"en": "Project Mode:", "pt": "Modo do Projeto:"},
+    "title_step1": {"en": "CONFIG — Job Configuration", "pt": "CONFIG — Configuração do Job"},
+    "s1_grp_job_id": {"en": "Project Identification", "pt": "Identificação do Projeto"},
         "s1_rb_new_project": {"en": "New Project", "pt": "Novo Projeto"},
         "s1_rb_load_project": {"en": "Load Previous Project", "pt": "Carregar Projeto Anterior"},
         "s1_lbl_prev_job": {"en": "Previous Project:", "pt": "Projeto Anterior:"},
@@ -384,7 +394,7 @@ _TEXTOS = {
     "s1_placeholder_no_job": {
         "en": "— (set job name first) —", "pt": "— (defina o nome do job primeiro) —",
     },
-    "s1_btn_create_job": {"en": "Create / Load Job", "pt": "Criar / Carregar Job"},
+    "s1_btn_create_job": {"en": "Create / Load Project", "pt": "Criar / Carregar Projeto"},
     "s1_msg_job_ready": {"en": "✅  Job ready:  {job_dir}", "pt": "✅  Job pronto:  {job_dir}"},
     "s1_msg_fill_root_name": {
         "en": "Please fill in the CODEEP root directory and a job name.",
@@ -402,11 +412,6 @@ _TEXTOS = {
         "en": "Project folder not found:\n{job_dir}",
         "pt": "Pasta do projeto não encontrada:\n{job_dir}",
     },
-    "dlg_select_root_title": {
-        "en": "Select the CODEEP root folder", "pt": "Selecione a pasta raiz do CODEEP",
-    },
-
-    # ---------------------------------------------------------------- Final report
     "report_title_done": {"en": "Final Report", "pt": "Relatório Final"},
     "report_saved": {
         "en": "Final report saved to:\n{path}",
@@ -418,8 +423,8 @@ _TEXTOS = {
     # de uma única aba; ver _tab_step2/_grp_data_collection/_grp_data_curation/
     # _grp_data_exploration em CODEEP.py)
     "title_step2": {
-        "en": "Step 2 — Data Management",
-        "pt": "Etapa 2 — Gerenciamento de Dados",
+        "en": "Step 1 — Data Management",
+        "pt": "Etapa 1 — Gerenciamento de Dados",
     },
     "s2_grp_title": {"en": "Data Collection", "pt": "Coleta de Dados"},
     "s2_lbl_dataset": {"en": "Phase 1 Dataset:", "pt": "Dataset da Fase 1:"},
@@ -430,12 +435,12 @@ _TEXTOS = {
     "s2_phase_all": {"en": "All Phases", "pt": "Todas as Fases"},
     "s2_tooltip_phase": {
         "en": "Phase 1 — Download the external dataset. (lp-PDBbind / RCSB / PLINDER / MOAD)\n"
-              "Phase 2 — Search RCSB by organism/description (terms defined in Step 1)\n"
-              "Phase 3 — Download specific PDBs by ID (IDs defined in Step 1)\n"
+              "Phase 2 — Search RCSB by organism/description (terms defined in CONFIG)\n"
+              "Phase 3 — Download specific PDBs by ID (IDs defined in CONFIG)\n"
               "All Phases — Execute all three phases in sequence",
         "pt": "Fase 1 — Baixa o dataset externo. (lp-PDBbind / RCSB / PLINDER / MOAD)\n"
-              "Fase 2 — Busca no RCSB por organismo/descrição (termos definidos na Etapa 1)\n"
-              "Fase 3 — Baixa PDBs específicos por ID (IDs definidos na Etapa 1)\n"
+              "Fase 2 — Busca no RCSB por organismo/descrição (termos definidos na CONFIG)\n"
+              "Fase 3 — Baixa PDBs específicos por ID (IDs definidos na CONFIG)\n"
               "Todas as Fases — Executa as três fases em sequência",
     },
     "s2_lbl_max_entries": {"en": "Max Phase 1 entries:", "pt": "Máx. de entradas da Fase 1:"},
@@ -451,42 +456,42 @@ _TEXTOS = {
         "pt": "Fase 2 — Termos de busca não configurados",
     },
     "s2_dlg_phase2_body": {
-        "en": "Phase 2 requires organism or description search terms (configured in Step 1), "
+        "en": "Phase 2 requires organism or description search terms (configured in CONFIG), "
               "but both fields are empty.\n\nWithout search terms, Phase 2 cannot retrieve "
               "target-specific structures from RCSB.\n\nWould you like to skip Phase 2 and "
               "continue with the other selected phases?",
         "pt": "A Fase 2 requer termos de busca por organismo ou descrição (configurados na "
-              "Etapa 1), mas os dois campos estão vazios.\n\nSem termos de busca, a Fase 2 não "
+              "CONFIG), mas os dois campos estão vazios.\n\nSem termos de busca, a Fase 2 não "
               "consegue obter estruturas específicas do alvo no RCSB.\n\nDeseja pular a Fase 2 "
               "e continuar com as outras fases selecionadas?",
     },
     "s2_err_phase2_cancelled": {
-        "en": "Cancelled. Fill in organism or description terms in Step 1 and try again.",
-        "pt": "Cancelado. Preencha os termos de organismo ou descrição na Etapa 1 e tente "
+        "en": "Cancelled. Fill in organism or description terms in CONFIG and try again.",
+        "pt": "Cancelado. Preencha os termos de organismo ou descrição na CONFIG e tente "
               "novamente.",
     },
     "s2_dlg_phase3_title": {
         "en": "Phase 3 — PDB IDs not configured", "pt": "Fase 3 — IDs de PDB não configurados",
     },
     "s2_dlg_phase3_body": {
-        "en": "Phase 3 requires a list of specific PDB IDs (configured in Step 1), but the "
+        "en": "Phase 3 requires a list of specific PDB IDs (configured in CONFIG), but the "
               "field is empty.\n\nWithout PDB IDs, Phase 3 cannot download the target "
               "structures.\n\nWould you like to skip Phase 3 and continue with the other "
               "selected phases?",
-        "pt": "A Fase 3 requer uma lista de IDs de PDB específicos (configurados na Etapa 1), "
+        "pt": "A Fase 3 requer uma lista de IDs de PDB específicos (configurados na CONFIG), "
               "mas o campo está vazio.\n\nSem IDs de PDB, a Fase 3 não consegue baixar as "
               "estruturas do alvo.\n\nDeseja pular a Fase 3 e continuar com as outras fases "
               "selecionadas?",
     },
     "s2_err_phase3_cancelled": {
-        "en": "Cancelled. Fill in the PDB IDs in Step 1 and try again.",
-        "pt": "Cancelado. Preencha os IDs de PDB na Etapa 1 e tente novamente.",
+        "en": "Cancelled. Fill in the PDB IDs in CONFIG and try again.",
+        "pt": "Cancelado. Preencha os IDs de PDB na CONFIG e tente novamente.",
     },
     "s2_err_no_phase_active": {
         "en": "No collection phase active after validation. Please check your configuration "
-              "in Step 1 and try again.",
+              "in CONFIG and try again.",
         "pt": "Nenhuma fase de coleta ativa após a validação. Verifique sua configuração na "
-              "Etapa 1 e tente novamente.",
+              "CONFIG e tente novamente.",
     },
     "dlg_moad_folder": {"en": "MOAD folder", "pt": "Pasta do MOAD"},
 
@@ -515,9 +520,16 @@ _TEXTOS = {
 
     # ---------------------------------------------------------------- STEP 3 — Voxelization
     "title_step3": {
-        "en": "Step 3 — 3D Voxelization + Molecular Graphs",
-        "pt": "Etapa 3 — Voxelização 3D + Grafos Moleculares",
+        "en": "Step 2 — 3D Voxelization + Molecular Graphs",
+        "pt": "Etapa 2 — Voxelização 3D + Grafos Moleculares",
     },
+    # Títulos dos grupos colapsáveis da aba (ver _tab_step3 em CODEEP.py).
+    "s3_grp_scope": {"en": "Scope and Execution", "pt": "Escopo e Execução"},
+    "s3_grp_site":  {"en": "Site Preparation",    "pt": "Preparação do Sítio"},
+    "s3_grp_grid":  {"en": "Voxel Grid and Channels",
+                     "pt": "Grade de Voxels e Canais"},
+    "s3_grp_qm":    {"en": "Quantum Channels (QM)",
+                     "pt": "Canais Quânticos (QM)"},
     "s3_ph_pair": {"en": "empty = process all pairs", "pt": "vazio = processa todos os pares"},
     "s3_tooltip_vox_workers": {
         "en": "Number of pairs processed simultaneously — only takes effect if "
@@ -693,12 +705,52 @@ _TEXTOS = {
 
     # ---------------------------------------------------------------- STEP 4 — Hyperparameter optimization
     "title_step4": {
-        "en": "Step 4 — Hyperparameter optimization",
-        "pt": "Etapa 4 — Otimização de hiperparâmetros",
+        "en": "Step 3 — Hyperparameter optimization",
+        "pt": "Etapa 3 — Otimização de hiperparâmetros",
     },
     "s4_grp_budget": {"en": "Search budget", "pt": "Orçamento da busca"},
     "s4_grp_space": {"en": "Search space", "pt": "Espaço de busca"},
     "s4_lbl_sampler": {"en": "Search algorithm:", "pt": "Algoritmo de busca:"},
+    # Algoritmos de busca (rótulo e dica de cada item da lista). A chave segue o "name" de
+    # pipeline_optimize.SAMPLERS; o texto original de lá continua servindo à linha de comando.
+    "s4_sampler_tpe": {"en": "TPE (Optuna)", "pt": "TPE (Optuna)"},
+    "s4_sampler_tpe_help": {
+        "en": "Tree-structured Parzen Estimator — density-based Bayesian optimization. Default "
+              "and best cost/benefit for small spaces like this one. Learns from the previous "
+              "trials.",
+        "pt": "Tree-structured Parzen Estimator — otimização bayesiana baseada em densidades. "
+              "Default e melhor custo/benefício para espaços pequenos como este. Aprende com "
+              "os trials anteriores.",
+    },
+    "s4_sampler_random": {"en": "Random Search", "pt": "Random Search"},
+    "s4_sampler_random_help": {
+        "en": "Independent uniform sampling. It does not learn from the history, but it is "
+              "unbeatable as a baseline and parallelizes with no coordination. Good for mapping "
+              "the space before refining.",
+        "pt": "Amostragem uniforme independente. Não aprende com o histórico, mas é imbatível "
+              "como baseline e paraleliza sem coordenação. Bom para mapear o espaço antes de "
+              "refinar.",
+    },
+    "s4_sampler_grid": {"en": "Grid Search", "pt": "Grid Search"},
+    "s4_sampler_grid_help": {
+        "en": "Exhaustive sweep. Continuous ranges are discretized at the resolution that fits "
+              "the number of trials. The cost explodes with the number of hyperparameters — use "
+              "it only with 2-3 checked.",
+        "pt": "Varredura exaustiva. As faixas contínuas são discretizadas com a resolução que "
+              "couber no nº de trials. O custo explode com o nº de hiperparâmetros — use só com "
+              "2-3 marcados.",
+    },
+    "s4_sampler_gp": {
+        "en": "Bayesian (Gaussian Process)", "pt": "Bayesiano (Processo Gaussiano)",
+    },
+    "s4_sampler_gp_help": {
+        "en": "Classic Bayesian optimization with a GP. It tends to beat TPE when trials are "
+              "expensive and the space is continuous and low-dimensional, but the cost per "
+              "suggestion grows with the number of trials.",
+        "pt": "Otimização bayesiana clássica com GP. Costuma superar o TPE quando os trials são "
+              "caros e o espaço é contínuo e de baixa dimensão, mas o custo por sugestão cresce "
+              "com o nº de trials.",
+    },
     "s4_tooltip_sampler": {
         "en": "Which configuration to try next. Orthogonal to pruning: "
               "Successive Halving (ASHA) is a PRUNER — it decides when to "
@@ -784,34 +836,34 @@ _TEXTOS = {
     # Aviso de fidelidade — trocado ao vivo conforme a fração do dataset e as
     # épocas por trial (ver _opt_update_fidelity_note em CODEEP.py). Com
     # orçamento total a busca deixa de ser proxy e mandar repetir o treino na
-    # Etapa 7 seria mandar refazer o que já foi feito.
+    # Etapa 6 seria mandar refazer o que já foi feito.
     "s4_note_screen": {
         "en": "With this budget the search is a PROXY: the ranking comes from "
               "a subset and/or from early epochs. Use it to shortlist 2-3 "
               "configurations, then confirm them with a full training run in "
-              "Step 7.",
+              "Step 6.",
         "pt": "Com este orçamento a busca é um PROXY: o ranking vem de um "
               "subconjunto e/ou de épocas iniciais. Use-a para selecionar 2-3 "
-              "configurações e confirme-as com um treino completo na Etapa 7.",
+              "configurações e confirme-as com um treino completo na Etapa 6.",
     },
     "s4_note_near_full": {
         "en": "Full dataset, but a reduced epoch budget: the ranking is "
               "reliable on data and approximate on convergence. Confirm the "
-              "top configurations with a full-length run in Step 7.",
+              "top configurations with a full-length run in Step 6.",
         "pt": "Dataset completo, mas orçamento de épocas reduzido: o ranking é "
               "confiável quanto aos dados e aproximado quanto à convergência. "
               "Confirme as melhores com um treino de duração completa na "
-              "Etapa 7.",
+              "Etapa 6.",
     },
     "s4_note_full": {
         "en": "With this budget every trial is a COMPLETE training run — this "
-              "is a direct comparison, not a screen, and Step 7 need not be "
+              "is a direct comparison, not a screen, and Step 6 need not be "
               "repeated. Beware the cost (trials × epochs) and note that ASHA "
               "still prunes on early epochs. Only the objective gap remains: "
               "compare by the generation metrics of Steps 8-9, not by loss.",
         "pt": "Com este orçamento cada trial é um treino COMPLETO — isto é uma "
               "comparação direta, não uma triagem, e não é preciso repetir a "
-              "Etapa 7. Atenção ao custo (trials × épocas) e ao fato de o ASHA "
+              "Etapa 6. Atenção ao custo (trials × épocas) e ao fato de o ASHA "
               "ainda podar nas épocas iniciais. Resta só a lacuna de objetivo: "
               "compare pelas métricas de geração das Etapas 8-9, não pela loss.",
     },
@@ -841,7 +893,17 @@ _TEXTOS = {
     },
 
     # ---------------------------------------------------------------- STEP 5 — Training
-    "title_step5": {"en": "Step 5 — CVAE / GNN Training", "pt": "Etapa 5 — Treinamento CVAE / GNN"},
+    "title_step5": {"en": "Step 4 — CVAE / GNN Training", "pt": "Etapa 4 — Treinamento CVAE / GNN"},
+    # Títulos dos grupos colapsáveis da aba (ver _tab_step5 em CODEEP.py).
+    "s5_grp_capacity": {"en": "Model Capacity",  "pt": "Capacidade do Modelo"},
+    "s5_grp_optim":    {"en": "Optimization",    "pt": "Otimização"},
+    "s5_grp_reg":      {"en": "Regularization",  "pt": "Regularização"},
+    "s5_grp_loss":     {"en": "Loss Weights and KL",
+                        "pt": "Pesos da Perda e KL"},
+    "s5_grp_ss":       {"en": "Scheduled Sampling",
+                        "pt": "Scheduled Sampling"},
+    "s5_grp_exec":     {"en": "Execution",       "pt": "Execução"},
+    "s5_grp_ckpt":     {"en": "Checkpoints",     "pt": "Checkpoints"},
     "s5_lbl_epochs": {"en": "Epochs:", "pt": "Épocas:"},
     "s5_lbl_batch": {"en": "Batch size:", "pt": "Tamanho do lote:"},
     "s5_lbl_latent": {"en": "Latent dim:", "pt": "Dim. latente:"},
@@ -901,7 +963,7 @@ _TEXTOS = {
               "próximo átomo no lugar errado, e a geometria piora mesmo com "
               "uma boa cabeça de posição.",
     },
-    # ── Janela de curvas ao vivo (Etapa 5) ────────────────────────────
+    # ── Janela de curvas ao vivo (Etapa 4) ────────────────────────────
     "s5_plot_title": {
         "en": "Training — live curves", "pt": "Treinamento — curvas ao vivo",
     },
@@ -1029,16 +1091,18 @@ _TEXTOS = {
 
     # ---------------------------------------------------------------- STEP 6 — Evaluation
     "title_step6": {
-        "en": "Step 6 — Trained Model Evaluation", "pt": "Etapa 6 — Avaliação do Modelo Treinado",
+        "en": "Step 5 — Trained Model Evaluation", "pt": "Etapa 5 — Avaliação do Modelo Treinado",
     },
+    # Títulos dos grupos colapsáveis da aba (ver _tab_step6 em CODEEP.py).
+    "s6_grp_input":   {"en": "Model and Data",   "pt": "Modelo e Dados"},
+    "s6_grp_reports": {"en": "Figures and Diagnostics",
+                       "pt": "Figuras e Diagnósticos"},
     "s6_chk_do_generate": {
         "en": "Generate ligands during evaluation", "pt": "Gerar ligantes durante a avaliação",
     },
     "s6_lbl_checkpoints": {"en": "Checkpoints:", "pt": "Checkpoints:"},
-    "s6_lbl_figures": {"en": "Figures:", "pt": "Figuras:"},
     "s6_btn_training_curves": {"en": "Training Curves", "pt": "Curvas de Treinamento"},
     "s6_btn_performance_report": {"en": "Performance Report", "pt": "Relatório de Desempenho"},
-    "s6_lbl_diagnostics": {"en": "Diagnostics:", "pt": "Diagnósticos:"},
     "s6_btn_active_units": {
         "en": "Active Units Diagnostic", "pt": "Diagnóstico de Active Units",
     },
@@ -1059,6 +1123,41 @@ _TEXTOS = {
     "s6_dlg_active_units_title": {
         "en": "Active Units Diagnostic", "pt": "Diagnóstico de Active Units",
     },
+    # Relatório do diagnóstico de active units (ver _pipeline_check_active_units em CODEEP.py).
+    "s6_au_lbl_ckpt":      {"en": "Checkpoint",    "pt": "Checkpoint"},
+    "s6_au_lbl_epoch":     {"en": "Saved epoch",   "pt": "Época salva"},
+    "s6_au_lbl_split":     {"en": "Split used",    "pt": "Split usado"},
+    "s6_au_lbl_threshold": {"en": "Threshold",     "pt": "Limiar"},
+    "s6_au_lbl_active":    {"en": "Active units",  "pt": "Active units"},
+    "s6_au_samples":       {"en": "samples",       "pt": "amostras"},
+    "s6_au_good": {
+        "en": "✅ Good use of the latent space — most dimensions are active.",
+        "pt": "✅ Boa utilização do espaço latente — a maioria das dimensões está ativa.",
+    },
+    "s6_au_partial": {
+        "en": "⚠️  Partial use — a considerable share of the dimensions may be dead.",
+        "pt": "⚠️  Utilização parcial — parte considerável das dimensões pode estar morta.",
+    },
+    "s6_au_bad1": {
+        "en": "❌ Few active dimensions — strong sign of PARTIAL posterior collapse,",
+        "pt": "❌ Poucas dimensões ativas — forte indício de colapso PARCIAL de posterior,",
+    },
+    "s6_au_bad2": {
+        "en": "   even if the aggregate mean KL (training log) does not look collapsed.",
+        "pt": "   mesmo que o KL médio agregado (log de treino) não pareça colapsado.",
+    },
+    "s6_au_err": {
+        "en": "Could not compute active units — see the messages above (checkpoint/tensor_dir "
+              "missing, empty validation split or PyTorch unavailable).",
+        "pt": "Não foi possível calcular active units — veja as mensagens acima "
+              "(checkpoint/tensor_dir ausentes, split de validação vazio ou PyTorch indisponível).",
+    },
+    "s6_au_log_fail": {
+        "en": "(could not write the log to {log_dir}: {erro})",
+        "pt": "(não foi possível gravar o log em {log_dir}: {erro})",
+    },
+    "s6_lbl_au_logfile": {"en": "Log saved to:", "pt": "Log salvo em:"},
+    "s6_btn_open_log": {"en": "Open log", "pt": "Abrir log"},
     "s6_msg_active_units_no_output": {
         "en": "No output captured — check the checkpoint/tensor paths and try again.",
         "pt": "Nenhuma saída capturada — verifique os caminhos de checkpoint/tensores e "
@@ -1067,8 +1166,18 @@ _TEXTOS = {
 
     # ---------------------------------------------------------------- STEP 7 — Generation
     "title_step7": {
-        "en": "Step 7 — Ligand Candidate Generation", "pt": "Etapa 7 — Geração de Candidatos a Ligante",
+        "en": "Step 6 — Ligand Candidate Generation", "pt": "Etapa 6 — Geração de Candidatos a Ligante",
     },
+    # Títulos dos grupos colapsáveis da aba (ver _tab_step7 em CODEEP.py).
+    "s7_grp_model":    {"en": "Target, Model and Output",
+                        "pt": "Alvo, Modelo e Saída"},
+    "s7_grp_site":     {"en": "Site Definition", "pt": "Definição do Sítio"},
+    "s7_grp_channels": {"en": "Site Channels (must match training)",
+                        "pt": "Canais do Sítio (devem bater com o treino)"},
+    "s7_grp_sampling": {"en": "Sampling",        "pt": "Amostragem"},
+    "s7_grp_filter":   {"en": "Filters and Ranking",
+                        "pt": "Filtros e Ranqueamento"},
+    "s7_grp_geometry": {"en": "Final Geometry",  "pt": "Geometria Final"},
     "s7_ph_pdb": {
         "en": "Target protein PDB file (required)", "pt": "Arquivo PDB da proteína-alvo (obrigatório)",
     },
@@ -1077,8 +1186,8 @@ _TEXTOS = {
         "pt": "opcional — PDB apenas com os resíduos do sítio de ligação",
     },
     "s7_ph_out": {
-        "en": "JOBS/<job_id>/results/{pdb}/ (default)",
-        "pt": "JOBS/<job_id>/results/{pdb}/ (padrão)",
+        "en": "PROJECTS/<job_id>/results/{pdb}/ (default)",
+        "pt": "PROJECTS/<job_id>/results/{pdb}/ (padrão)",
     },
     "s7_ph_ligand_ref": {
         "en": "optional — reference ligand SDF", "pt": "opcional — SDF do ligante de referência",
@@ -1138,7 +1247,7 @@ _TEXTOS = {
     "s7_tooltip_min_heavy": {
         "en": "Discards generated candidates with fewer HEAVY (non-H) atoms "
               "than this, right before picking the Top N — same threshold, "
-              "same count, as \"Min. heavy atoms\" in Step 2 (Data Validation "
+              "same count, as \"Min. heavy atoms\" in Step 1 (Data Validation "
               "and Curation), applied to the TRAINING ligands. No training "
               "ligand has fewer than that; generated candidates could, "
               "because nothing enforced it during generation.\n\n"
@@ -1147,7 +1256,7 @@ _TEXTOS = {
               "later\". Set to 1 to disable.",
         "pt": "Descarta candidatos gerados com menos átomos PESADOS (não-H) "
               "que isto, logo antes de escolher o Top N — mesmo limiar, "
-              "mesma contagem, do \"Átomos pesados mín.\" da Etapa 2 (Data "
+              "mesma contagem, do \"Átomos pesados mín.\" da Etapa 1 (Data "
               "Validation and Curation), aplicado aos ligantes de TREINO. "
               "Nenhum ligante de treino tem menos que isso; candidatos "
               "gerados podem ter, porque nada impedia isso durante a "
@@ -1389,16 +1498,16 @@ _TEXTOS = {
         "en": "Summary Dashboard — Phase {phase}", "pt": "Painel Resumo — Fase {phase}",
     },
     "msg_run_dataexp_first": {
-        "en": "Run Data Exploration (Step 2) with Phase {phase} first.\n\nExpected at:\n{fig_dir}",
-        "pt": "Execute Exploração de Dados (Etapa 2) com a Fase {phase} primeiro.\n\n"
+        "en": "Run Data Exploration (Step 1) with Phase {phase} first.\n\nExpected at:\n{fig_dir}",
+        "pt": "Execute Exploração de Dados (Etapa 1) com a Fase {phase} primeiro.\n\n"
               "Esperado em:\n{fig_dir}",
     },
     "msg_fig_title_with_phase": {
         "en": "{title} — Phase {phase}", "pt": "{title} — Fase {phase}",
     },
     "msg_run_step6_first": {
-        "en": "Run Step 6 with Phase {phase} first.\n\nExpected at:\n{fig_dir}",
-        "pt": "Execute a Etapa 6 com a Fase {phase} primeiro.\n\nEsperado em:\n{fig_dir}",
+        "en": "Run Step 5 with Phase {phase} first.\n\nExpected at:\n{fig_dir}",
+        "pt": "Execute a Etapa 5 com a Fase {phase} primeiro.\n\nEsperado em:\n{fig_dir}",
     },
     "msg_module_not_found_title": {"en": "Module not found", "pt": "Módulo não encontrado"},
     "msg_module_not_found_body": {

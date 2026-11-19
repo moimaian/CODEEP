@@ -1,0 +1,55 @@
+codeep (1.2.0-1) unstable; urgency=low
+
+  * Nova aba CONFIG, no lugar do grupo "CODEEP Root Directory" (a pasta do
+    programa é identificada sozinha): identificação do projeto (data, Novo
+    Projeto, Carregar Projeto Anterior, ID do Job e o botão Criar / Carregar
+    Projeto), caminhos detectados e termos de busca das Fases 2 e 3. As
+    etapas passam a ser numeradas de 1 a 6 (a antiga Step 2 é a ETAPA 1, e
+    assim por diante) e o item Sobre sai do menu Ajuda para a barra de menus.
+    Os arquivos step*.json dos projetos mantêm o nome antigo, então
+    projetos existentes continuam abrindo (CODEEP.py, MODULES/i18n.py).
+  * Parâmetros das ETAPAS 2, 4, 5 e 6 organizados em grupos recolhíveis,
+    por função (CODEEP.py).
+  * Training Curves e Execution Log: ao serem expandidos, a janela cresce o
+    necessário para que não fiquem sobrepostos a outros elementos, e volta
+    ao tamanho anterior ao recolher; na ETAPA 4 os dois são mutuamente
+    exclusivos (CODEEP.py).
+  * ETAPA 5: botões Curvas de Treinamento, Relatório de Desempenho e
+    Diagnóstico de Active Units na mesma linha. O Active Units passa a abrir
+    uma janela de texto e a gravar active_units.log e active_units.json na
+    pasta de logs da fase; o relatório sai no idioma da interface
+    (CODEEP.py, MODULES/i18n.py).
+  * ETAPA 3: lista de algoritmos de busca (rótulos e dicas) traduzida na
+    interface em inglês (CODEEP.py, MODULES/i18n.py).
+  * Geração: guarda estérica na amostragem, que rejeita e refaz o sorteio de
+    átomos que colidem com o sítio ou ficam a distâncias incompatíveis com as
+    ligações vizinhas, reduzindo as colisões da molécula com a proteína sem
+    retreinar o modelo (MODULES/pipeline_train.py, pipeline_generate.py).
+  * Manuais do usuário em português e inglês em TUTORIALS/, além de
+    LICENSE.txt e README.md na raiz.
+  * Empacotamento: o atalho do pacote passa a se chamar CODEEP.desktop, o
+    mesmo nome do que o programa grava em ~/.local/share/applications, e o
+    atalho gravado pelo programa aponta para /usr/bin/codeep quando o pacote
+    está instalado. Assim o menu não mostra duas entradas e todo clique passa
+    pelo launcher, que sincroniza as atualizações de /opt/codeep
+    (packaging/deb, CODEEP.py).
+
+ -- Moisés Maia <moimaian@gmail.com>  Mon, 16 Nov 2026 18:00:00 -0300
+
+codeep (1.1.0-1) unstable; urgency=low
+
+  * Primeiro pacote .deb do CODEEP. Instala o código da aplicação
+    (CODEEP.py, CODEEP_requirements.py, versao.py, MODULES/, ICONS/ e
+    TUTORIALS/) em /opt/codeep, o launcher /usr/bin/codeep e a entrada no
+    menu de aplicativos.
+  * O launcher sincroniza /opt/codeep para $HOME/CODEEP sem tocar em
+    PROJECTS/, data/, checkpoints/, hpo/ e tools/ (dados, modelos treinados e
+    ferramentas do usuário), e não sincroniza quando $HOME/CODEEP é um
+    repositório git (cópia de trabalho do desenvolvedor). O ambiente virtual
+    em ~/.venv/CODEEP e as dependências continuam sendo criados pelo próprio
+    CODEEP.py na primeira execução, nunca pelo postinst.
+  * packaging/deb/build.sh usa versao.py como versão padrão, recusa
+    empacotar se versao.py e o topo deste changelog divergirem e grava o
+    pacote em packaging/dist/ (ignorada pelo git).
+
+ -- Moisés Maia <moimaian@gmail.com>  Mon, 16 Nov 2026 17:30:00 -0300

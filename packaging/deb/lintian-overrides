@@ -1,0 +1,15 @@
+# Instalado em /usr/share/lintian/overrides/codeep pelo build.sh.
+# Avisos do lintian que valem para o repositório oficial do Debian, mas não para
+# o CODEEP, distribuído como pacote de terceiros (ver packaging/deb/README.md).
+
+# Software de terceiros, fora do repositório oficial: /opt é o lugar previsto
+# pela FHS (e o launcher /usr/bin/codeep sincroniza /opt/codeep -> $HOME/CODEEP).
+codeep: dir-or-file-in-opt
+
+# Aplicação gráfica, aberta pelo menu; não há uma interface de linha de comando
+# a documentar em man page.
+codeep: no-manual-page
+
+# versao.py tem shebang (#!/usr/bin/env python3) por herança do cabeçalho padrão dos
+# módulos do CODEEP, mas é só uma biblioteca importada por CODEEP.py, não um script.
+codeep: script-not-executable [opt/codeep/versao.py]

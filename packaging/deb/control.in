@@ -1,0 +1,28 @@
+Package: codeep
+Version: @VERSION@
+Section: science
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.10), python3-venv, python3-pip
+Recommends: python3.10, rsync
+Suggests: openjdk-17-jre | default-jre, gromacs
+Maintainer: Moisés Maia <moimaian@gmail.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/moimaian/CODEEP
+Description: Deep-learning de novo ligand generation conditioned on the binding site
+ CODEEP is a PyQt5-based graphical tool for de novo ligand design with
+ deep learning: collection and curation of protein-ligand complexes,
+ voxelization of the binding site into 3D tensors, hyperparameter search,
+ training of a conditional variational autoencoder (3D-CNN site encoder and
+ autoregressive graph-neural-network ligand decoder), evaluation, and
+ generation of ranked ligand candidates, with 3D coordinates, for a new
+ target protein.
+ .
+ This package installs the application files to /opt/codeep and a menu
+ launcher. On first run, CODEEP itself creates an isolated Python virtual
+ environment at ~/.venv/CODEEP and installs its own scientific dependencies
+ (PyTorch, RDKit, etc.) into it, from its Install Requirements window --
+ this package does not do that as root during installation, by design (see
+ packaging/deb/README.md). Training data, trained models and the helper
+ tools xtb and P2Rank are not part of the package; they are created or
+ downloaded by the program under ~/CODEEP.

@@ -1,0 +1,30 @@
+#!/bin/sh
+# postrm do pacote codeep
+#
+# Da mesma forma que o postinst nunca escreve em $HOME, o postrm nunca
+# apaga nada em $HOME: $HOME/CODEEP guarda os dados, os modelos treinados e
+# $HOME/CODEEP/PROJECTS guarda resultados gerados pelo usuário, e
+# $HOME/.venv/CODEEP é um ambiente virtual por-usuário. Um script de sistema
+# (root) removendo isso de forma automática — inclusive em "purge" —
+# arriscaria apagar dados de trabalho (às vezes dias de treinamento) de
+# qualquer usuário que já tenha logado na máquina, sem chance de
+# confirmação. Só avisamos.
+
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+
+if [ "$1" = "purge" ]; then
+    cat <<'MSG' >&2
+codeep: o pacote foi removido, mas dados por-usuário NÃO foram apagados:
+  - Código copiado, dados, modelos e resultados:  ~/CODEEP
+    (inclui ~/CODEEP/data, ~/CODEEP/checkpoints e ~/CODEEP/PROJECTS)
+  - Ambiente virtual Python:                      ~/.venv/CODEEP
+Remova manualmente esses diretórios, para cada usuário que os tenha, se
+quiser liberar o espaço.
+MSG
+fi
+
+exit 0
