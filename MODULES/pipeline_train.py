@@ -230,7 +230,13 @@ class SiteLigandDataset(Dataset):
         plano (a, b), (u_a, u_b) → (L − u_b, u_a), com L o lado da caixa.
         É a versão contínua de (i, j) → (N−1−j, i).
 
-        pos entra e sai em Å relativos à origem da grade.
+        pos entra e sai em Å relativos à origem da grade. Essa origem é o
+        CENTRO do voxel 0 (os centros vão de 0 a (N−1)·voxel), portanto o
+        parâmetro `box_A` aqui deve ser (N−1)·voxel — a distância entre os
+        centros do primeiro e do último voxel —, e NÃO N·voxel. Usar N·voxel
+        deslocava o ligante ~1 voxel (≈1 Å) em relação à grade rotacionada em
+        toda amostra com k ≥ 1 (verificado com um impulso em um voxel
+        comparado ao np.rot90: erro 1,03 Å médio com N·voxel; 0 com (N−1)·voxel).
         """
         if k == 0:
             return pos
@@ -315,7 +321,8 @@ class SiteLigandDataset(Dataset):
                 return None
 
             if rot_k:
-                pos_rel = self._rotate_positions(pos_rel, rot_ax, rot_k, box_A)
+                pos_rel = self._rotate_positions(
+                    pos_rel, rot_ax, rot_k, box_A - voxel_size)   # (N−1)·voxel
             graph.pos = pos_rel
 
         return {
