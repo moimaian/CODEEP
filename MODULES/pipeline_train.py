@@ -315,7 +315,7 @@ class SiteLigandDataset(Dataset):
                 return None
 
             if rot_k:
-                pos_rel = self._rotate_positions(pos_rel, rot_ax, rot_k, box_A)
+                pos_rel = self._rotate_positions(pos_rel, rot_ax, rot_k, box_A) #Mudança de Rotação
             graph.pos = pos_rel
 
         return {
