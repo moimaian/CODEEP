@@ -1,0 +1,1201 @@
+# -*- coding: utf-8 -*-
+"""
+Pipeline - Etapa 8: Diagnóstico e Avaliação do Modelo Treinado
+==============================================================
+Verifica a saúde do treinamento e avalia o modelo nos dados de teste.
+
+Uso:
+    python 06_evaluate.py                        # usa checkpoints/ padrão
+    python 06_evaluate.py --ckpt meu_dir/        # diretório personalizado
+    python 06_evaluate.py --ckpt checkpoints/ --generate  # gera ligantes novos
+"""
+
+import json
+import argparse
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ── Verificações de dependências ───────────────────────────────────────────────
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Draw, AllChem, Descriptors, QED
+    from rdkit.Chem import rdMolDescriptors, rdFingerprintGenerator
+    from rdkit.DataStructs import TanimotoSimilarity
+    HAS_RDKIT = True
+except ImportError:
+    HAS_RDKIT = False
+
+# SA Score (Ertl & Schuffenhauer, 2009) — script Contrib do RDKit, não faz
+# parte da API principal. Precisa do caminho adicionado manualmente.
+try:
+    import sys as _sys
+    from rdkit.Chem import RDConfig as _RDConfig
+    _sys.path.append(str(Path(_RDConfig.RDContribDir) / "SA_Score"))
+    import sascorer
+    HAS_SASCORER = True
+except Exception:
+    HAS_SASCORER = False
+
+PROJECT_ROOT = Path(globals().get("_CODEEP_ROOT", Path(__file__).resolve().parent.parent))
+BASE_DIR = PROJECT_ROOT / "data"
+
+def _load_train_module():
+    import importlib.util
+
+    train_path = Path(__file__).resolve().parent / "pipeline_train.py"
+    spec = importlib.util.spec_from_file_location("pipeline_train", train_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Não foi possível criar spec para {train_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 1 — ANÁLISE DO HISTÓRICO DE TREINAMENTO
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _check_arch(cfg: dict, mod, contexto: str) -> bool:
+    """Confere se o checkpoint foi treinado com a arquitetura deste código.
+
+    Sem esta checagem, um checkpoint de versão anterior carregado num
+    modelo da versão atual produz métricas silenciosamente erradas — o
+    caso mais perigoso é o load_state_dict(strict=False) do cálculo de
+    active units, que aceita pesos faltantes sem reclamar. Mesmo guarda
+    já existente em pipeline_train.train(resume=) e
+    pipeline_generate.load_model.
+    """
+    ck_arch  = int(cfg.get("arch_version", 1))
+    cur_arch = int(getattr(mod, "ARCH_VERSION", 1))
+    if ck_arch == cur_arch:
+        return True
+    log.error(
+        f"  {contexto}: checkpoint da arquitetura versão {ck_arch}, código na "
+        f"versão {cur_arch}. As cabeças mudaram de forma e de significado — "
+        f"as métricas seriam inválidas. Retreine (Step 5) antes de avaliar."
+    )
+    return False
+
+def analyze_training_history(ckpt_dir: Path):
+    """Lê training_history.csv e extrai métricas de saúde do treinamento."""
+    csv_path = ckpt_dir / "training_history.csv"
+    if not csv_path.exists():
+        log.error(f"Arquivo não encontrado: {csv_path}")
+        return {}
+
+    df = pd.read_csv(csv_path)
+    log.info(f"Histórico carregado: {len(df)} epochs")
+
+    # ── Métricas principais ────────────────────────────────────────────────────
+    last = df.iloc[-1]
+    best_epoch = df.loc[df["val_total"].idxmin()]
+
+    report = {
+        "total_epochs":      len(df),
+        "best_epoch":        int(best_epoch["epoch"]),
+        "best_val_loss":     round(float(best_epoch["val_total"]), 4),
+        "final_train_loss":  round(float(last["train_total"]), 4),
+        "final_val_loss":    round(float(last["val_total"]), 4),
+        "final_kl":          round(float(last.get("val_kl", 0)), 4),
+        "final_recon":       round(float(last.get("val_recon", 0)), 4),
+        "overfit_gap":       round(float(last["val_total"]) -
+                                   float(last["train_total"]), 4),
+    }
+
+    # ── Diagnósticos ──────────────────────────────────────────────────────────
+    issues = []
+
+    # 1. KL collapse: se KL ≈ 0, o encoder não aprendeu distribuição útil
+    if report["final_kl"] < 0.01:
+        issues.append("⚠️  KL ≈ 0 (posterior collapse): o encoder pode estar "
+                      "ignorando o espaço latente. Tente reduzir beta ou "
+                      "aumentar beta_warmup.")
+
+    # 2. KL muito alto: reconstrução sacrificada
+    if report["final_kl"] > 50:
+        issues.append("⚠️  KL muito alto: o modelo está priorizando regularização "
+                      "sobre reconstrução. Reduza beta_max.")
+
+    # 3. Overfitting
+    if report["overfit_gap"] > 0.5:
+        issues.append(f"⚠️  Overfitting detectado: gap train/val = "
+                      f"{report['overfit_gap']:.3f}. "
+                      "Aumente dropout ou reduza o modelo.")
+
+    # 4. Loss não convergiu
+    if len(df) >= 10:
+        early_val = df["val_total"].iloc[:5].mean()
+        late_val  = df["val_total"].iloc[-5:].mean()
+        if late_val >= early_val * 0.99:
+            issues.append("⚠️  Loss de validação não convergiu. O modelo pode "
+                          "precisar de mais epochs, LR maior, ou dados.")
+
+    # 5. Loss NaN
+    if df["train_total"].isna().any() or df["val_total"].isna().any():
+        issues.append("❌ NaN detectado no histórico! Verifique o LR "
+                      "(provavelmente muito alto) e grad_clip.")
+
+    report["issues"] = issues
+    return report, df
+
+
+def plot_training_curves(df: pd.DataFrame, ckpt_dir: Path, fig_dir: Path):
+    """Plota curvas de treinamento detalhadas."""
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(16, 10))
+    fig.suptitle("Training Diagnostics — CVAE", fontsize=13, fontweight="bold")
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+
+    epochs = df["epoch"]
+
+    plots = [
+        ("Total Loss",       "train_total",  "val_total",   gs[0, 0]),
+        ("Reconstruction",   "train_recon",  "val_recon",   gs[0, 1]),
+        ("KL Divergence",    "train_kl",     "val_kl",      gs[0, 2]),
+        ("Atom Loss",        "train_atom",   "val_atom",    gs[1, 0]),
+        ("Bond Loss",        "train_bond",   "val_bond",    gs[1, 1]),
+        ("3D Position Loss", "train_pos",    "val_pos",     gs[1, 2]),
+    ]
+
+    for title, train_col, val_col, pos in plots:
+        ax = fig.add_subplot(pos)
+        if train_col in df.columns:
+            ax.plot(epochs, df[train_col], label="Train", color="#4C72B0", linewidth=1.5)
+        if val_col in df.columns:
+            ax.plot(epochs, df[val_col],   label="Val",   color="#DD8452",
+                    linewidth=1.5, linestyle="--")
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        ax.set_xlabel("Epoch")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # Marca melhor epoch
+        if val_col in df.columns:
+            best_i = df[val_col].idxmin()
+            ax.axvline(df["epoch"].iloc[best_i], color="green",
+                       linestyle=":", alpha=0.6, label=f"Best e{df['epoch'].iloc[best_i]}")
+
+    for ext, kw in [("png", {"dpi": 150}), ("svg", {})]:
+        out = fig_dir / f"training_curves.{ext}"
+        plt.savefig(out, bbox_inches="tight", **kw)
+        log.info(f"Curvas salvas em: {out}")
+    plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 2 — AVALIAÇÃO NO CONJUNTO DE TESTE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_on_test(ckpt_dir: Path, tensor_dir: Path) -> dict:
+    """Carrega o melhor modelo e avalia no conjunto de teste."""
+    if not HAS_TORCH:
+        log.warning("PyTorch não disponível — pulando avaliação no teste.")
+        return {}
+
+    best_ckpt = ckpt_dir / "best_model.pt"
+    if not best_ckpt.exists():
+        log.warning(f"best_model.pt não encontrado em {ckpt_dir}")
+        return {}
+
+    from torch.utils.data import DataLoader
+
+    try:
+        mod = _load_train_module()
+        SiteLigandDataset = mod.SiteLigandDataset
+        LigandCVAE = mod.LigandCVAE
+        cvae_loss = mod.cvae_loss
+    except Exception as e:
+        log.error(f"Não foi possível importar pipeline_train.py: {e}")
+        return {}
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Carrega checkpoint
+    ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+    cfg  = ckpt.get("config", {})
+
+    model = LigandCVAE(
+        in_channels  = cfg.get("site_in_channels", 5),
+        latent_dim   = cfg.get("latent_dim",   256),
+        hidden_dim   = cfg.get("hidden_dim",   256),
+        n_gnn_layers = cfg.get("n_gnn_layers", 4),
+    ).to(device)
+
+    encoder_fc_weight = ckpt["model_state"].get("encoder.fc.0.weight")
+    if encoder_fc_weight is not None:
+        ckpt_in_features = int(encoder_fc_weight.shape[1])
+        current_fc = model.encoder.fc[0]
+        if current_fc.in_features != ckpt_in_features:
+            model.encoder.fc[0] = torch.nn.Linear(
+                ckpt_in_features,
+                current_fc.out_features,
+                bias=current_fc.bias is not None,
+            ).to(device)
+
+    if not _check_arch(cfg, mod, "Avaliação no teste"):
+        return {}
+
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    log.info(f"Modelo carregado do epoch {ckpt.get('epoch', '?')} "
+             f"(val_loss={ckpt.get('val_loss', '?'):.4f})")
+
+    # Dataset de teste
+    try:
+        test_ds = SiteLigandDataset(tensor_dir=tensor_dir, split="test")
+        test_loader = DataLoader(
+            test_ds, batch_size=4, shuffle=False,
+            collate_fn=SiteLigandDataset.collate_fn,
+        )
+    except Exception as e:
+        log.warning(f"Dataset de teste: {e}")
+        return {"loaded": True, "epoch": ckpt.get("epoch"), "val_loss": ckpt.get("val_loss")}
+
+    # Loop de avaliação
+    # Inicializa todos os componentes que cvae_loss pode retornar
+    totals = {k: 0.0 for k in ["total","recon","stop","atom","bond","exist","pos","charge","kl"]}
+    n = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            if batch is None:
+                continue
+            site        = batch["tensor"].to(device)
+            graphs      = [g.to(device) for g in batch["graphs"]]
+            voxel_sizes = batch["voxel_sizes"].to(device)
+            preds = model(site, graphs, voxel_sizes)
+            losses = cvae_loss(preds, beta=1.0)
+            # Acumula apenas as chaves presentes — robusto a versões diferentes
+            for k in totals:
+                if k in losses and torch.isfinite(losses[k]):
+                    totals[k] += losses[k].item()
+            n += 1
+
+    if n == 0:
+        return {"loaded": True, "n_test_batches": 0}
+
+    return {
+        "loaded":           True,
+        "best_epoch":       ckpt.get("epoch"),
+        "val_loss_ckpt":    round(float(ckpt.get("val_loss", 0)), 4),
+        "test_total":       round(totals["total"]  / n, 4),
+        "test_recon":       round(totals["recon"]  / n, 4),
+        "test_stop":        round(totals["stop"]   / n, 6),
+        "test_atom":        round(totals["atom"]   / n, 6),  # 6 casas: valores ~1e-5
+        "test_bond":        round(totals["bond"]   / n, 6),
+        "test_exist":       round(totals["exist"]  / n, 6),
+        "test_pos":         round(totals["pos"]    / n, 4),
+        "test_charge":      round(totals["charge"] / n, 6),
+        "test_kl":          round(totals["kl"]     / n, 4),
+        "n_test_batches":   n,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCO 3 — GERAÇÃO E VALIDAÇÃO DE LIGANTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+_GEN_MODULE = None     # cache — ver _load_generate_module
+
+
+def _load_generate_module():
+    """Carrega pipeline_generate.py UMA vez por processo.
+
+    Antes, era recarregado a cada candidato (dentro de
+    decode_predictions_to_mol): além do custo, cada instância nova nascia
+    com BOND_STATS/CHARGE_STATS VAZIAS, porque quem as popula é
+    pipeline_generate.load_model — que a Etapa 6 não chama. Ver
+    _prepare_generate_module.
+    """
+    global _GEN_MODULE
+    if _GEN_MODULE is not None:
+        return _GEN_MODULE
+    import importlib.util
+    gen_path = Path(__file__).resolve().parent / "pipeline_generate.py"
+    spec = importlib.util.spec_from_file_location("pipeline_generate", gen_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Não foi possível criar spec para {gen_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _GEN_MODULE = mod
+    return mod
+
+
+def _prepare_generate_module(cfg: dict, tensor_dir: "Path | None" = None):
+    """Carrega o módulo de geração e injeta nele a química empírica da base,
+    exatamente como pipeline_generate.load_model faz na Etapa 7.
+
+    Por que isto é obrigatório: sem BOND_STATS a montagem da molécula
+    (_assemble_bonds_global / _bond_distance_ok) perde os dois priors que
+    vêm da base e passa a montar moléculas que não são química de pequenas
+    moléculas. Medido na Etapa 6 com o dicionário vazio, 60 candidatos:
+
+      - o TIPO da ligação deixa de ser decidido: com estatística vazia todos
+        os tipos pontuam freq = 1,0 e vence o primeiro da ordem de iteração,
+        BondType.SINGLE. Resultado, 565 de 565 ligações simples — nenhuma
+        aromática era POSSÍVEL por construção, independentemente do que o
+        modelo tivesse aprendido;
+      - _bond_distance_ok cai no limite plano (2,15 Å) e abandona a checagem
+        de frequência do par, de modo que pares que a base praticamente não
+        tem passam a ser aceitos: O-O (1 ocorrência em 90.272 ligações da
+        base) e N-N apareceram 4 e 13 vezes.
+
+    A consequência metodológica era pior que os defeitos em si: Etapa 6 e
+    Etapa 7 exercitavam caminhos de montagem DIFERENTES, e suas métricas
+    não eram comparáveis entre si.
+    """
+    gen = _load_generate_module()
+
+    _stats = (cfg or {}).get("bond_stats") or {}
+    if _stats:
+        gen.BOND_STATS.clear(); gen.BOND_STATS.update(_stats)
+        log.info(f"  Química da base herdada do checkpoint: "
+                 f"{len(_stats)} pares (elemento, elemento, ordem)")
+    else:
+        log.warning(
+            "  Checkpoint sem bond_stats: a montagem cai no critério plano de "
+            "distância (2,15 Å), NÃO rejeita pares inexistentes na base "
+            "(O-O, N-N, O-F...) e rotula TODA ligação como simples. As "
+            "métricas desta etapa não serão comparáveis com a Etapa 7."
+        )
+
+    # Padrões de carga formal — mesma cascata de load_model: checkpoint
+    # primeiro, charge_stats.json ao lado dos tensores como alternativa.
+    _cst = (cfg or {}).get("charge_stats") or {}
+    if not _cst and tensor_dir is not None:
+        _cst_path = Path(tensor_dir) / "charge_stats.json"
+        if _cst_path.exists():
+            try:
+                import json
+                _cst = json.loads(_cst_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                log.debug(f"  charge_stats.json ilegível: {e}")
+    if _cst:
+        gen.CHARGE_STATS.clear(); gen.CHARGE_STATS.update(_cst)
+
+    return gen
+
+
+def decode_predictions_to_mol(candidate: dict, gen=None):
+    """Converte um candidato de LigandCVAE.sample() (decoder autorregressivo)
+    em molécula RDKit.
+
+    Fina wrapper sobre pipeline_generate.preds_to_mol — reaproveita a MESMA
+    lógica de validação química (valência, distância, reparo de fragmentos
+    desconexos) usada na geração real, em vez de manter uma cópia duplicada
+    aqui que divergiria com o tempo (era exatamente o que acontecia com a
+    versão anterior, escrita para o decoder de topologia fixa por template
+    — já incompatível com o formato de saída atual).
+
+    gen: módulo de geração JÁ preparado por _prepare_generate_module (com
+    BOND_STATS/CHARGE_STATS da base). Passar None mantém compatibilidade,
+    mas então a montagem roda sem os priors da base — ver o aviso na
+    docstring de _prepare_generate_module.
+    """
+    if not HAS_RDKIT:
+        return None
+    try:
+        if gen is None:
+            gen = _load_generate_module()
+        return gen.preds_to_mol(candidate)
+    except Exception as e:
+        log.warning(f"  decode_predictions_to_mol: {e}")
+        return None
+
+
+def compute_molecule_metrics(smiles_list, train_smiles: "set[str] | list[str] | None" = None) -> dict:
+    """Calcula métricas de qualidade de moléculas geradas.
+
+    Métricas padrão em avaliação de geração molecular de novo (MOSES —
+    Polykovskiy et al., 2020; GuacaMol — Brown et al., 2019):
+      - Validity    : % de SMILES que são moléculas válidas
+      - Uniqueness  : % de moléculas únicas (canônicas) entre as válidas
+      - Novelty     : % das moléculas únicas válidas AUSENTES de
+                       `train_smiles` — descarta memorização trivial do
+                       conjunto de treino. None se train_smiles não for
+                       passado (em vez de um valor enganoso tipo 0 ou 1).
+      - Internal diversity (IntDiv1): 1 − similaridade de Tanimoto média
+                       par-a-par (Morgan/ECFP4 r=2, 2048 bits) entre as
+                       moléculas únicas válidas. Alto = candidatos
+                       quimicamente diferentes entre si, não apenas
+                       variações do mesmo esqueleto.
+      - QED         : Drug-likeness (0-1, maior = mais drug-like)
+      - MW          : Peso molecular médio
+      - LogP        : Coeficiente de partição (lipofilia)
+      - SA Score    : Facilidade de síntese estimada (Ertl & Schuffenhauer,
+                       2009; 1=fácil, 10=difícil) via o script Contrib
+                       `sascorer` do RDKit. None se HAS_SASCORER=False
+                       (script indisponível) — antes este campo era
+                       prometido no docstring mas nunca calculado.
+      - Lipinski    : % que passa na Regra dos 5 de Lipinski
+
+    QED/MW/LogP/SA/Lipinski são calculados sobre o conjunto DEDUPLICADO
+    (uma ocorrência por SMILES canônico) — evita que um candidato muito
+    repetido distorça as médias, consistente com a prática de MOSES/
+    GuacaMol.
+
+    Args:
+        train_smiles: SMILES do split de TREINO, usado só para novelty
+            (comparação por forma canônica). Passe None para pular esse
+            cálculo.
+    """
+    if not HAS_RDKIT or not smiles_list:
+        return {}
+
+    valid_mols = []
+    for smi in smiles_list:
+        if smi:
+            mol = Chem.MolFromSmiles(smi)
+            if mol:
+                valid_mols.append(mol)
+
+    validity = len(valid_mols) / len(smiles_list) if smiles_list else 0
+
+    # Deduplica por SMILES CANÔNICO — duas strings de entrada diferentes
+    # podem representar a mesma molécula.
+    unique_canon: dict = {}
+    for mol in valid_mols:
+        try:
+            canon = Chem.MolToSmiles(mol)
+        except Exception:
+            continue
+        unique_canon.setdefault(canon, mol)
+    uniqueness = len(unique_canon) / len(valid_mols) if valid_mols else 0
+
+    if not valid_mols:
+        return {"validity": 0.0, "uniqueness": 0.0, "n_valid": 0}
+
+    qed_scores, mws, logps, lipinski_pass, sa_scores = [], [], [], [], []
+    for mol in unique_canon.values():
+        try:
+            mw   = Descriptors.MolWt(mol)
+            logp = Descriptors.MolLogP(mol)
+            hbd  = rdMolDescriptors.CalcNumHBD(mol)
+            hba  = rdMolDescriptors.CalcNumHBA(mol)
+            qed_scores.append(QED.qed(mol))
+            mws.append(mw)
+            logps.append(logp)
+            lipinski_pass.append(mw <= 500 and logp <= 5 and hbd <= 5 and hba <= 10)
+        except Exception:
+            pass
+        if HAS_SASCORER:
+            try:
+                sa_scores.append(sascorer.calculateScore(mol))
+            except Exception:
+                pass
+
+    # ── Novelty vs. conjunto de treino ──────────────────────────────────
+    novelty = None
+    if train_smiles:
+        train_canon = set()
+        for smi in train_smiles:
+            if not smi:
+                continue
+            m = Chem.MolFromSmiles(smi)
+            if m is not None:
+                train_canon.add(Chem.MolToSmiles(m))
+        if train_canon:
+            n_novel = sum(1 for canon in unique_canon if canon not in train_canon)
+            novelty = n_novel / len(unique_canon)
+
+    # ── Diversidade interna (IntDiv1) ───────────────────────────────────
+    internal_diversity = None
+    unique_mol_list = list(unique_canon.values())
+    if len(unique_mol_list) >= 2:
+        try:
+            generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+            fps = [generator.GetFingerprint(m) for m in unique_mol_list]
+            sims = [
+                TanimotoSimilarity(fps[i], fps[j])
+                for i in range(len(fps)) for j in range(i + 1, len(fps))
+            ]
+            internal_diversity = 1.0 - (sum(sims) / len(sims)) if sims else None
+        except Exception:
+            internal_diversity = None
+
+    return {
+        "n_total":            len(smiles_list),
+        "n_valid":             len(valid_mols),
+        "n_unique":            len(unique_canon),
+        "validity":            round(validity, 3),
+        "uniqueness":          round(uniqueness, 3),
+        "novelty":             round(novelty, 3) if novelty is not None else None,
+        "internal_diversity":  round(internal_diversity, 3) if internal_diversity is not None else None,
+        "qed_mean":    round(np.mean(qed_scores), 3)    if qed_scores else None,
+        "qed_std":     round(np.std(qed_scores), 3)     if qed_scores else None,
+        "mw_mean":     round(np.mean(mws), 1)           if mws else None,
+        "logp_mean":   round(np.mean(logps), 2)         if logps else None,
+        "sa_score_mean": round(np.mean(sa_scores), 2)   if sa_scores else None,
+        "sa_score_std":  round(np.std(sa_scores), 2)    if sa_scores else None,
+        "lipinski_%":  round(np.mean(lipinski_pass)*100, 1) if lipinski_pass else None,
+    }
+
+
+def save_generated_sdf(generated_records, out_sdf: Path, real_smiles: str):
+    """Salva os ligantes gerados com coordenadas 3D em formato SDF.
+
+    Candidatos marcados com too_small (ver generate_ligands_for_site) NÃO
+    entram: eram eles que colocavam butano e N-N no arquivo que se abre no
+    PyMOL. Eles continuam contados nas métricas de validade.
+    """
+    writer = Chem.SDWriter(str(out_sdf))
+    n_escritos = n_pequenos = n_revertidos = 0
+    for idx, record in enumerate(generated_records, start=1):
+        mol = record.get("mol")
+        if mol is None:
+            continue
+        if record.get("too_small"):
+            n_pequenos += 1
+            continue
+        mol.SetProp("_Name", f"generated_{idx}")
+        mol.SetProp("SMILES", record.get("smiles", ""))
+        mol.SetProp("HeavyAtoms", str(record.get("n_heavy", mol.GetNumHeavyAtoms())))
+        # Rastreabilidade da guarda de relaxação (ver
+        # pipeline_generate._geometry_is_sane): diz se a geometria deste
+        # candidato é a minimizada ou a do decoder, revertida por
+        # divergência do minimizador.
+        if mol.HasProp("relax_reverted"):
+            revertido = bool(mol.GetBoolProp("relax_reverted"))
+            mol.SetProp("Geometry", "decoder (minimização revertida)"
+                                    if revertido else "minimizada")
+            n_revertidos += int(revertido)
+        if real_smiles:
+            mol.SetProp("Reference_SMILES", real_smiles)
+        writer.write(mol)
+        n_escritos += 1
+    writer.close()
+    log.info(f"\n  3D SDF saved at: {out_sdf}")
+    log.info(f"  Molecules written: {n_escritos}"
+             + (f"  (excluded by minimum size: {n_pequenos})" if n_pequenos else ""))
+    if n_revertidos:
+        log.info(f"  Geometry reverted to the decoder's (minimizer diverged): "
+                 f"{n_revertidos}")
+
+
+def generate_ligands_for_site(
+    ckpt_dir: Path,
+    tensor_dir: Path,
+    n_samples: int = 20,
+    temperature: float = 1.0,
+    min_heavy_atoms: int = 7,
+):
+    """Gera ligantes para os sítios do conjunto de teste e avalia qualidade.
+
+    min_heavy_atoms: mesmo limiar da curadoria
+    (pipeline_curate.CURATE_CONFIG["min_heavy_atoms"]) e da Etapa 7
+    (pipeline_generate.filter_candidates_by_size). Aqui NÃO descarta o
+    candidato: cada registro recebe "n_heavy" e "too_small", para que as
+    métricas de validade química continuem medidas sobre TODOS os
+    candidatos (trocar o denominador tornaria a validade incomparável com
+    a da Etapa 7) enquanto o SDF/SMI, que é o que se abre no visualizador,
+    fica só com moléculas de tamanho plausível. Era por falta deste campo
+    que butano (4 átomos) e N-N (2 átomos) apareciam em
+    generated_ligands_3d.sdf.
+    """
+    if not HAS_TORCH:
+        return []
+
+    try:
+        mod = _load_train_module()
+        SiteLigandDataset = mod.SiteLigandDataset
+        LigandCVAE = mod.LigandCVAE
+    except Exception as e:
+        log.error(f"Erro ao importar pipeline_train.py: {e}")
+        return []
+
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    best_ckpt = ckpt_dir / "best_model.pt"
+    ckpt      = torch.load(best_ckpt, map_location=device, weights_only=False)
+    cfg       = ckpt.get("config", {})
+
+    model = LigandCVAE(
+        in_channels=cfg.get("site_in_channels", 5),
+        latent_dim=cfg.get("latent_dim", 256),
+        hidden_dim=cfg.get("hidden_dim", 256),
+        n_gnn_layers=cfg.get("n_gnn_layers", 4),
+    ).to(device)
+    if not _check_arch(cfg, mod, "Geração de exemplos"):
+        return []
+
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    # Pega um par do teste como sítio de referência (só o tensor do sítio —
+    # o decoder autorregressivo não usa mais nenhum "template graph")
+    test_ds = SiteLigandDataset(tensor_dir=tensor_dir, split="test")
+    from torch.utils.data import DataLoader
+    loader      = DataLoader(test_ds, batch_size=1, shuffle=True,
+                             collate_fn=SiteLigandDataset.collate_fn)
+    batch       = next(iter(loader))
+    if batch is None:
+        return []
+
+    site        = batch["tensor"].to(device)
+    real_smiles = batch["smiles"][0]
+
+    log.info(f"Sítio de referência: {batch['pair_ids'][0]}")
+    log.info(f"Ligante real (cristal): {real_smiles}")
+    log.info(f"Gerando {n_samples} ligantes (temperatura={temperature})...")
+
+    # Química empírica da base, do próprio checkpoint — sem isto a montagem
+    # roda sem os priors que a Etapa 7 usa e as duas etapas deixam de ser
+    # comparáveis (ver _prepare_generate_module).
+    bond_stats = cfg.get("bond_stats") or None
+    gen = _prepare_generate_module(cfg, tensor_dir=tensor_dir)
+
+    # Amostragem — construção sequencial em lockstep (ver LigandCVAE.sample).
+    # bond_stats também entra no rollout: é o que habilita a janela de
+    # distância por par de elemento no rollback geométrico de
+    # LigandCVAE.sample (sem ele, a janela cai no limite genérico).
+    generated_records = []
+    voxel_sizes = batch["voxel_sizes"].to(device)
+    with torch.no_grad():
+        samples = model.sample(site,
+                               n_samples=n_samples,
+                               temperature=temperature,
+                               voxel_sizes=voxel_sizes,
+                               bond_stats=bond_stats)
+        for candidate in samples:
+            mol = decode_predictions_to_mol(candidate, gen=gen)
+            if mol:
+                smi = Chem.MolToSmiles(mol)
+                n_heavy = mol.GetNumHeavyAtoms()
+                generated_records.append({
+                    "smiles": smi,
+                    "mol": mol,
+                    "n_heavy": n_heavy,
+                    "too_small": n_heavy < min_heavy_atoms,
+                })
+            else:
+                generated_records.append({
+                    "smiles": "", "mol": None,
+                    "n_heavy": 0, "too_small": True,
+                })
+
+    return real_smiles, generated_records
+
+
+def compute_active_units(
+    ckpt_dir: Path,
+    tensor_dir: Path,
+    split: str = "val",
+    threshold: float = 0.01,
+    max_samples: int = 500,
+) -> "dict | None":
+    """Métrica "active units" (Burda, Grosse & Salakhutdinov, 2016 — Importance
+    Weighted Autoencoders) para diagnosticar colapso PARCIAL de posterior, que
+    o heurístico já existente (analyze_training_history: "KL ≈ 0" sobre o
+    escalar médio final_kl) não detecta — uma média de KL moderada pode
+    esconder poucas dimensões fortemente ativas e o resto morto, indistinguível
+    de "todas as dimensões fracamente ativas" olhando só o agregado (ver
+    pipeline_train.cvae_loss: L_KL é a MÉDIA sobre batch×latent_dim, não a
+    soma por amostra).
+
+    Para cada dimensão u do espaço latente, AU_u = Var_x(E_{q(z|x)}[z_u]) — a
+    variância, ENTRE AMOSTRAS do split (sítios diferentes), da média
+    posterior z_mean naquela dimensão. Uma dimensão "morta" tem z_mean
+    praticamente constante entre sítios diferentes (o encoder não usa aquele
+    eixo para diferenciar sítios) — variância perto de zero. Convenção do
+    artigo original: ativa se essa variância > 0.01.
+
+    Retorna None em qualquer falha (torch ausente, checkpoint/tensor_dir
+    ausentes ou split vazio, poucas amostras) — o chamador decide como
+    reportar a ausência do diagnóstico.
+    """
+    if not HAS_TORCH:
+        log.warning("  PyTorch indisponível — não é possível calcular active units.")
+        return None
+
+    ckpt_dir = Path(ckpt_dir)
+    best_ckpt = ckpt_dir / "best_model.pt"
+    if not best_ckpt.exists():
+        log.error(f"  Checkpoint não encontrado: {best_ckpt}")
+        return None
+
+    try:
+        mod = _load_train_module()
+    except Exception as e:
+        log.error(f"  Erro ao importar pipeline_train.py: {e}")
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+    except Exception as e:
+        log.error(f"  Erro ao carregar {best_ckpt}: {e}")
+        return None
+    cfg = ckpt.get("config", {})
+    latent_dim = cfg.get("latent_dim", 256)
+
+    model = mod.LigandCVAE(
+        in_channels=cfg.get("site_in_channels", 5),
+        latent_dim=latent_dim,
+        hidden_dim=cfg.get("hidden_dim", 256),
+        n_gnn_layers=cfg.get("n_gnn_layers", 4),
+    ).to(device)
+    if not _check_arch(cfg, mod, "Active units"):
+        return None
+    try:
+        model.load_state_dict(ckpt["model_state"], strict=False)
+    except Exception as e:
+        log.error(f"  Erro ao carregar pesos do checkpoint: {e}")
+        return None
+    model.eval()
+
+    try:
+        ds = mod.SiteLigandDataset(tensor_dir=Path(tensor_dir), split=split)
+    except Exception as e:
+        log.error(f"  Erro ao carregar split '{split}' de {tensor_dir}: {e}")
+        return None
+    if len(ds) == 0:
+        log.error(f"  Split '{split}' vazio em {tensor_dir}.")
+        return None
+
+    from torch.utils.data import DataLoader
+    loader = DataLoader(ds, batch_size=16, shuffle=False,
+                         collate_fn=mod.SiteLigandDataset.collate_fn)
+
+    z_means = []
+    n_seen = 0
+    with torch.no_grad():
+        for batch in loader:
+            if batch is None:
+                continue
+            site        = batch["tensor"].to(device)
+            voxel_sizes = batch["voxel_sizes"].to(device)
+            zm, _ = model.encoder(site, voxel_sizes)
+            z_means.append(zm.cpu())
+            n_seen += zm.shape[0]
+            if n_seen >= max_samples:
+                break
+
+    if not z_means:
+        log.error("  Nenhum lote válido obtido do DataLoader — não foi possível calcular.")
+        return None
+
+    z_means = torch.cat(z_means, dim=0)[:max_samples]   # (N, latent_dim)
+    n_used  = z_means.shape[0]
+    if n_used < 2:
+        log.error(f"  Amostras insuficientes ({n_used}) para calcular variância entre sítios.")
+        return None
+
+    per_dim_var = z_means.var(dim=0, unbiased=True).numpy()   # (latent_dim,)
+    n_active    = int((per_dim_var > threshold).sum())
+
+    # kl_mean_per_dim: reaproveita a MESMA fórmula de pipeline_train.cvae_loss
+    # (via mean/var, não a variância entre amostras usada acima) como
+    # cross-check contra o valor já logado durante o treino — devem bater
+    # aproximadamente se o split/checkpoint forem os mesmos.
+    return {
+        "n_active":        n_active,
+        "n_total":         latent_dim,
+        "fraction_active": (n_active / latent_dim) if latent_dim else 0.0,
+        "threshold":       threshold,
+        "n_samples_used":  n_used,
+        "split":           split,
+        "per_dim_variance": per_dim_var,
+        "ckpt_epoch":      ckpt.get("epoch", "?"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_section(title: str):
+    sep = "═" * 60
+    log.info(f"\n{sep}")
+    log.info(f"  {title}")
+    log.info(sep)
+
+
+def plot_performance_report(
+    df,
+    test_results,
+    gen_metrics,
+    real_smiles,
+    gen_smiles,
+    ckpt_dir,
+    fig_dir,
+    active_units=None,
+):
+    """Painel de desempenho: 3 paineis lado a lado.
+
+    [1] Barras — componentes da loss no conjunto de teste
+    [2] Histograma — distribuicao de QED das moleculas geradas
+    [3] Tabela — metricas de geracao
+
+    Salva: performance_report.png e performance_report.svg
+    Nao repete os graficos de treinamento (ja cobertos por training_curves).
+    """
+    C_BAR  = "#5B9BD5"
+    C_QED  = "#55A868"
+    C_MEAN = "#C44E52"
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5),
+                             gridspec_kw={"wspace": 0.38})
+
+    _best_vl  = df["val_total"].min() if "val_total" in df.columns else 0
+    _test_tot = test_results.get("test_total", "N/A")
+    _title = (
+        "CODEEP - Performance | Val loss: " + str(round(float(_best_vl), 4)) +
+        " | Test loss: " + str(_test_tot)
+    )
+    # Active units (Burda et al., 2016) — diagnóstico de colapso PARCIAL de
+    # posterior, complementar ao heurístico "KL ≈ 0" já usado em
+    # analyze_training_history (que só enxerga o escalar agregado, ver
+    # compute_active_units). None quando o cálculo falhou (torch ausente,
+    # split de validação vazio etc.) — não interrompe o resto do relatório.
+    if active_units:
+        _title += (
+            " | Active units: " + str(active_units["n_active"]) + "/" +
+            str(active_units["n_total"]) + " (" +
+            str(round(active_units["fraction_active"] * 100, 1)) + "%)"
+        )
+    fig.suptitle(_title, fontsize=12, fontweight="bold", y=1.02)
+
+    # Painel 1: barras dos componentes de teste
+    ax1 = axes[0]
+    components = {
+        "Total":   test_results.get("test_total",  0) or 0,
+        "Reconstruction":   test_results.get("test_recon",  0) or 0,
+        "3D Position": test_results.get("test_pos",    0) or 0,
+        "KL":      test_results.get("test_kl",     0) or 0,
+        "Atom":   test_results.get("test_atom",   0) or 0,
+        "Charge":   test_results.get("test_charge", 0) or 0,
+    }
+    vals  = list(components.values())
+    bars  = ax1.bar(list(components.keys()), vals,
+                    color=C_BAR, edgecolor="white", width=0.55)
+    ymax  = max(vals) * 1.18 if max(vals) > 0 else 1
+    ax1.set_ylim(0, ymax)
+    for bar, val in zip(bars, vals):
+        ax1.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + ymax * 0.02,
+                 str(round(val, 4)), ha="center", va="bottom", fontsize=8)
+    ax1.set_title("Test Loss Components", fontsize=10, fontweight="bold")
+    ax1.set_ylabel("Loss", fontsize=9)
+    ax1.grid(True, alpha=0.3, axis="y")
+    ax1.tick_params(axis="x", labelsize=8, rotation=15)
+    ax1.tick_params(axis="y", labelsize=8)
+
+    # Panel 2: QED histogram
+    ax2 = axes[1]
+    qed_vals = []
+    if HAS_RDKIT and gen_smiles:
+        for smi in gen_smiles:
+            if smi:
+                mol = Chem.MolFromSmiles(smi)
+                if mol:
+                    try:
+                        qed_vals.append(QED.qed(mol))
+                    except Exception:
+                        pass
+
+    if qed_vals:
+        ax2.hist(qed_vals, bins=min(12, len(qed_vals)),
+                 color=C_QED, edgecolor="white", alpha=0.85)
+        mu = float(np.mean(qed_vals))
+        ax2.axvline(mu, color=C_MEAN, lw=2, ls="--",
+                    label="Mean = " + str(round(mu, 3)))
+        ax2.set_xlim(0, 1)
+        ax2.legend(fontsize=9)
+    else:
+        msg = "Run with --generate" if not gen_smiles else "No valid molecules"
+        ax2.text(0.5, 0.5, msg, ha="center", va="center",
+                 fontsize=10, color="gray", transform=ax2.transAxes)
+    ax2.set_title("QED Distribution (Generated)", fontsize=10, fontweight="bold")
+    ax2.set_xlabel("QED", fontsize=9)
+    ax2.set_ylabel("Frequency", fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.tick_params(labelsize=8)
+
+    # Panel 3: generation metrics table
+    ax3 = axes[2]
+    ax3.axis("off")
+    if gen_metrics and gen_metrics.get("n_valid", 0) > 0:
+        n_val = gen_metrics.get("n_valid", 0)
+        n_tot = gen_metrics.get("n_total", 0)
+        rows = [
+            ["Generated",    str(n_tot)],
+            ["Valid",        str(n_val) + " (" + str(round(gen_metrics.get("validity",0)*100)) + "%)"],
+            ["Unique",       str(round(gen_metrics.get("uniqueness",0)*100)) + "%"],
+            ["Mean QED",     str(gen_metrics.get("qed_mean","N/A")) + " +/- " + str(gen_metrics.get("qed_std","N/A"))],
+            ["Mean MW",      str(gen_metrics.get("mw_mean","N/A")) + " Da"],
+            ["Mean LogP",    str(gen_metrics.get("logp_mean", "N/A"))],
+            ["Lipinski",     str(gen_metrics.get("lipinski_%","N/A")) + "%"],
+        ]
+        tbl = ax3.table(cellText=rows, colLabels=["Metric", "Value"],
+                        cellLoc="center", loc="center",
+                        bbox=[0.0, 0.05, 1.0, 0.92])
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9.5)
+        for (row, col), cell in tbl.get_celld().items():
+            cell.set_edgecolor("#CCCCCC")
+            cell.set_height(0.125)
+            if row == 0:
+                cell.set_facecolor("#2C3E50")
+                cell.set_text_props(color="white", fontweight="bold")
+            elif row % 2 == 0:
+                cell.set_facecolor("#F0F4F8")
+    else:
+        ax3.text(0.5, 0.5, "Run with --generate to see metrics",
+                 ha="center", va="center", fontsize=10, color="gray",
+                 transform=ax3.transAxes)
+    ax3.set_title("Generation Metrics", fontsize=10, fontweight="bold")
+
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    for ext, kw in [("png", {"dpi": 150}), ("svg", {})]:
+        out = fig_dir / ("performance_report." + ext)
+        plt.savefig(out, bbox_inches="tight", **kw)
+        log.info(f"Performance report saved at: {out}")
+    plt.close()
+
+def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path,
+         min_heavy_atoms: int = 7):
+    
+
+    print_section("1. TRAINING HISTORY ANALYSIS")
+
+    result = analyze_training_history(ckpt_dir)
+    if not result:
+        return
+    report, df = result
+
+    log.info(f"  Trained epochs      : {report['total_epochs']}")
+    log.info(f"  Best epoch          : {report['best_epoch']}")
+    log.info(f"  Best val_loss       : {report['best_val_loss']}")
+    log.info(f"  Final val loss      : {report['final_val_loss']}")
+    log.info(f"  Final train loss    : {report['final_train_loss']}")
+    log.info(f"  Overfitting gap     : {report['overfit_gap']:+.4f}")
+    log.info(f"  Final KL (val)      : {report['final_kl']}")
+    log.info(f"  Final recon (val)   : {report['final_recon']}")
+
+    if report["issues"]:
+        log.info("\n  DIAGNOSTICS:")
+        for issue in report["issues"]:
+            log.info(f"    {issue}")
+    else:
+        log.info("\n  ✓ No issues detected during training.")
+
+    plot_training_curves(df, ckpt_dir, fig_dir)
+    
+
+    print_section("2. TEST SET EVALUATION")
+
+    test_results = evaluate_on_test(ckpt_dir, tensor_dir)
+    if test_results:
+        for k, v in test_results.items():
+            log.info(f"  {k:<25}: {v}")
+
+        # Generalization: compare val_loss from checkpoint with test_loss
+        if "val_loss_ckpt" in test_results and "test_total" in test_results:
+            gap = test_results["test_total"] - test_results["val_loss_ckpt"]
+            if abs(gap) < 0.1:
+                log.info("\n  ✓ Good generalization: val ≈ test")
+            elif gap > 0.3:
+                log.info(f"\n  ⚠️  Test loss ({test_results['test_total']}) "
+                         f"> Val loss ({test_results['val_loss_ckpt']}): "
+                         "possible data leakage or small dataset.")
+
+    print_section("2b. LATENT SPACE DIAGNOSTICS (ACTIVE UNITS)")
+    active_units = compute_active_units(ckpt_dir, tensor_dir)
+    if active_units:
+        log.info(
+            f"  Active units: {active_units['n_active']}/{active_units['n_total']} "
+            f"({active_units['fraction_active']*100:.1f}%) — "
+            f"threshold={active_units['threshold']}, "
+            f"split={active_units['split']} ({active_units['n_samples_used']} amostras)"
+        )
+        if active_units["fraction_active"] < 0.10:
+            log.info(
+                "  ⚠️  Poucas dimensões ativas — possível colapso PARCIAL de "
+                "posterior mesmo com KL médio agregado não-nulo (ver nota em "
+                "compute_active_units)."
+            )
+    else:
+        log.warning("  Não foi possível calcular active units (ver mensagens acima).")
+
+    if do_generate:
+        print_section("3. GENERATION OF NEW LIGANDS")
+
+        real_smi, generated_records = generate_ligands_for_site(
+            ckpt_dir=ckpt_dir,
+            tensor_dir=tensor_dir,
+            n_samples=20,
+            temperature=1.0,
+            min_heavy_atoms=min_heavy_atoms,
+        )
+
+        gen_smiles = [record["smiles"] for record in generated_records]
+
+        # SMILES do split de TREINO — só para novelty (ver
+        # compute_molecule_metrics). Falha aqui não deve derrubar a
+        # avaliação inteira: sem isso, novelty simplesmente fica None.
+        train_smiles = None
+        try:
+            mod = _load_train_module()
+            train_ds = mod.SiteLigandDataset(tensor_dir=tensor_dir, split="train")
+            train_smiles = train_ds.records["ligand_smiles"].dropna().tolist()
+        except Exception as e:
+            log.warning(f"  Não foi possível carregar SMILES de treino p/ novelty: {e}")
+
+        metrics = compute_molecule_metrics(gen_smiles, train_smiles=train_smiles)
+        log.info(f"  Real crystal ligand: {real_smi}")
+        log.info(f"  Generated molecules     : {metrics.get('n_total', 0)}")
+        log.info(f"  Valid                   : {metrics.get('n_valid', 0)} "
+                 f"({metrics.get('validity', 0)*100:.1f}%)")
+        log.info(f"  Unique                  : {metrics.get('uniqueness', 0)*100:.1f}%")
+        novelty = metrics.get('novelty')
+        log.info(f"  Novelty (vs. treino)    : "
+                 f"{'N/A' if novelty is None else f'{novelty*100:.1f}%'}")
+        int_div = metrics.get('internal_diversity')
+        log.info(f"  Internal diversity      : {'N/A' if int_div is None else int_div}")
+        log.info(f"  Mean QED                : {metrics.get('qed_mean', 'N/A')} "
+                 f"(± {metrics.get('qed_std', 'N/A')})")
+        log.info(f"  Mean MW                 : {metrics.get('mw_mean', 'N/A')} Da")
+        log.info(f"  Mean LogP               : {metrics.get('logp_mean', 'N/A')}")
+        sa_mean = metrics.get('sa_score_mean')
+        log.info(f"  Mean SA Score           : "
+                 f"{'N/A (sascorer indisponível)' if sa_mean is None else sa_mean}")
+        log.info(f"  Lipinski Rule           : {metrics.get('lipinski_%', 'N/A')}%")
+
+        # Funil de tamanho — o mesmo limiar da curadoria e da Etapa 7.
+        # Reportado separadamente da validade: um candidato de 2 átomos é
+        # quimicamente VÁLIDO e ao mesmo tempo inútil como ligante, e
+        # misturar as duas coisas numa só porcentagem esconde qual dos dois
+        # problemas o modelo tem.
+        tamanhos = [r.get("n_heavy", 0) for r in generated_records
+                    if r.get("mol") is not None]
+        n_pequenos = sum(1 for r in generated_records
+                         if r.get("mol") is not None and r.get("too_small"))
+        if tamanhos:
+            log.info(f"  Heavy atoms (valid)     : "
+                     f"median {int(np.median(tamanhos))}, "
+                     f"min {min(tamanhos)}, max {max(tamanhos)}")
+            log.info(f"  Below minimum size      : {n_pequenos} of "
+                     f"{len(tamanhos)} valid (excluded from SDF/SMI)")
+
+        out_sdf = ckpt_dir / "generated_ligands_3d.sdf"
+        save_generated_sdf(generated_records, out_sdf, real_smi)
+
+        # Save generated SMILES — mesmo critério de tamanho do SDF, para que
+        # os dois arquivos tragam o mesmo conjunto de moléculas.
+        out_smi = ckpt_dir / "generated_smiles.smi"
+        with open(out_smi, "w") as f:
+            f.write(f"# Real crystal ligand: {real_smi}\n")
+            for record in generated_records:
+                smi = record.get("smiles", "")
+                if smi and not record.get("too_small"):
+                    f.write(smi + "\n")
+        log.info(f"\n  SMILES saved at: {out_smi}")
+
+    # Generate full performance report
+    _gen_metrics = metrics     if (do_generate and "metrics"    in dir()) else {}
+    _gen_smiles  = gen_smiles  if (do_generate and "gen_smiles" in dir()) else []
+    _real_smi    = real_smi    if (do_generate and "real_smi"   in dir()) else ""
+    plot_performance_report(
+        df=df,
+        test_results=test_results or {},
+        gen_metrics=_gen_metrics,
+        real_smiles=_real_smi,
+        gen_smiles=_gen_smiles,
+        ckpt_dir=ckpt_dir,
+        fig_dir=fig_dir,
+        active_units=active_units,
+    )
+
+    print_section("SUMMARY AND NEXT STEPS")
+
+    # Recommendation logic based on diagnostics
+    issues = report.get("issues", [])
+    kl     = report["final_kl"]
+    gap    = report["overfit_gap"]
+
+    if not issues:
+        log.info("  ✓ Healthy training!")
+        log.info("  Suggested next steps:")
+        log.info("    1. Run with --generate to evaluate generated molecules")
+        log.info("    2. Increase the dataset (more ABC transporter proteins)")
+        log.info("    3. Try higher QM level: 3-21G or DFT/B3LYP")
+        log.info("    4. Fine-tuning: train more epochs with lower LR (1e-5)")
+    else:
+        log.info("  Recommended actions based on diagnostics:")
+        if kl < 0.01:
+            log.info("    → Posterior collapse: reduce --beta to 0.1 and increase")
+            log.info("      --beta-warmup to 40 in the next training")
+        if gap > 0.5:
+            log.info("    → Overfitting: increase --dropout to 0.3 or")
+            log.info("      collect more training data")
+        if "NaN" in str(issues):
+            log.info("    → NaN: reduce --lr to 1e-5 and add --grad-clip 0.5")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=str(PROJECT_ROOT / "checkpoints" / "phase1"),
+        help="Checkpoint directory",
+    )
+    parser.add_argument(
+        "--tensor-dir",
+        type=str,
+        default=str(BASE_DIR / "tensors"),
+        help="Tensor directory for the phase to evaluate",
+    )
+    parser.add_argument(
+        "--fig-dir",
+        type=str,
+        default=str(BASE_DIR / "figures"),
+        help="Directory where the figures will be saved",
+    )
+    parser.add_argument(
+        "--generate",
+        action="store_true",
+        help="Generate new ligands and evaluate chemical quality",
+    )
+    parser.add_argument(
+        "--min-heavy-atoms",
+        type=int,
+        default=7,
+        help="Minimum heavy atoms for a generated molecule to be written to "
+             "the SDF/SMI (same threshold as curation and Step 7). It does "
+             "not change the validity metrics.",
+    )
+    args = parser.parse_args()
+
+    ckpt_dir = Path(args.ckpt)
+    tensor_dir = Path(args.tensor_dir)
+    fig_dir = Path(args.fig_dir)
+
+    if not ckpt_dir.exists():
+        log.error(f"Directory not found: {ckpt_dir}")
+        log.error("Check the path with --ckpt <directory>")
+        raise SystemExit(1)
+
+    main(
+        ckpt_dir=ckpt_dir,
+        do_generate=args.generate,
+        tensor_dir=tensor_dir,
+        fig_dir=fig_dir,
+        min_heavy_atoms=args.min_heavy_atoms,
+    )
