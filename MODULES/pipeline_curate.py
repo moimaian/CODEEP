@@ -603,7 +603,7 @@ def process_entry(
             and pair_info_file.exists()
         ):
             try:
-                with open(pair_info_file, "r") as f:
+                with open(pair_info_file, "r", encoding="utf-8") as f:
                     pair_meta = json.load(f)
 
                 records.append(pair_meta)
@@ -633,7 +633,7 @@ def process_entry(
             "site_fingerprint":      fp,
             **lig_props,
         }
-        with open(out_dir / "pair_info.json", "w") as f:
+        with open(out_dir / "pair_info.json", "w", encoding="utf-8") as f:
             json.dump(pair_meta, f, indent=2)
 
         records.append(pair_meta)

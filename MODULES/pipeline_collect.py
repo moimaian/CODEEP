@@ -266,7 +266,7 @@ def download_sdf_file(comp_id: str, dest_dir: Path) -> bool:
             r.raise_for_status()
             if len(r.text) < 10:
                 continue
-            out.write_text(r.text)
+            out.write_text(r.text, encoding="utf-8")
             time.sleep(REQUEST_DELAY)
             return True
         except Exception:
@@ -473,7 +473,7 @@ def collect_phase2(
     # Salva lista de IDs
     out = _base / "data" / "phase2_ids.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w") as f:
+    with open(out, "w", encoding="utf-8") as f:
         json.dump(sorted(all_ids), f)
 
     log.info(f"Phase 2 — PDB: {ok} downloaded, {fail} failed. IDs saved to {out}")
@@ -873,7 +873,7 @@ def collect_rcsb_wide(
         log.error("RCSB-wide não retornou nenhum PDB elegível.")
         return False
 
-    ids_json.write_text(json.dumps(pdb_ids, indent=2))
+    ids_json.write_text(json.dumps(pdb_ids, indent=2), encoding="utf-8")
     log.info(f"PDB IDs salvos em: {ids_json}")
     log.info(f"Total de PDB IDs elegíveis: {len(pdb_ids)}")
 

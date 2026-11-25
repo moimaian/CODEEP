@@ -667,7 +667,7 @@ def make_subset(
     marker = out_dir / "subset_info.json"
     if marker.exists():
         try:
-            info = json.loads(marker.read_text())
+            info = json.loads(marker.read_text(encoding="utf-8"))
             if (info.get("frac") == frac and info.get("seed") == seed
                     and info.get("source") == str(tensor_dir)):
                 log.info(f"Subconjunto reaproveitado: {out_dir} "
@@ -716,7 +716,10 @@ def make_subset(
         if dst.exists() or dst.is_symlink():
             continue
         if src.is_dir():
-            os.symlink(src, dst, target_is_directory=True)
+            # Linux: link simbólico. Windows: link simbólico exige modo de desenvolvedor/administrador, então
+            # cai para uma junção de diretório (sem privilégio) e, por último, para a cópia.
+            from MODULES import platform_utils
+            platform_utils.symlink_or_copy(src, dst)
             n_linked += 1
 
     marker.write_text(json.dumps({
@@ -726,7 +729,7 @@ def make_subset(
         "n_pairs":    int(len(sub)),
         "n_clusters": len(keep),
         "n_linked":   n_linked,
-    }, indent=2))
+    }, indent=2), encoding="utf-8")
 
     log.info(f"Subconjunto criado em {out_dir}: {len(sub)} pares "
              f"({len(keep)}/{len(clusters)} clusters, {n_linked} symlinks)")
@@ -1262,7 +1265,7 @@ def optimize(
         "out_dir":          str(out_dir),
     }
     best_json = out_dir / "best_params.json"
-    best_json.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    best_json.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
 
     log.info("")
     log.info(f"  Tabela de trials : {csv_path}")

@@ -366,41 +366,38 @@ def extract_site_from_center(
 # ── Busca heurística de sítio (P2Rank) ────────────────────────────────────────
 
 def _p2rank_bin() -> "str | None":
-    """Localiza o executável `prank` do P2Rank.
+    """Localiza o launcher do P2Rank (`prank`; `prank.bat` no Windows).
 
     Busca, nesta ordem: P2RANK_HOME, PATH e os diretórios de instalação
-    usuais. Mesmo padrão de _xtb_bin() em pipeline_voxelize.
+    usuais (<projeto>/tools, $HOME e, no Linux, /opt). Mesma busca de
+    CODEEP_requirements.detect_p2rank() e de _xtb_bin() em pipeline_voxelize.
     """
-    env_home = os.environ.get("P2RANK_HOME")
-    if env_home:
-        cand = Path(env_home) / "prank"
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
-
-    found = shutil.which("prank")
-    if found:
-        return found
-
-    for base in (PROJECT_DIR / "tools", Path.home(), Path("/opt")):
-        if not base.is_dir():
-            continue
-        try:
-            for cand in sorted(base.glob("p2rank*/prank")):
-                if cand.is_file() and os.access(cand, os.X_OK):
-                    return str(cand)
-        except OSError:
-            continue
-    return None
+    from MODULES import platform_utils
+    return platform_utils.find_p2rank(PROJECT_DIR / "tools")
 
 
-P2RANK_INSTALL_HINT = (
-    "P2Rank não encontrado. Para instalar:\n"
-    "  sudo apt install openjdk-17-jre-headless\n"
-    "  wget https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz\n"
-    "  tar -xzf p2rank_2.5.1.tar.gz -C ~/\n"
-    "Depois exporte P2RANK_HOME=~/p2rank_2.5.1 ou acrescente-o ao PATH.\n"
-    "P2Rank exige Java 17 ou superior."
-)
+def _p2rank_install_hint() -> str:
+    from MODULES import platform_utils
+    if platform_utils.IS_WINDOWS:
+        return (
+            "P2Rank não encontrado. Para instalar: abra o CODEEP, menu Install Requirements, "
+            "marque \"P2Rank\" e \"Java (JRE)\" e clique em Install selected.\n"
+            "(Manual: winget install --id Microsoft.OpenJDK.17 -e e descompacte "
+            "https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz em "
+            "%USERPROFILE%\\; depois defina P2RANK_HOME=%USERPROFILE%\\p2rank_2.5.1.)\n"
+            "P2Rank exige Java 17 ou superior."
+        )
+    return (
+        "P2Rank não encontrado. Para instalar:\n"
+        "  sudo apt install openjdk-17-jre-headless\n"
+        "  wget https://github.com/rdk/p2rank/releases/download/2.5.1/p2rank_2.5.1.tar.gz\n"
+        "  tar -xzf p2rank_2.5.1.tar.gz -C ~/\n"
+        "Depois exporte P2RANK_HOME=~/p2rank_2.5.1 ou acrescente-o ao PATH.\n"
+        "P2Rank exige Java 17 ou superior."
+    )
+
+
+P2RANK_INSTALL_HINT = _p2rank_install_hint()
 
 
 def detect_pockets_p2rank(
@@ -434,7 +431,11 @@ def detect_pockets_p2rank(
     cmd = [prank, "predict", "-f", str(pdb_path), "-o", str(tmp_out)]
     log.info(f"  Executando P2Rank: {' '.join(cmd)}")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        from MODULES import platform_utils
+        # Java achado fora do PATH (logo após instalar pelo winget) entra no ambiente do P2Rank;
+        # encoding explícito: a saída do Java não segue a página de código do Windows.
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              env=platform_utils.java_environment())
         if proc.returncode != 0:
             cauda = (proc.stderr or proc.stdout or "").strip().splitlines()[-6:]
             raise RuntimeError(
@@ -934,7 +935,7 @@ def load_model(
         _cst_path = _proj / "data" / "tensors" / "charge_stats.json"
         if _cst_path.exists():
             try:
-                _cst = json.loads(_cst_path.read_text())
+                _cst = json.loads(_cst_path.read_text(encoding="utf-8"))
                 log.info(f"  Padrões de carga formal lidos de {_cst_path.name}")
             except Exception as e:
                 log.warning(f"  charge_stats.json ilegível ({e}).")
@@ -1982,7 +1983,7 @@ def _build_gromacs_site_topology(
         if serial == 1:
             return None   # nenhum átomo pesado — nada a fazer
         lines += ["TER", "END"]
-        pdb_path.write_text("\n".join(lines))
+        pdb_path.write_text("\n".join(lines), encoding="utf-8")
 
         ff_name  = _resolve_gromacs_ff(protein_ff)
         top_path = workdir / "site.top"
@@ -1998,7 +1999,7 @@ def _build_gromacs_site_topology(
             log.debug(f"  pdb2gmx falhou: {result.stderr[-800:]}")
             return None
 
-        gro_lines = gro_path.read_text().splitlines()
+        gro_lines = gro_path.read_text(encoding="utf-8").splitlines()
         n_atoms = int(gro_lines[1].strip())
         atom_names = [line[10:15].strip() for line in gro_lines[2:2 + n_atoms]]
         # Backbone flag e elemento NA ORDEM/ÍNDICES do .gro que o pdb2gmx
@@ -2091,7 +2092,7 @@ def _minimize_complex_gromacs(
                           f"{result.stderr[-800:]}")
                 return False, None
 
-            lig_gro_lines = lig_gro.read_text().splitlines()
+            lig_gro_lines = lig_gro.read_text(encoding="utf-8").splitlines()
             n_lig = int(lig_gro_lines[1].strip())
             # Validação de ordem: acpype passa o ligante por vários conversores
             # internamente (OpenBabel -> antechamber -> parmchk2 -> tleap) antes
@@ -2110,7 +2111,7 @@ def _minimize_complex_gromacs(
                 return False, None
 
             # 2) Une a topologia do ligante com a do sítio (cacheada)
-            top_text = site_topology["top"].read_text()
+            top_text = site_topology["top"].read_text(encoding="utf-8")
             out_lines, inserted = [], False
             for line in top_text.split("\n"):
                 out_lines.append(line)
@@ -2119,10 +2120,10 @@ def _minimize_complex_gromacs(
                     inserted = True
             merged_top = "\n".join(out_lines).rstrip() + "\nLIG                 1\n"
             complex_top = tmp / "complex.top"
-            complex_top.write_text(merged_top)
+            complex_top.write_text(merged_top, encoding="utf-8")
 
             # 3) Une as coordenadas (site.gro + ligante.gro)
-            site_lines = site_topology["gro"].read_text().splitlines()
+            site_lines = site_topology["gro"].read_text(encoding="utf-8").splitlines()
             n_site = site_topology["n_atoms"]
             complex_gro_raw = tmp / "complex_raw.gro"
             complex_gro_raw.write_text("\n".join(
@@ -2130,7 +2131,7 @@ def _minimize_complex_gromacs(
                 + site_lines[2:2 + n_site]
                 + lig_gro_lines[2:2 + n_lig]
                 + [site_lines[2 + n_site]]   # vetor de caixa (do sítio)
-            ) + "\n")
+            ) + "\n", encoding="utf-8")
 
             # 4) Caixa de vácuo com padding — sistema pequeno e isolado, sem
             # relevância física de periodicidade real
@@ -2164,13 +2165,13 @@ def _minimize_complex_gromacs(
             ndx_lines = ["[ Frozen ]"]
             for i in range(0, len(frozen_idx), 15):
                 ndx_lines.append(" ".join(str(x) for x in frozen_idx[i:i + 15]))
-            (tmp / "index.ndx").write_text("\n".join(ndx_lines) + "\n")
+            (tmp / "index.ndx").write_text("\n".join(ndx_lines) + "\n", encoding="utf-8")
 
             (tmp / "min.mdp").write_text(
                 "integrator = steep\nnsteps = 500\nemtol = 100\nemstep = 0.01\n"
                 "cutoff-scheme = Verlet\ncoulombtype = cutoff\nrcoulomb = 1.2\n"
                 "rvdw = 1.2\npbc = xyz\nfreezegrps = Frozen\nfreezedim = Y Y Y\n"
-            )
+            , encoding="utf-8")
 
             tpr_path = tmp / "min.tpr"
             r = subprocess.run(
@@ -2193,7 +2194,7 @@ def _minimize_complex_gromacs(
                 return False, None
 
             # 6) Extrai posições finais (nm -> Å)
-            final_lines = min_gro.read_text().splitlines()
+            final_lines = min_gro.read_text(encoding="utf-8").splitlines()
 
             def _coords(lines, start, n):
                 return np.array([

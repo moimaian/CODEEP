@@ -39,12 +39,22 @@ import threading
 from pathlib import Path
 from typing import Optional, List
 
+# Camada de portabilidade Linux/Windows (só biblioteca padrão — ver MODULES/platform_utils.py e env_setup.py)
+_HERE_REQ = Path(__file__).resolve().parent
+if str(_HERE_REQ) not in sys.path:
+    sys.path.insert(0, str(_HERE_REQ))
+from MODULES import platform_utils, env_setup
+from MODULES.platform_utils import IS_WINDOWS
+
 
 # ==========================================================================
 # ─── HELPERS GENÉRICOS ────────────────────────────────────────────────────
 # ==========================================================================
 
 def _run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    # encoding/errors explícitos: a saída do pip/winget tem caracteres fora da página de código do Windows
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
     return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -89,14 +99,11 @@ def bootstrap_pyqt5(interactive: bool = True) -> bool:
     Garante que PyQt5 esteja disponível NO VENV ~/.venv/CODEEP.
     Usado quando CODEEP_requirements.py é executado diretamente.
     """
-    venv_python = Path.home() / ".venv" / "CODEEP" / "bin" / "python"
+    venv_python = Path(env_setup.venv_paths("CODEEP")["python"])
 
     # Já está rodando no venv — PyQt5 deve estar lá
-    try:
-        if Path(sys.executable).resolve() == venv_python.resolve():
-            return True
-    except Exception:
-        pass
+    if env_setup.running_in_venv("CODEEP"):
+        return True
 
     # Verifica se PyQt5 já está no venv
     check = subprocess.run(
@@ -108,7 +115,7 @@ def bootstrap_pyqt5(interactive: bool = True) -> bool:
         return True  # já instalado no venv
 
     msg = (
-        "\n[CODEEP] PyQt5 não encontrado no venv ~/.venv/CODEEP.\n"
+        f"\n[CODEEP] PyQt5 não encontrado no venv {env_setup.venv_paths('CODEEP')['venv_dir']}.\n"
         f"  Python atual: {sys.executable}\n"
     )
     print(msg)
@@ -145,57 +152,23 @@ def bootstrap_pyqt5(interactive: bool = True) -> bool:
 # ==========================================================================
 
 def venv_paths(env_name: str = "CODEEP") -> dict:
-    """Retorna caminhos do venv dedicado ao CODEEP."""
-    venv_dir = Path.home() / ".venv" / env_name
-    return {
-        "venv_dir": str(venv_dir),
-        "python":   str(venv_dir / "bin" / "python"),
-        "pip":      str(venv_dir / "bin" / "pip"),
-    }
+    """Retorna caminhos do venv dedicado ao CODEEP (Linux: bin/python; Windows: Scripts\\python.exe)."""
+    p = env_setup.venv_paths(env_name)
+    return {"venv_dir": p["venv_dir"], "python": p["python"], "pip": p["pip"], "pythonw": p["pythonw"]}
 
 
 def ensure_venv(env_name: str = "CODEEP") -> dict:
     """Cria o venv ~/.venv/CODEEP se não existir. Retorna venv_paths.
 
-    Usa sempre o Python do sistema (não sys.executable) para criar o venv,
-    evitando recursão caso o script já esteja rodando de dentro de outro venv.
-    """
-    p = venv_paths(env_name)
-    venv_dir = Path(p["venv_dir"])
-
-    if not venv_dir.is_dir() or not Path(p["python"]).is_file():
-        venv_dir.parent.mkdir(parents=True, exist_ok=True)
-
-        # Usa o Python do sistema para criar o venv, não o atual (pode ser venv)
-        system_python = _find_system_python()
-        res = _run([system_python, "-m", "venv", str(venv_dir)])
-        if res.returncode != 0:
-            raise RuntimeError(
-                f"Falha ao criar venv com {system_python}:\n{res.stdout}\n"
-                "Verifique se 'python3-venv' está instalado:\n"
-                "  sudo apt install python3-venv"
-            )
-        # Atualiza pip/setuptools/wheel no venv
-        _run([p["python"], "-m", "pip", "install", "--upgrade",
-              "pip", "setuptools", "wheel"])
-
-    return p
+    Usa sempre o Python do sistema (não sys.executable) para criar o venv no Linux e o Python 3.10.11
+    do python.org no Windows (instalado se faltar) — ver env_setup.ensure_venv."""
+    env_setup.ensure_venv(env_name)
+    return venv_paths(env_name)
 
 
 def _find_system_python() -> str:
     """Localiza o Python do sistema (fora de qualquer venv)."""
-    import shutil as _shutil
-    # Se o Python atual NÃO está num venv, usa ele diretamente
-    if not (hasattr(sys, "real_prefix") or
-            (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix)):
-        return sys.executable
-    # Caso contrário, procura python3 no PATH do sistema
-    for candidate in ("python3", "python3.12", "python3.11",
-                      "python3.10", "python3.9", "python"):
-        found = _shutil.which(candidate)
-        if found:
-            return found
-    return sys.executable  # fallback
+    return env_setup.find_system_python()
 
 
 def _pip_install(python_bin: str, pkgs: List[str]) -> subprocess.CompletedProcess:
@@ -224,6 +197,16 @@ def detect_cpu() -> dict:
         "cores_logical":  os.cpu_count() or 1,
         "cores_physical": 1,
     }
+    if IS_WINDOWS:
+        nome = platform_utils.windows_cpu_name()
+        if nome:
+            info["brand"] = nome
+        try:
+            import psutil as _ps
+            info["cores_physical"] = _ps.cpu_count(logical=False) or max(1, info["cores_logical"] // 2)
+        except Exception:
+            info["cores_physical"] = max(1, info["cores_logical"] // 2)
+        return info
     try:
         if platform.system() == "Linux":
             out = subprocess.check_output(["lscpu"], text=True, stderr=subprocess.DEVNULL)
@@ -248,7 +231,7 @@ def detect_gpu() -> dict:
     }
     try:
         out = subprocess.check_output(
-            ["nvidia-smi",
+            [platform_utils.find_nvidia_smi() or "nvidia-smi",
              "--query-gpu=name,memory.total,driver_version",
              "--format=csv,noheader,nounits"],
             text=True, stderr=subprocess.DEVNULL
@@ -289,9 +272,19 @@ def detect_gpu() -> dict:
 
 
 def detect_ram() -> dict:
+    if IS_WINDOWS:
+        total_gb, free_gb = platform_utils.windows_memory_gb()
+        if total_gb:
+            return {"total_gb": total_gb, "free_gb": free_gb, "ok": total_gb >= 8}
+        try:
+            import psutil as _ps
+            vm = _ps.virtual_memory()
+            return {"total_gb": round(vm.total / 1e9, 1), "free_gb": round(vm.available / 1e9, 1), "ok": vm.total / 1e9 >= 8}
+        except Exception:
+            return {"total_gb": 0, "free_gb": 0, "ok": True}
     try:
         if platform.system() == "Linux":
-            with open("/proc/meminfo") as f:
+            with open("/proc/meminfo", encoding="utf-8") as f:
                 mem = {}
                 for line in f:
                     parts = line.split()
@@ -398,6 +391,28 @@ PACKAGES_CATALOG: list[tuple] = [
     ("openpyxl",             "openpyxl",         "openpyxl",
      "Excel file read/write support.",                               False),
 ]
+
+
+# CuPy e cuTENSOR: no Windows as rodas não trazem as bibliotecas CUDA — precisam do CUDA Toolkit 12.x
+# instalado (variável CUDA_PATH). São opcionais: sem eles a voxelização usa o NumPy.
+if IS_WINDOWS:
+    PACKAGES_CATALOG = [
+        (d, i, sp, desc + " On Windows it also needs the NVIDIA CUDA Toolkit 12.x installed (CUDA_PATH).", c)
+        if i in ("cupy", "cutensor") else (d, i, sp, desc, c)
+        for (d, i, sp, desc, c) in PACKAGES_CATALOG
+    ]
+
+# Pacotes sem versão utilizável no Windows (import_name → motivo). Aparecem na janela desabilitados, com o
+# motivo, em vez de falhar no pip. GPU4PySCF só tem pacotes para Linux (depende das bibliotecas CUDA do
+# sistema Linux); a Etapa 5 funciona sem ele (PySCF em CPU, xtb ou a aproximação heurística).
+UNAVAILABLE_ON_WINDOWS = {
+    "gpu4pyscf": "GPU4PySCF has no Windows build — QM runs on the CPU (PySCF/xtb). Use WSL2 for the GPU path.",
+}
+
+
+def package_unavailable_reason(import_name: str) -> Optional[str]:
+    """Motivo pelo qual o pacote não pode ser instalado neste sistema, ou None se pode."""
+    return UNAVAILABLE_ON_WINDOWS.get(import_name) if IS_WINDOWS else None
 
 
 # ==========================================================================
@@ -562,20 +577,15 @@ QPushButton:pressed { background: #C0392B; color: #FFF; }
 # desproporcional. Ele é detectado e, se ausente ou anterior ao 17, a linha
 # de comando é exibida para o usuário executar.
 
-P2RANK_VERSION = "2.5.1"
-P2RANK_URL_TMPL = ("https://github.com/rdk/p2rank/releases/download/"
-                   "{v}/p2rank_{v}.tar.gz")
-JAVA_MIN_MAJOR = 17
-JAVA_INSTALL_HINT = "sudo apt install openjdk-17-jre-headless"
-
-# xtb: binário ESTÁTICO (`ldd` confirma: "não é um executável dinâmico"),
-# sem nenhuma dependência de sistema — mais simples que o P2Rank, que ao
-# menos precisa de Java. Usado pela voxelização (Etapa 5) como nível de
-# teoria semi-empírico (GFN-xTB) para os canais doador/aceptor de elétrons
-# do sítio; sem ele, cai automaticamente na aproximação heurística.
-XTB_VERSION = "6.7.1"
-XTB_URL_TMPL = ("https://github.com/grimme-lab/xtb/releases/download/"
-                "v{v}/xtb-{v}-linux-x86_64.tar.xz")
+# Constantes, detecção e instalação vivem em MODULES/env_setup.py (só biblioteca padrão) e escolhem o arquivo
+# certo para o sistema: tar.gz/tar.xz no Linux; zip, winget e prank.bat no Windows. Os nomes antigos
+# continuam exportados daqui, para o restante do programa não mudar.
+P2RANK_VERSION = env_setup.P2RANK_VERSION
+P2RANK_URL_TMPL = env_setup.P2RANK_URL_TMPL
+JAVA_MIN_MAJOR = env_setup.JAVA_MIN_MAJOR
+JAVA_INSTALL_HINT = env_setup.java_install_hint()
+XTB_VERSION = env_setup.XTB_VERSION
+XTB_URL_TMPL = env_setup.XTB_URL_WINDOWS if IS_WINDOWS else env_setup.XTB_URL_LINUX
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 TOOLS_DIR = _PROJECT_ROOT / "tools"
@@ -583,162 +593,57 @@ TOOLS_DIR = _PROJECT_ROOT / "tools"
 
 def detect_java() -> dict:
     """Versão do Java disponível e se atende ao mínimo exigido pelo P2Rank."""
-    java = shutil.which("java")
-    if not java:
-        return {"found": False, "version": None, "major": None, "ok": False}
-    try:
-        out = subprocess.run([java, "-version"], capture_output=True,
-                             text=True, timeout=5)
-        txt = (out.stderr or out.stdout or "").splitlines()
-        ver = txt[0].split('"')[1] if txt and '"' in txt[0] else "?"
-    except Exception:
-        ver = "?"
-    try:
-        major = int(ver.split(".")[0])
-    except (ValueError, IndexError):
-        major = None
-    return {"found": True, "version": ver, "major": major,
-            "ok": major is not None and major >= JAVA_MIN_MAJOR}
+    return env_setup.detect_java()
 
 
 def detect_p2rank() -> Optional[str]:
-    """Caminho do executável `prank`, se instalado.
+    """Caminho do launcher do P2Rank (`prank`; `prank.bat` no Windows), se instalado.
 
     Mesma ordem de busca de pipeline_generate._p2rank_bin, para que o que o
     instalador mostra seja o que o pipeline vai encontrar.
     """
-    env_home = os.environ.get("P2RANK_HOME")
-    if env_home:
-        cand = Path(env_home) / "prank"
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
-    found = shutil.which("prank")
-    if found:
-        return found
-    for base in (TOOLS_DIR, Path.home(), Path("/opt")):
-        if not base.is_dir():
-            continue
-        try:
-            for cand in sorted(base.glob("p2rank*/prank")):
-                if cand.is_file() and os.access(cand, os.X_OK):
-                    return str(cand)
-        except OSError:
-            continue
-    return None
+    return env_setup.detect_p2rank()
 
 
 def install_p2rank(version: str = P2RANK_VERSION, log=print) -> bool:
-    """Baixa e extrai o P2Rank em <projeto>/tools/. Não requer root."""
-    import tarfile
-    import urllib.request
+    """Baixa e extrai o P2Rank em <projeto>/tools/. Não requer root nem administrador."""
+    return env_setup.install_p2rank(version, log)
 
-    url = P2RANK_URL_TMPL.format(v=version)
-    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-    tarball = TOOLS_DIR / f"p2rank_{version}.tar.gz"
-    try:
-        log(f"$ download {url}")
-        urllib.request.urlretrieve(url, tarball)
-        log(f"$ tar -xzf {tarball.name} -C {TOOLS_DIR}")
-        with tarfile.open(tarball, "r:gz") as tf:
-            tf.extractall(TOOLS_DIR)
-        tarball.unlink(missing_ok=True)
-    except Exception as exc:
-        log(f"FAILED  P2Rank download/extract: {exc}")
-        return False
 
-    prank = detect_p2rank()
-    if not prank:
-        log("FAILED  P2Rank extracted but 'prank' not found in tools/")
-        return False
-    try:
-        os.chmod(prank, 0o755)
-    except OSError:
-        pass
-
-    java = detect_java()
-    if not java["ok"]:
-        atual = java["version"] or "ausente"
-        log(f"WARNING  P2Rank instalado em {prank}, mas o Java disponível é "
-            f"{atual} e ele exige {JAVA_MIN_MAJOR}+.")
-        log(f"         Instale com: {JAVA_INSTALL_HINT}")
-    else:
-        log(f"OK  P2Rank {version} installed at {prank}")
-    return True
+def install_java(log=print) -> bool:
+    """Windows: OpenJDK 17 pelo winget. Linux: só mostra o comando (exige root)."""
+    return env_setup.install_java(log)
 
 
 def detect_xtb() -> Optional[str]:
-    """Caminho do executável `xtb`, se instalado.
+    """Caminho do executável `xtb` (`xtb.exe` no Windows), se instalado.
 
     Mesma ordem de busca de pipeline_voxelize._xtb_bin, para que o que o
     instalador mostra seja o que o pipeline vai encontrar.
     """
-    env_home = os.environ.get("XTB_HOME")
-    if env_home:
-        cand = Path(env_home) / "bin" / "xtb"
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
-    found = shutil.which("xtb")
-    if found:
-        return found
-    for base in (TOOLS_DIR, Path.home(), Path("/opt")):
-        if not base.is_dir():
-            continue
-        try:
-            for cand in sorted(base.glob("xtb*/bin/xtb")):
-                if cand.is_file() and os.access(cand, os.X_OK):
-                    return str(cand)
-        except OSError:
-            continue
-    return None
+    return env_setup.detect_xtb()
 
 
 def install_xtb(version: str = XTB_VERSION, log=print) -> bool:
-    """Baixa e extrai o xtb em <projeto>/tools/. Não requer root.
-
-    O tarball oficial já vem com o binário estático em bin/xtb e os
-    parâmetros GFN em share/xtb/ (lidos em tempo de execução, achados por
-    caminho relativo ao binário — extrair preserva essa estrutura).
-    """
-    import tarfile
-    import urllib.request
-
-    url = XTB_URL_TMPL.format(v=version)
-    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-    tarball = TOOLS_DIR / f"xtb-{version}-linux-x86_64.tar.xz"
-    try:
-        log(f"$ download {url}")
-        urllib.request.urlretrieve(url, tarball)
-        log(f"$ tar -xJf {tarball.name} -C {TOOLS_DIR}")
-        with tarfile.open(tarball, "r:xz") as tf:
-            tf.extractall(TOOLS_DIR)
-        tarball.unlink(missing_ok=True)
-    except Exception as exc:
-        log(f"FAILED  xtb download/extract: {exc}")
-        return False
-
-    xtb_bin = detect_xtb()
-    if not xtb_bin:
-        log("FAILED  xtb extracted but 'bin/xtb' not found in tools/")
-        return False
-    try:
-        os.chmod(xtb_bin, 0o755)
-    except OSError:
-        pass
-    log(f"OK  xtb {version} installed at {xtb_bin}")
-    return True
+    """Baixa e extrai o xtb em <projeto>/tools/. Não requer root nem administrador."""
+    return env_setup.install_xtb(version, log)
 
 
 # (display, key, default_spec, description, auto_installable)
+# Java: no Linux exige root (apt) e por isso só é reportado; no Windows é instalado pelo winget.
 EXTERNAL_TOOLS: list[tuple] = [
     ("P2Rank", "__p2rank__", P2RANK_VERSION,
      "Heuristic binding-site search (Step 9). Java program, installed into "
      "tools/. Requires Java 17+.", True),
-    ("Java (JRE)", "__java__", JAVA_INSTALL_HINT,
-     f"Required by P2Rank (version {JAVA_MIN_MAJOR} or newer). Needs root: "
-     "run the command shown in a terminal.", False),
+    ("Java (JRE)", "__java__", env_setup.JAVA_WINGET_ID if IS_WINDOWS else JAVA_INSTALL_HINT,
+     (f"Required by P2Rank (version {JAVA_MIN_MAJOR} or newer). Installed with winget "
+      "(Microsoft OpenJDK 17); Windows may ask for confirmation once.") if IS_WINDOWS else
+     (f"Required by P2Rank (version {JAVA_MIN_MAJOR} or newer). Needs root: "
+      "run the command shown in a terminal."), IS_WINDOWS),
     ("xtb", "__xtb__", XTB_VERSION,
      "Semi-empirical (GFN-xTB) electronic descriptors for the site (Step 5). "
-     "Static binary, no other dependency, installed into tools/.", True),
+     + ("Windows build (xtb.exe), installed into tools/." if IS_WINDOWS
+        else "Static binary, no other dependency, installed into tools/."), True),
 ]
 
 
@@ -751,7 +656,7 @@ class _InstallWorker(QThread):
     def __init__(self, python_bin: str, tasks: list[tuple], parent=None):
         """
         tasks: lista de (display_name, spec, kind), com kind em
-        {"pip", "p2rank", "xtb"}. Tuplas de 2 elementos são aceitas e
+        {"pip", "p2rank", "xtb", "java"}. Tuplas de 2 elementos são aceitas e
         tratadas como "pip", para não quebrar chamadas anteriores a esta
         classe.
         """
@@ -771,6 +676,9 @@ class _InstallWorker(QThread):
                 success = success and ok
             elif kind == "xtb":
                 ok = install_xtb(spec or XTB_VERSION, log=self.log_signal.emit)
+                success = success and ok
+            elif kind == "java":
+                ok = install_java(log=self.log_signal.emit)
                 success = success and ok
             else:
                 self.log_signal.emit(f"$ pip install {spec}")
@@ -826,11 +734,9 @@ class RequirementsInstaller(QWidget):
         root.addWidget(hdr)
 
         # Detecta se já estamos no venv correto
-        _venv_py  = str(Path.home() / ".venv" / "CODEEP" / "bin" / "python")
-        _in_venv  = (
-            Path(sys.executable).resolve() == Path(_venv_py).resolve()
-        ) if Path(_venv_py).is_file() else False
-        _venv_dir = str(Path.home() / ".venv" / "CODEEP")
+        _venv_dir = env_setup.venv_paths("CODEEP")["venv_dir"]
+        _in_venv  = env_setup.running_in_venv("CODEEP")
+        _restart_cmd = "CODEEP_Windows.bat / the CODEEP shortcut" if IS_WINDOWS else "python3 CODEEP.py"
         _py_info  = f"{sys.executable}  ({sys.version.split()[0]})"
 
         if _in_venv:
@@ -838,7 +744,7 @@ class RequirementsInstaller(QWidget):
             _env_note  = "running inside the CODEEP venv — packages will be installed here"
         else:
             _env_color = "#E67E22"
-            _env_note  = "not running inside the venv — restart via:  python3 CODEEP.py"
+            _env_note  = f"not running inside the venv — restart via:  {_restart_cmd}"
 
         desc = QLabel(
             f"Virtual environment:  <b>{_venv_dir}</b><br>"
@@ -875,6 +781,9 @@ class RequirementsInstaller(QWidget):
             # Checkbox de seleção
             chk = QCheckBox()
             chk.setChecked(True)
+            _indisp = package_unavailable_reason(import_name)
+            if _indisp:
+                chk.setChecked(False); chk.setEnabled(False); chk.setToolTip(_indisp)
             self._checks[import_name] = chk
             pkg_lay.addWidget(chk, row_i, 0, Qt.AlignCenter)
 
@@ -896,6 +805,8 @@ class RequirementsInstaller(QWidget):
             ed = QLineEdit(default_spec)
             ed.setFixedWidth(228)
             ed.setToolTip(f"pip spec for {display}. Edit the version if needed.")
+            if _indisp:
+                ed.setReadOnly(True); ed.setToolTip(_indisp)
             self._edits[import_name] = ed
             pkg_lay.addWidget(ed, row_i, 3)
 
@@ -1040,6 +951,12 @@ class RequirementsInstaller(QWidget):
             ver       = _pkg_version(import_name)
             lbl       = self._status[import_name]
             chk       = self._checks[import_name]
+            _indisp   = package_unavailable_reason(import_name)
+            if _indisp and not installed:
+                lbl.setText("⛔")
+                lbl.setToolTip(_indisp)
+                chk.setChecked(False)
+                continue
             if installed:
                 lbl.setText("✅")
                 lbl.setToolTip(f"Installed (version: {ver or '?'})")
@@ -1062,6 +979,8 @@ class RequirementsInstaller(QWidget):
             chk.setChecked(True)
 
         lbl = self._status["__java__"]
+        if IS_WINDOWS:
+            self._checks["__java__"].setChecked(not java["ok"])
         if java["ok"]:
             lbl.setText("✅"); lbl.setToolTip(f"Java {java['version']}")
         elif java["found"]:
@@ -1074,7 +993,8 @@ class RequirementsInstaller(QWidget):
         if prank and not java["ok"]:
             self._log(f"WARNING  P2Rank is installed but Java "
                       f"{java['version'] or 'is missing'}; it requires "
-                      f"{JAVA_MIN_MAJOR}+. Run: {JAVA_INSTALL_HINT}")
+                      f"{JAVA_MIN_MAJOR}+. Run: {JAVA_INSTALL_HINT}"
+                      + ("  (or tick Java (JRE) below)" if IS_WINDOWS else ""))
 
         xtb_bin = detect_xtb()
         lbl, chk = self._status["__xtb__"], self._checks["__xtb__"]
@@ -1092,7 +1012,8 @@ class RequirementsInstaller(QWidget):
     # ── Helpers de seleção ─────────────────────────────────────────────────
     def _set_all_checks(self, state: bool):
         for chk in self._checks.values():
-            chk.setChecked(state)
+            if chk.isEnabled():
+                chk.setChecked(state)
 
     def _select_only_missing(self):
         for import_name, chk in self._checks.items():
@@ -1103,7 +1024,12 @@ class RequirementsInstaller(QWidget):
                 chk.setChecked(detect_xtb() is None)
                 continue
             if import_name == "__java__":
-                continue          # não instalável por aqui (exige root)
+                if IS_WINDOWS:     # no Linux não é instalável por aqui (exige root)
+                    chk.setChecked(not detect_java()["ok"])
+                continue
+            if package_unavailable_reason(import_name):
+                chk.setChecked(False)
+                continue
             installed = _pkg_installed(import_name)
             chk.setChecked(not installed)
 
@@ -1113,7 +1039,7 @@ class RequirementsInstaller(QWidget):
         tasks: list[tuple[str, str]] = []
         for display, import_name, _, _, _ in PACKAGES_CATALOG:
             chk = self._checks[import_name]
-            if not chk.isChecked():
+            if not chk.isChecked() or package_unavailable_reason(import_name):
                 continue
             spec = self._edits[import_name].text().strip()
             if not spec:
@@ -1138,6 +1064,8 @@ class RequirementsInstaller(QWidget):
             tasks.append(("xtb",
                           self._edits["__xtb__"].text().strip() or XTB_VERSION,
                           "xtb"))
+        if IS_WINDOWS and self._checks["__java__"].isChecked():
+            tasks.append(("Java (JRE 17)", env_setup.JAVA_WINGET_ID, "java"))
 
         if not tasks:
             QMessageBox.information(self, "No packages selected",
@@ -1145,13 +1073,13 @@ class RequirementsInstaller(QWidget):
             return
 
         pybin    = sys.executable
-        venv_dir = str(Path.home() / ".venv" / "CODEEP")
-        _venv_py = str(Path.home() / ".venv" / "CODEEP" / "bin" / "python")
-        _in_venv = False
-        try:
-            _in_venv = Path(pybin).resolve() == Path(_venv_py).resolve()
-        except Exception:
-            pass
+        # No Windows o programa roda com pythonw.exe (sem console): o pip precisa do python.exe do mesmo venv
+        if IS_WINDOWS and os.path.basename(pybin).lower() == "pythonw.exe":
+            _py = os.path.join(os.path.dirname(pybin), "python.exe")
+            if os.path.isfile(_py):
+                pybin = _py
+        venv_dir = env_setup.venv_paths("CODEEP")["venv_dir"]
+        _in_venv = env_setup.running_in_venv("CODEEP")
 
         if not _in_venv:
             resp = QMessageBox.warning(
@@ -1160,8 +1088,8 @@ class RequirementsInstaller(QWidget):
                 f"Active Python: {pybin}\n"
                 f"Expected venv: {venv_dir}\n\n"
                 "Restart CODEEP with:\n"
-                "  python3 CODEEP.py\n\n"
-                "Install into the current Python anyway?",
+                + ("  CODEEP_Windows.bat (or the CODEEP shortcut)\n\n" if IS_WINDOWS else "  python3 CODEEP.py\n\n")
+                + "Install into the current Python anyway?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )

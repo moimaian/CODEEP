@@ -39,11 +39,16 @@ import logging
 from pathlib import Path
 from versao import VERSAO, LICENCA_CURTA
 
+# Camada de portabilidade Linux/Windows (só biblioteca padrão; MODULES/platform_utils.py e env_setup.py).
+# Windows aberto pelo atalho (pythonw.exe) não tem console: sys.stdout/sys.stderr são None até aqui.
+from MODULES import platform_utils
+from MODULES.platform_utils import IS_WINDOWS
+platform_utils.ensure_std_streams()
 
-# Caminho canônico do venv dedicado ao CODEEP
-_VENV_DIR    = Path.home() / ".venv" / "CODEEP"
-_VENV_PYTHON = _VENV_DIR / "bin" / "python"
-_APP_LOG_DIR = Path.home() / ".local" / "state" / "CODEEP"
+# Caminho canônico do venv dedicado ao CODEEP (Linux: ~/.venv/CODEEP/bin/python; Windows: ...\Scripts\python.exe)
+_VENV_DIR    = Path(platform_utils.default_venv_dir("CODEEP"))
+_VENV_PYTHON = Path(platform_utils.venv_python(str(_VENV_DIR)))
+_APP_LOG_DIR = platform_utils.state_dir()
 _APP_TERMINAL_LOG = _APP_LOG_DIR / "terminal.log"
 
 log = logging.getLogger(__name__)
@@ -128,7 +133,15 @@ def _write_desktop() -> None:
 
 
 def _ensure_desktop() -> None:
-    """Cria/atualiza o atalho no menu Linux quando o conteúdo esperado mudar."""
+    """Cria/atualiza o atalho no menu (Linux: .desktop; Windows: CODEEP.lnk na Área de Trabalho e no Menu
+    Iniciar) quando o conteúdo esperado mudar."""
+    if IS_WINDOWS:
+        try:
+            from MODULES import env_setup
+            env_setup.ensure_windows_shortcuts(_APP_DIR / "CODEEP.py")
+        except Exception:
+            pass     # nunca travar a inicialização por causa do atalho
+        return
     try:
         current = _DESKTOP_FILE.read_text(encoding="utf-8") if _DESKTOP_FILE.exists() else None
         if current != _desktop_content():
@@ -137,11 +150,20 @@ def _ensure_desktop() -> None:
         pass  # nunca travar a inicialização por causa do atalho
 
 
+if "--setup" in sys.argv:
+    # Install-CODEEP.ps1 (Windows): prepara o venv, o runtime Visual C++, os pacotes essenciais e os atalhos
+    # CODEEP.lnk, sem abrir a interface e sem pedir nenhum comando ao usuário.
+    from MODULES import env_setup
+    sys.exit(env_setup.run_setup())
+
 _setup_terminal_capture()
 
 # ── Bootstrap ───────────────────────────────────────────────────
 def _already_in_venv() -> bool:
     """Retorna True se o Python atual É o Python do venv CODEEP."""
+    if IS_WINDOWS:
+        from MODULES import env_setup
+        return env_setup.running_in_venv("CODEEP")      # o atalho abre com pythonw.exe: é o mesmo venv
     try:
         return Path(sys.executable).resolve() == _VENV_PYTHON.resolve()
     except Exception:
@@ -162,6 +184,16 @@ def _bootstrap_venv():
         os.environ["CODEEP_VENV_ACTIVE"] = "1"
         _ensure_desktop()
         return
+
+    if IS_WINDOWS:
+        # Windows: cria o venv com o Python 3.10.11 (instalando-o se faltar) e o PyQt5, e reabre o CODEEP dentro
+        # dele (o Windows não tem exec(): executa o filho e espera). CODEEP_ASSUME_YES=1 responde "S".
+        from MODULES import env_setup
+        if env_setup.bootstrap_windows(interactive=True):
+            os.environ["CODEEP_VENV_ACTIVE"] = "1"
+            _ensure_desktop()
+            return
+        sys.exit(1)
 
     # ── Informa o usuário e pede confirmação ──────────────────────────────
     print("\n" + "═" * 62)
@@ -2820,7 +2852,7 @@ class MainWindow(QMainWindow):
         # ── Fonte 2: /proc/cpuinfo ────────────────────────────────────────
         # Usado quando lscpu não trouxe modelo ou clock
         try:
-            cpuinfo = open("/proc/cpuinfo").read()
+            cpuinfo = open("/proc/cpuinfo", encoding="utf-8").read()
             if not model:
                 m = _re.search(r"model name\s*:\s*(.+)", cpuinfo)
                 if m:
@@ -2856,6 +2888,11 @@ class MainWindow(QMainWindow):
                         max_mhz = freq.max
             except Exception:
                 pass
+
+        # ── Windows: nome e clock vêm do registro (sem lscpu nem /proc) ────
+        if IS_WINDOWS:
+            model = platform_utils.windows_cpu_name() or model
+            base_mhz = base_mhz or platform_utils.windows_cpu_mhz()
 
         # ── Fallback final de modelo ───────────────────────────────────────
         if not model:
@@ -2899,7 +2936,8 @@ class MainWindow(QMainWindow):
         """
         import subprocess as _sp, shutil as _sh
         rows = []
-        if not _sh.which("nvidia-smi"):
+        _nvsmi = platform_utils.find_nvidia_smi()
+        if not _nvsmi:
             rows.append(("GPU", "nvidia-smi not found"))
             return rows
         try:
@@ -2910,7 +2948,7 @@ class MainWindow(QMainWindow):
                 "clocks.max.memory,power.limit"
             )
             raw = _sp.check_output(
-                ["nvidia-smi",
+                [_nvsmi,
                  f"--query-gpu={fields}",
                  "--format=csv,noheader,nounits"],
                 text=True, stderr=_sp.PIPE, timeout=4
@@ -2927,7 +2965,7 @@ class MainWindow(QMainWindow):
             # Versão CUDA máxima suportada pelo driver (linha do cabeçalho)
             try:
                 header = _sp.check_output(
-                    ["nvidia-smi"], text=True,
+                    [_nvsmi], text=True,
                     stderr=_sp.DEVNULL, timeout=4
                 )
                 import re as _re
@@ -3072,7 +3110,7 @@ class MainWindow(QMainWindow):
             "vram_gb": 0.0,
             "free_disk_gb": 0.0,
             "cupy": bool(_CUPY_OK),
-            "xtb": bool(_sh.which("xtb")),
+            "xtb": bool(_sh.which("xtb") or platform_utils.find_xtb(_APP_DIR / "tools")),
         }
         if _PSUTIL_OK:
             try:
@@ -3442,10 +3480,11 @@ class MainWindow(QMainWindow):
                           _t.version.cuda or "N/A"))
 
         # Driver NVIDIA
-        if _sh.which("nvidia-smi"):
+        _nvsmi_drv = platform_utils.find_nvidia_smi()
+        if _nvsmi_drv:
             try:
                 drv = _sp.check_output(
-                    ["nvidia-smi","--query-gpu=driver_version",
+                    [_nvsmi_drv,"--query-gpu=driver_version",
                      "--format=csv,noheader"],
                     text=True, stderr=_sp.DEVNULL, timeout=3
                 ).strip().splitlines()[0].strip()
@@ -5712,7 +5751,7 @@ class MainWindow(QMainWindow):
         br.addStretch()
         if arquivo_log:
             b_open = _mk_btn(i18n.t("s6_btn_open_log", self._idioma), _SS_BTN_SECONDARY, 130)
-            b_open.clicked.connect(lambda: subprocess.Popen(["xdg-open", arquivo_log]))
+            b_open.clicked.connect(lambda: platform_utils.open_path(arquivo_log))
             br.addWidget(b_open)
         b_close = _mk_btn(i18n.t("btn_close", self._idioma), _SS_BTN_PRIMARY, 100)
         b_close.clicked.connect(dlg.accept)
@@ -6163,7 +6202,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(scroll)
         br = QHBoxLayout()
         b_open = _mk_btn(i18n.t("btn_open_in_system", self._idioma), _SS_BTN_PRIMARY, 160)
-        b_open.clicked.connect(lambda: subprocess.Popen(["xdg-open", path]))
+        b_open.clicked.connect(lambda: platform_utils.open_path(path))
         b_close = _mk_btn(i18n.t("btn_close", self._idioma), _SS_BTN_PRIMARY, 100)
         b_close.clicked.connect(dlg.accept)
         br.addStretch(); br.addWidget(b_open); br.addWidget(b_close)
@@ -6260,13 +6299,7 @@ class MainWindow(QMainWindow):
             return
 
         log_path = str(_APP_TERMINAL_LOG)
-        candidates = [
-            ["x-terminal-emulator", "-e", "tail", "-n", "+1", "-F", log_path],
-            ["gnome-terminal", "--", "tail", "-n", "+1", "-F", log_path],
-            ["konsole", "-e", "tail", "-n", "+1", "-F", log_path],
-            ["xfce4-terminal", "--title=CODEEP Terminal", "--command", f"tail -n +1 -F '{log_path}'"],
-            ["xterm", "-T", "CODEEP Terminal", "-e", "tail", "-n", "+1", "-F", log_path],
-        ]
+        candidates = platform_utils.follow_log_command(log_path)
         for cmd in candidates:
             try:
                 self._terminal_viewer_proc = subprocess.Popen(cmd, cwd=str(_APP_DIR))
@@ -6323,9 +6356,22 @@ class MainWindow(QMainWindow):
 # ═══════════════════════ PONTO DE ENTRADA ═════════════════════════════════
 # ==========================================================================================================================================
 if __name__ == "__main__":
+    platform_utils.install_subprocess_defaults()        # Windows: filhos sem janela de console e com stdin válido
+    if IS_WINDOWS:
+        os.environ.setdefault("PYTHONUTF8", "1")        # as ferramentas que o CODEEP chama escrevem UTF-8
+        try:
+            # identidade própria na barra de tarefas (em vez de "pythonw.exe"): o atalho fixado mantém o ícone
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CODEEP.CEB.UFPR")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("CODEEP")
 
     window = MainWindow()
     window.show()
+    if os.environ.get("CODEEP_OPEN_REQUIREMENTS") == "1":
+        # definido por Install-CODEEP.ps1 na primeira abertura: o programa ainda precisa do resto das bibliotecas
+        os.environ.pop("CODEEP_OPEN_REQUIREMENTS", None)
+        QTimer.singleShot(600, window._show_requirements)
     sys.exit(app.exec_())

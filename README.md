@@ -14,7 +14,21 @@ sudo apt install ./codeep_<version>_all.deb
 
 The package installs the program in `/opt/codeep`, the launcher `/usr/bin/codeep` and a menu entry. On the first launch from the menu, the launcher copies the program to `$HOME/CODEEP` (never touching your data, models and projects) and a terminal window asks for confirmation to create the Python virtual environment. See `packaging/deb/README.md` for details and `packaging/deb/build.sh` to build the package.
 
-### Option 2 — From source
+### Option 2 — Windows 10/11 (installer, no terminal needed)
+
+**Download the compressed file from the link and extract it anywhere:**
+https://github.com/moimaian/CODEEP/archive/refs/heads/main.zip
+
+**Double-click `CODEEP_Windows.bat`** (it runs `Install-CODEEP.ps1`; if Windows shows "Windows protected your PC", click *More info > Run anyway*). It does everything, with no command to type:
+
+1. copies the program to `%USERPROFILE%\CODEEP` (your projects, data and models are never overwritten);
+2. looks for Python 3.10 and, if missing, downloads Python 3.10.11 from python.org, checks its digital signature and installs it for your user only (no administrator needed);
+3. creates the virtual environment `%USERPROFILE%\.venv\CODEEP`, installs the Visual C++ runtime that Qt5 and PyTorch need (Windows asks for the administrator's confirmation once) and the essential packages;
+4. creates the **CODEEP** shortcuts on the Desktop and in the Start Menu, and opens the program, which then shows the *Install Requirements* window for the rest (PyTorch with the right CUDA build for your GPU, RDKit, PySCF, CuPy, xtb, Java 17 and P2Rank).
+
+From then on, just use the CODEEP shortcut. Equivalent command: `powershell -ExecutionPolicy Bypass -File .\Install-CODEEP.ps1`.
+
+### Option 3 — From source (Linux)
 
 **Download the compressed file from the link:**
 https://github.com/moimaian/CODEEP/archive/refs/heads/main.zip
@@ -50,7 +64,19 @@ All prerequisites are installed from the *Install Requirements* window. The PyTo
 
 An NVIDIA GPU is not mandatory, but it is practically required for training at scale.
 
-This application was developed for Linux, targeting Debian/Ubuntu and their flavors; other distributions are not guaranteed to work.
+The application was developed on Linux (Debian/Ubuntu and flavors) and also runs on Windows 10/11 (64-bit). The *Install Requirements* window recognizes the operating system and adapts what it installs:
+
+| Item | Linux | Windows |
+|---|---|---|
+| Python of the environment | system `python3` | Python 3.10.11 (installed for the user if missing) |
+| Java 17+ (P2Rank) | `sudo apt install openjdk-17-jre-headless` (command shown) | installed by the window, with `winget` (Microsoft OpenJDK 17) |
+| P2Rank | `prank` | `prank.bat` (same package) |
+| xtb (GFN-xTB) | Linux static binary | `xtb.exe` (Windows build of the same release) |
+| RDKit, PySCF, CuPy, cuTENSOR, PyTorch | `pip` | `pip` (CuPy and cuTENSOR also need the NVIDIA CUDA Toolkit 12.x) |
+| GPU4PySCF | `pip` | not available (no Windows build) — QM runs on the CPU |
+| GROMACS / AmberTools (AMBER ff14SB, CHARMM36 in STEP 6) | optional | not supported natively — the final geometry uses MMFF/UFF (or use WSL2) |
+
+On Windows the program is opened by the shortcut with `pythonw.exe` (no console window); the *Terminal* button of the HOME tab shows the session log.
 
 ## More information
 

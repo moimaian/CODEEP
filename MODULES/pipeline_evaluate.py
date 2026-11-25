@@ -1099,7 +1099,7 @@ def main(ckpt_dir: Path, do_generate: bool, tensor_dir: Path, fig_dir: Path,
         # Save generated SMILES — mesmo critério de tamanho do SDF, para que
         # os dois arquivos tragam o mesmo conjunto de moléculas.
         out_smi = ckpt_dir / "generated_smiles.smi"
-        with open(out_smi, "w") as f:
+        with open(out_smi, "w", encoding="utf-8") as f:
             f.write(f"# Real crystal ligand: {real_smi}\n")
             for record in generated_records:
                 smi = record.get("smiles", "")

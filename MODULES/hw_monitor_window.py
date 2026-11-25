@@ -31,6 +31,16 @@ import shutil
 import subprocess
 import sys
 
+try:                                    # importado pelo CODEEP (pacote MODULES) ou executado como script solto
+    from MODULES import platform_utils as _pu
+except ImportError:                     # pragma: no cover
+    import platform_utils as _pu
+
+
+def _find_nvidia_smi():
+    """nvidia-smi no PATH ou, no Windows, nas pastas do driver da NVIDIA."""
+    return _pu.find_nvidia_smi()
+
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QVBoxLayout
 
@@ -80,7 +90,8 @@ class HwMonitorWindow(QDialog):
         self.lbl_cpu.setStyleSheet(_mon_ss("#27AE60"))
         row.addWidget(self.lbl_cpu, 1)
 
-        self._has_nvidia = shutil.which("nvidia-smi") is not None
+        self._nvidia_smi = _find_nvidia_smi()
+        self._has_nvidia = self._nvidia_smi is not None
         self.lbl_gpu = QLabel("GPU: --")
         self.lbl_gpu.setAlignment(Qt.AlignCenter)
         self.lbl_gpu.setStyleSheet(_mon_ss("#2980B9"))
@@ -151,7 +162,7 @@ class HwMonitorWindow(QDialog):
         try:
             raw = subprocess.check_output(
                 [
-                    "nvidia-smi",
+                    self._nvidia_smi,
                     "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total",
                     "--format=csv,noheader,nounits",
                 ],

@@ -391,7 +391,7 @@ def save_voxel_config_snapshot(tensor_dir: "Path | str", config: "dict | None" =
     snapshot = {k: cfg[k] for k in VOXEL_CONFIG_TENSOR_KEYS if k in cfg}
     out_path = Path(tensor_dir) / "voxel_config.json"
     try:
-        out_path.write_text(json.dumps(snapshot, indent=2))
+        out_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
         log.info(f"  Retrato da config de voxelização salvo em {out_path}")
     except Exception as e:
         log.warning(f"  Não foi possível salvar {out_path}: {e}")
@@ -967,26 +967,9 @@ def _xtb_bin() -> "str | None":
     usada por CODEEP_requirements.detect_xtb(), para que o que a tela de
     Install Requirements mostra seja o que este pipeline de fato encontra.
     """
-    env_home = os.environ.get("XTB_HOME")
-    if env_home:
-        cand = Path(env_home) / "bin" / "xtb"
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
-
-    xtb_bin = shutil.which("xtb")
-    if xtb_bin is None:
-        for base in (PROJECT_ROOT / "tools", Path.home(), Path("/opt")):
-            if not base.is_dir():
-                continue
-            try:
-                for cand in sorted(base.glob("xtb*/bin/xtb")):
-                    if cand.is_file() and os.access(cand, os.X_OK):
-                        xtb_bin = str(cand)
-                        break
-            except OSError:
-                continue
-            if xtb_bin:
-                break
+    # XTB_HOME, PATH e tools/xtb*/bin/xtb(.exe) — a busca é a mesma do instalador e vale para Linux e Windows
+    from MODULES import platform_utils
+    xtb_bin = platform_utils.find_xtb(PROJECT_ROOT / "tools")
 
     if xtb_bin is None:
         log.warning(
@@ -1025,7 +1008,7 @@ def _run_xtb_vfukui(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             xyz_path = Path(tmpdir) / "site.xyz"
-            with open(xyz_path, "w") as f:
+            with open(xyz_path, "w", encoding="utf-8") as f:
                 f.write(f"{len(elements)}\n")
                 f.write("CODEEP\n")
                 for elem, xyz in zip(elements, coords):
@@ -1483,7 +1466,7 @@ def _read_cube_data(cube_path: str, n: int) -> np.ndarray:
       Linhas 6..(6+n_atoms-1): átomos
       Linhas seguintes: dados volumétricos (row-major: x varia mais lentamente)
     """
-    with open(cube_path) as f:
+    with open(cube_path, encoding="utf-8") as f:
         lines = f.readlines()
 
     n_atoms   = abs(int(lines[2].split()[0]))
@@ -2373,7 +2356,7 @@ def process_pair(
     # Pula se já processado
     if (out_dir / "site_tensor.npz").exists() and (out_dir / "meta.json").exists():
         try:
-            with open(out_dir / "meta.json") as f:
+            with open(out_dir / "meta.json", encoding="utf-8") as f:
                 meta = json.load(f)
             meta["status"] = "ok"          # par válido — existência prévia não é erro
             return meta
@@ -2556,7 +2539,7 @@ def process_pair(
         "elapsed_s":       round(elapsed, 2),
         "status":          "ok",
     }
-    with open(out_dir / "meta.json", "w") as f:
+    with open(out_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     log.info(

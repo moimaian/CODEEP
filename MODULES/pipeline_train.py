@@ -2458,7 +2458,7 @@ def compute_bond_stats(dataset_dir, max_ligands: int = 3000, seed: int = 42) -> 
     cache = dataset_dir / "bond_stats.json"
     if cache.exists():
         try:
-            data = _json.loads(cache.read_text())
+            data = _json.loads(cache.read_text(encoding="utf-8"))
             if data:
                 log.info(f"  Estatística de ligações lida de {cache} "
                          f"({len(data)} pares)")
@@ -2508,7 +2508,7 @@ def compute_bond_stats(dataset_dir, max_ligands: int = 3000, seed: int = 42) -> 
                     "mean": round(float(arr.mean()), 3),
                     "p99": round(float(_np.percentile(arr, 99)), 3)}
     try:
-        cache.write_text(_json.dumps(stats, indent=1))
+        cache.write_text(_json.dumps(stats, indent=1), encoding="utf-8")
     except OSError:
         pass
     log.info(f"  Estatística de ligações medida: {len(stats)} pares, "
@@ -2541,7 +2541,7 @@ def compute_charge_stats(dataset_dir, max_ligands: int = 8000,
     cache = dataset_dir / "charge_stats.json"
     if cache.exists():
         try:
-            data = _json.loads(cache.read_text())
+            data = _json.loads(cache.read_text(encoding="utf-8"))
             if data.get("patterns"):
                 log.info(f"  Estatística de carga formal lida de {cache} "
                          f"({len(data['patterns'])} padrões)")
@@ -2590,7 +2590,7 @@ def compute_charge_stats(dataset_dir, max_ligands: int = 8000,
              "patterns": {k: {"n": int(n), "freq": n / tot}
                           for k, n in cnt.items()}}
     try:
-        cache.write_text(_json.dumps(stats, indent=1))
+        cache.write_text(_json.dumps(stats, indent=1), encoding="utf-8")
     except OSError:
         pass
     n_carregados = sum(1 for k in stats["patterns"] if k.split("|")[1] != "0")
@@ -2723,7 +2723,7 @@ def train(
     _vc_path = dataset_dir / "voxel_config.json"
     if _vc_path.exists():
         try:
-            voxel_config_snapshot = json.loads(_vc_path.read_text())
+            voxel_config_snapshot = json.loads(_vc_path.read_text(encoding="utf-8"))
             log.info(f"  Voxel config herdada de {_vc_path}: {voxel_config_snapshot}")
         except Exception as e:
             log.warning(f"  Não foi possível ler {_vc_path}: {e}")

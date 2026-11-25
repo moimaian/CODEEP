@@ -69,7 +69,7 @@ ORDEM = np.array([1.0, 2.0, 3.0, 1.5], np.float32)
 def _parse_bolso(path) -> tuple[np.ndarray, np.ndarray]:
     """Átomos PESADOS do bolso (binding_site.pdb): posição (Å, referencial cristalográfico) e classe 0..5."""
     pos, el = [], []
-    for ln in open(path):
+    for ln in open(path, encoding="utf-8"):
         if not ln.startswith(("ATOM", "HETATM")):
             continue
         e = (ln[76:78].strip() or ln[12:16].strip()[:1]).upper()
@@ -121,7 +121,7 @@ def _registro_par(args) -> Optional[dict]:
 
 
 def construir_cache(tensor_dir, curated_dir=None, split: str = "train", cache_dir=None,
-                    max_atoms: int = 60, n_proc: int = 16, refazer: bool = False) -> Path:
+                    max_atoms: int = 60, n_proc: Optional[int] = None, refazer: bool = False) -> Path:
     """Cria (ou reaproveita) cache/<split>.pt com os registros do divisão `split` do SiteLigandDataset
     (a MESMA divisão por cluster PDB do CVAE: os pares de teste nunca foram vistos no treino)."""
     from multiprocessing import Pool
@@ -134,7 +134,8 @@ def construir_cache(tensor_dir, curated_dir=None, split: str = "train", cache_di
     if saida.exists() and not refazer:
         return saida
     ids = SiteLigandDataset(tensor_dir=tensor_dir, split=split, max_atoms=max_atoms).records["pair_id"].tolist()
-    with Pool(n_proc) as p:
+    from MODULES import platform_utils
+    with Pool(n_proc or max(1, min(16, (os.cpu_count() or 2) - 1) if not platform_utils.IS_WINDOWS else min(6, os.cpu_count() or 2))) as p:
         res = p.map(_registro_par, [(i, str(tensor_dir), str(curated_dir)) for i in ids], chunksize=64)
     ok = [r for r in res if r is not None]
     torch.save(ok, saida)
@@ -566,7 +567,7 @@ def train_hybrid(
     weight_decay: float = 1e-4,
     grad_clip: float = 1.0,
     device: str = "auto",
-    workers: int = 14,
+    workers: Optional[int] = None,       # None: 14 no Linux, 4 no Windows (spawn reimporta o programa)
     n_train: int = 0,
     max_iter: int = 0,
     seed: int = 0,
@@ -575,6 +576,8 @@ def train_hybrid(
     """Treina o modelo híbrido. Devolve o caminho do melhor checkpoint (best_model_hybrid.pt)."""
     dev = torch.device("cuda" if (device == "auto" and torch.cuda.is_available()) else ("cpu" if device == "auto" else device))
     tensor_dir = Path(tensor_dir); ck_dir = Path(checkpoint_dir); ck_dir.mkdir(parents=True, exist_ok=True)
+    from MODULES import platform_utils
+    workers = platform_utils.default_workers() if workers is None else workers
     tr = torch.load(construir_cache(tensor_dir, curated_dir, "train", cache_dir), weights_only=False)
     va = torch.load(construir_cache(tensor_dir, curated_dir, "val", cache_dir), weights_only=False)
     if n_train: tr = tr[:n_train]
@@ -812,7 +815,7 @@ if __name__ == "__main__":
     ap.add_argument("--checkpoint-dir", default="checkpoints/hybrid"); ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch-size", type=int, default=32); ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--beta", type=float, default=0.02); ap.add_argument("--sem-eletro", action="store_true")
-    ap.add_argument("--workers", type=int, default=14); ap.add_argument("--device", default="auto")
+    ap.add_argument("--workers", type=int, default=None); ap.add_argument("--device", default="auto")
     a = ap.parse_args(); logging.basicConfig(level=logging.INFO, format="%(message)s")
     if a.cmd == "selftest": print(json.dumps(selftest(), indent=1))
     elif a.cmd == "cache":
